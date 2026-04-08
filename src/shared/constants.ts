@@ -8,11 +8,16 @@ export const FSM_TASK_QUEUE = 'tne-fsm-queue';
 /** Task queue for generic long-running Horizon jobs */
 export const JOBS_TASK_QUEUE = 'tne-jobs-queue';
 
-/** Temporal namespace */
-export const TEMPORAL_NAMESPACE = process.env.TEMPORAL_NAMESPACE || 'tne';
+/**
+ * Runtime-only constants (use process.env).
+ * These must NOT be imported from workflow code — only from worker.ts, client.ts, and activities.
+ */
 
-/** Temporal server address */
-export const TEMPORAL_ADDRESS = process.env.TEMPORAL_ADDRESS || 'localhost:7233';
+/** Temporal namespace — only use from worker/client/activities, never workflows */
+export const TEMPORAL_NAMESPACE = typeof process !== 'undefined' ? (process.env.TEMPORAL_NAMESPACE || 'tne') : 'tne';
+
+/** Temporal server address — only use from worker/client/activities, never workflows */
+export const TEMPORAL_ADDRESS = typeof process !== 'undefined' ? (process.env.TEMPORAL_ADDRESS || 'localhost:7233') : 'localhost:7233';
 
 // ─── Timeouts ───────────────────────────────────────────────────────────────
 
@@ -72,7 +77,7 @@ export const DEFAULT_SUPPORT_MODEL = 'claude-haiku-4-5';
 // ─── Environment Variables ──────────────────────────────────────────────────
 
 /** Horizon API URL for skill invocation (if set, use HTTP POST instead of claude -p) */
-export const FSM_INVOKE_URL = process.env.FSM_INVOKE_URL || '';
+export const FSM_INVOKE_URL = typeof process !== 'undefined' ? (process.env.FSM_INVOKE_URL || '') : '';
 
 /** Secret for Horizon API authentication */
-export const FSM_INVOKE_SECRET = process.env.FSM_INVOKE_SECRET || '';
+export const FSM_INVOKE_SECRET = typeof process !== 'undefined' ? (process.env.FSM_INVOKE_SECRET || '') : '';
