@@ -81,3 +81,31 @@ export const FSM_INVOKE_URL = typeof process !== 'undefined' ? (process.env.FSM_
 
 /** Secret for Horizon API authentication */
 export const FSM_INVOKE_SECRET = typeof process !== 'undefined' ? (process.env.FSM_INVOKE_SECRET || '') : '';
+
+// ─── Agent Backend ─────────────────────────────────────────────────────────
+
+/** Which agent backend to use for skill invocation */
+export const AGENT_BACKEND: import('./types.js').AgentBackend =
+  (typeof process !== 'undefined' ? process.env.AGENT_BACKEND as any : undefined) || 'harness';
+
+// ─── S3 Workspace ──────────────────────────────────────────────────────────
+
+/** S3 bucket for workspace sync */
+export const S3_BUCKET = typeof process !== 'undefined' ? (process.env.S3_BUCKET || '') : '';
+
+/** AWS region (defaults to us-west-2) */
+export const AWS_REGION = typeof process !== 'undefined' ? (process.env.AWS_REGION || 'us-west-2') : 'us-west-2';
+
+/** Timeout for workspace sync activities */
+export const WORKSPACE_SYNC_TIMEOUT = '15m';
+
+/** Max concurrent S3 operations during sync */
+export const S3_SYNC_CONCURRENCY = 20;
+
+/** Files/dirs to exclude from S3 sync */
+export const SYNC_EXCLUDE_PATTERNS = [
+  'node_modules', '.git', '.venv', '__pycache__', '*.pyc',
+  'dist', 'build', '.next', '.cache', 'coverage', '.nyc_output',
+  '.DS_Store', 'Thumbs.db', '.vscode', '.idea', '*.log',
+  '.env.local', '.env.*.local',
+];

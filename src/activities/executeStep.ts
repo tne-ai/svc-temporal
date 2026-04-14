@@ -42,7 +42,7 @@ export async function executeStep(params: StepExecutionParams): Promise<StepResu
     heartbeat({ step: step.number, skill: step.skill, status: 'invoking', retry: retries });
 
     // Invoke the skill
-    const invResult = await invokeSkill(step, prompt + (currentFeedback ? `\n\n## Revision Feedback\n\n${currentFeedback}` : ''));
+    const invResult = await invokeSkill(step, prompt + (currentFeedback ? `\n\n## Revision Feedback\n\n${currentFeedback}` : ''), workspacePath);
 
     if (!invResult.success) {
       // Check for stage review pause (nested orchestrator)

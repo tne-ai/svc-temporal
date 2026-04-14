@@ -134,6 +134,10 @@ export interface FsmProcessInput {
   autoApprove: boolean;
   /** Resumed state from continueAsNew */
   resumeState?: FsmWorkflowState;
+  /** S3 bucket for workspace sync */
+  s3Bucket?: string;
+  /** S3 key prefix (usually userId) */
+  s3Prefix?: string;
 }
 
 export interface FsmProcessResult {
@@ -238,6 +242,12 @@ export interface JobInput {
   workspaceId: string;
   tools?: string[];
   model?: string;
+  /** S3 bucket for workspace sync */
+  s3Bucket?: string;
+  /** S3 key prefix (usually userId) */
+  s3Prefix?: string;
+  /** Output folder within workspace (e.g., "jobs/my-job") */
+  outputFolder?: string;
 }
 
 export interface JobResult {
@@ -252,3 +262,40 @@ export interface ApprovalSignalPayload {
   approved: boolean;
   notes?: string;
 }
+
+// ─── S3 Workspace Types ───────────────────────────────────────────────────
+
+export interface WorkspaceSyncParams {
+  /** S3 bucket name */
+  bucket: string;
+  /** S3 key prefix — typically the userId (all user files live under this) */
+  prefix: string;
+  /** Local directory to sync to/from */
+  localPath: string;
+  /** Optional subdirectory within the workspace to scope the sync */
+  scopePath?: string;
+}
+
+export interface WorkspaceSyncResult {
+  /** Number of files downloaded or uploaded */
+  fileCount: number;
+  /** Files that had conflicts (S3 version differs from local) */
+  conflicts: FileConflict[];
+  /** Total bytes transferred */
+  bytes: number;
+}
+
+export interface FileConflict {
+  /** Relative path within workspace */
+  path: string;
+  /** What happened */
+  resolution: 'skipped' | 'overwritten' | 'renamed';
+  /** If renamed, the new path */
+  renamedTo?: string;
+  /** ETag of the S3 version */
+  s3ETag?: string;
+  /** Last modified time of local version */
+  localModified?: string;
+}
+
+export type AgentBackend = 'harness' | 'claude-agent-sdk' | 'claude-cli' | 'http';

@@ -43,7 +43,7 @@ import {
   STEP_ACTIVITY_TIMEOUT,
   STEP_HEARTBEAT_TIMEOUT,
   STEP_RETRY_POLICY,
-  S3_SYNC_TIMEOUT,
+  WORKSPACE_SYNC_TIMEOUT,
   CONTINUE_AS_NEW_INTERVAL,
 } from '../shared/constants.js';
 
@@ -73,14 +73,34 @@ export const getPhaseQuery = defineQuery<string>('getPhase');
 
 export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmProcessResult> {
   // Proxy activities with appropriate timeouts
-  const { executeStep, syncToS3 } = proxyActivities<typeof activities>({
+  const { executeStep } = proxyActivities<typeof activities>({
     startToCloseTimeout: STEP_ACTIVITY_TIMEOUT,
     heartbeatTimeout: STEP_HEARTBEAT_TIMEOUT,
     retry: STEP_RETRY_POLICY,
   });
 
+  // Separate proxy for sync activities with shorter timeout
+  const syncActivities = proxyActivities<typeof activities>({
+    startToCloseTimeout: WORKSPACE_SYNC_TIMEOUT,
+    heartbeatTimeout: '60s',
+    retry: { maximumAttempts: 2, initialInterval: '5s', backoffCoefficient: 2 },
+  });
+
   // Initialize or resume state
   const state: FsmWorkflowState = input.resumeState || initializeState(input);
+
+  // ── Pull workspace from S3 (skip on resume — already pulled) ──────────
+  if (!input.resumeState && input.s3Bucket && input.s3Prefix) {
+    try {
+      await syncActivities.pullWorkspaceFromS3({
+        bucket: input.s3Bucket,
+        prefix: input.s3Prefix,
+        localPath: input.workspacePath,
+      });
+    } catch {
+      // Non-fatal — may be first run with empty workspace
+    }
+  }
 
   // Signal state
   let approvalReceived = false;
@@ -298,20 +318,18 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   // are already in place from the generator). Full finalization (versioned → final
   // file copy) can be added as an activity.
 
-  // ─── SYNC TO S3 ───────────────────────────────────────────────────────
+  // ─── PUSH WORKSPACE TO S3 ───────────────────────────────────────────
 
-  const s3Activity = proxyActivities<typeof activities>({
-    startToCloseTimeout: S3_SYNC_TIMEOUT,
-  });
-
-  try {
-    await s3Activity.syncToS3({
-      workspacePath: input.workspacePath,
-      outputDir: '', // Will be resolved from config
-      prefix: `fsm/${input.runId}`,
-    });
-  } catch {
-    // Non-fatal: S3 sync failure doesn't fail the workflow
+  if (input.s3Bucket && input.s3Prefix) {
+    try {
+      await syncActivities.pushWorkspaceToS3({
+        bucket: input.s3Bucket,
+        prefix: input.s3Prefix,
+        localPath: input.workspacePath,
+      });
+    } catch {
+      // Non-fatal: S3 sync failure doesn't fail the workflow
+    }
   }
 
   // ─── COMPLETE ──────────────────────────────────────────────────────────

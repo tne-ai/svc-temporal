@@ -1,10 +1,12 @@
 /**
- * Skill invocation activity — two execution backends.
+ * Skill invocation activity — four execution backends.
  *
  * Ported from tne-plugins/plugins/tne/engine/invoker.py.
  *
- * - Local (default): `claude -p` subprocess
- * - Horizon API: HTTP POST to FSM_INVOKE_URL
+ * - agent-harness (default): @tne-ai/agent-harness streaming agent
+ * - claude-agent-sdk: Anthropic Claude Agent SDK
+ * - claude-cli: `claude -p` subprocess
+ * - http: HTTP POST to FSM_INVOKE_URL (Horizon API)
  */
 
 import { spawn } from 'child_process';
@@ -15,6 +17,7 @@ import {
   FSM_INVOKE_SECRET,
   SKILL_INVOCATION_TIMEOUT_MS,
   HEARTBEAT_INTERVAL_MS,
+  AGENT_BACKEND,
 } from '../shared/constants.js';
 import type { InvocationResult, Step } from '../shared/types.js';
 import { resolveTemplateVars } from '../config/templateResolver.js';
@@ -216,14 +219,118 @@ function isOnlySessionEndHookError(stderr: string): boolean {
 }
 
 /**
- * Invoke a skill using the configured backend (Horizon API or local claude -p).
+ * Invoke a skill via the @tne-ai/agent-harness streaming agent.
+ */
+async function invokeViaHarness(
+  prompt: string,
+  model?: string,
+  permissionMode?: string,
+  workspacePath?: string,
+): Promise<InvocationResult> {
+  try {
+    const { createAgent } = await import('@tne-ai/agent-harness');
+    const agent = createAgent({
+      model: model || 'claude-sonnet-4-6',
+      cwd: workspacePath || process.cwd(),
+      permissionMode: (permissionMode as any) || 'bypassPermissions',
+      maxTurns: 30,
+    });
+
+    let stdout = '';
+    let lastHeartbeat = Date.now();
+
+    for await (const event of agent.query(prompt)) {
+      // Agent harness emits various event types — capture text content from assistant messages
+      const ev = event as any;
+      if (ev.type === 'assistant' && ev.message?.content) {
+        for (const block of ev.message.content) {
+          if (block.type === 'text') stdout += block.text;
+        }
+      } else if (ev.type === 'result') {
+        if (typeof ev.text === 'string') stdout += ev.text;
+      }
+      // Heartbeat every 5 seconds
+      if (Date.now() - lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
+        heartbeat({ status: 'running', backend: 'harness', len: stdout.length });
+        lastHeartbeat = Date.now();
+      }
+    }
+
+    return { success: true, stdout, stderr: '', exitCode: 0 };
+  } catch (err) {
+    return {
+      success: false,
+      stdout: '',
+      stderr: String(err),
+      exitCode: 1,
+    };
+  }
+}
+
+/**
+ * Invoke a skill via the Anthropic SDK directly (messages API with agentic loop).
+ *
+ * Uses the @anthropic-ai/sdk to call Claude's messages API. For simple
+ * single-turn skill invocations this is sufficient. For multi-turn tool-using
+ * agents, consider switching to agent-harness or extending with tool definitions.
+ */
+async function invokeViaClaudeAgentSDK(
+  prompt: string,
+  model?: string,
+  _workspacePath?: string,
+): Promise<InvocationResult> {
+  try {
+    const Anthropic = (await import('@anthropic-ai/sdk')).default;
+    const client = new Anthropic();
+
+    const message = await client.messages.create({
+      model: model || 'claude-sonnet-4-6',
+      max_tokens: 16384,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    let stdout = '';
+    for (const block of message.content) {
+      if (block.type === 'text') {
+        stdout += block.text;
+      }
+    }
+
+    return { success: true, stdout, stderr: '', exitCode: 0 };
+  } catch (err) {
+    return {
+      success: false,
+      stdout: '',
+      stderr: String(err),
+      exitCode: 1,
+    };
+  }
+}
+
+/**
+ * Invoke a skill using the configured backend.
+ *
+ * Backend selection priority:
+ * 1. FSM_INVOKE_URL (HTTP override) — always takes priority if set
+ * 2. AGENT_BACKEND env var — 'harness' | 'claude-agent-sdk' | 'claude-cli'
  */
 export async function invokeSkill(
   step: Step,
   prompt: string,
+  workspacePath?: string,
 ): Promise<InvocationResult> {
+  // HTTP override takes priority
   if (FSM_INVOKE_URL) {
     return invokeViaHorizon(prompt, step.model || undefined);
   }
-  return invokeViaSubprocess(prompt, step.model || undefined, step.permissionMode);
+
+  switch (AGENT_BACKEND) {
+    case 'harness':
+      return invokeViaHarness(prompt, step.model || undefined, step.permissionMode, workspacePath);
+    case 'claude-agent-sdk':
+      return invokeViaClaudeAgentSDK(prompt, step.model || undefined, workspacePath);
+    case 'claude-cli':
+    default:
+      return invokeViaSubprocess(prompt, step.model || undefined, step.permissionMode);
+  }
 }
