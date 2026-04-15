@@ -332,7 +332,8 @@ async function invokeViaClaudeAgentSDK(
       if (event.type === 'result') {
         if (event.result) stdout = event.result;
 
-        if (event.is_error || event.subtype !== 'success') {
+        // Trust subtype over is_error — the SDK may set is_error on successful completions
+        if (event.subtype !== 'success') {
           const errorMsg = event.errors?.join('; ') || event.subtype || 'Unknown error';
           console.error('[invokeViaClaudeAgentSDK] SDK error:', errorMsg);
           return {
