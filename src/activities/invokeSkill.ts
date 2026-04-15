@@ -10,7 +10,7 @@
  */
 
 import { spawn } from 'child_process';
-import { existsSync } from 'fs';
+import { existsSync, mkdirSync } from 'fs';
 import { heartbeat } from '@temporalio/activity';
 import {
   createClaudeSDKAgent,
@@ -234,11 +234,13 @@ async function invokeViaHarness(
   try {
     const { createAgent } = await import('@tne-ai/agent-harness');
     const resolvedModel = resolveModelId(model, 'agent');
+    const cwd = workspacePath || process.cwd();
+    if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true });
     // Support both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN
     const apiKey = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_CODE_OAUTH_TOKEN;
     const agent = createAgent({
       model: resolvedModel,
-      cwd: workspacePath || process.cwd(),
+      cwd,
       permissionMode: (permissionMode as any) || 'bypassPermissions',
       maxTurns: 30,
       ...(apiKey ? { apiKey } : {}),
@@ -292,12 +294,15 @@ async function invokeViaClaudeAgentSDK(
   workspacePath?: string,
 ): Promise<InvocationResult> {
   const resolvedModel = resolveModelId(model, 'agent');
-  console.log(`[invokeViaClaudeAgentSDK] model=${resolvedModel}, workspace=${workspacePath || 'cwd'}`);
+  const cwd = workspacePath || process.cwd();
+  // Ensure workspace directory exists before spawning Claude Code
+  if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true });
+  console.log(`[invokeViaClaudeAgentSDK] model=${resolvedModel}, workspace=${cwd}`);
 
   try {
     const agent = createClaudeSDKAgent({
       model: resolvedModel,
-      cwd: workspacePath || process.cwd(),
+      cwd,
       permissionMode: 'bypassPermissions',
       persistSession: false,
       maxTurns: 30,
