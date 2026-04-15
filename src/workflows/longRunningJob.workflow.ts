@@ -113,11 +113,12 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
   if (input.s3Bucket && input.s3Prefix) {
     statusMessage = 'Syncing results to S3...';
     try {
+      // Push all files from the workspace root; prefix S3 keys with outputFolder
+      // so they land under {userId}/{outputFolder}/ in S3
       await syncActivities.pushWorkspaceToS3({
         bucket: input.s3Bucket,
-        prefix: input.s3Prefix,
+        prefix: `${input.s3Prefix}/${outputFolder}`,
         localPath: workspacePath,
-        scopePath: outputFolder,
       });
     } catch {
       // Non-fatal
