@@ -91,7 +91,7 @@ export const AGENT_BACKEND: import('./types.js').AgentBackend =
 // ─── S3 Workspace ──────────────────────────────────────────────────────────
 
 /** S3 bucket for workspace sync */
-export const S3_BUCKET = typeof process !== 'undefined' ? (process.env.S3_BUCKET || '') : '';
+export const S3_BUCKET = typeof process !== 'undefined' ? (process.env.AWS_BUCKET || '') : '';
 
 /** AWS region (defaults to us-west-2) */
 export const AWS_REGION = typeof process !== 'undefined' ? (process.env.AWS_REGION || 'us-west-2') : 'us-west-2';

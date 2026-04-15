@@ -5,6 +5,9 @@
  * and starts polling for tasks on the configured task queues.
  */
 
+import { config } from 'dotenv';
+config();
+
 import { Worker, NativeConnection } from '@temporalio/worker';
 import { TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE, FSM_TASK_QUEUE, JOBS_TASK_QUEUE } from './shared/constants.js';
 
