@@ -103,6 +103,7 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
     },
     input.prompt,
     workspacePath,
+    input.agentBackend,
   );
 
   progress = 90;
@@ -128,6 +129,6 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
 
   return {
     status: result.success ? 'completed' : 'failed',
-    output: result.stdout,
+    output: result.success ? result.stdout : (result.stderr || result.stdout || 'Unknown error'),
   };
 }

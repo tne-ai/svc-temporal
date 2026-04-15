@@ -66,13 +66,13 @@ export const TRANSIENT_RETRY_POLICY = {
 export const CONTINUE_AS_NEW_INTERVAL = 5;
 
 /** Default model for evaluator steps */
-export const DEFAULT_EVALUATOR_MODEL = 'claude-haiku-4-5';
+export const DEFAULT_EVALUATOR_MODEL = 'claude-haiku-4-5-20251001';
 
 /** Default model for generator steps */
-export const DEFAULT_GENERATOR_MODEL = 'claude-sonnet-4-6';
+export const DEFAULT_GENERATOR_MODEL = 'claude-sonnet-4-20250514';
 
 /** Default model for preamble/postamble steps */
-export const DEFAULT_SUPPORT_MODEL = 'claude-haiku-4-5';
+export const DEFAULT_SUPPORT_MODEL = 'claude-haiku-4-5-20251001';
 
 // ─── Environment Variables ──────────────────────────────────────────────────
 

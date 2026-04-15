@@ -11,16 +11,17 @@
     "test": "vitest"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.108",
     "@anthropic-ai/sdk": "^0.39.0",
     "@aws-sdk/client-s3": "^3.500.0",
-    "@temporalio/activity": "^1.11.0",
-    "@temporalio/client": "^1.11.0",
-    "@temporalio/worker": "^1.11.0",
-    "@temporalio/workflow": "^1.11.0",
-    "@tne-ai/agent-harness": "https://github.com/tne-ai/agent-harness.git#main"
+    "@temporalio/activity": "^1.16.0",
+    "@temporalio/client": "^1.16.0",
+    "@temporalio/worker": "^1.16.0",
+    "@temporalio/workflow": "^1.16.0",
+    "@tne-ai/agent-harness": "git+https://github.com/tne-ai/agent-harness.git#main"
   },
   "devDependencies": {
-    "@temporalio/testing": "^1.11.0",
+    "@temporalio/testing": "^1.16.0",
     "@types/node": "^20.11.0",
     "typescript": "^5.3.0",
     "vitest": "^4.1.3"

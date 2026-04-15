@@ -4,7 +4,7 @@
  * Ported from tne-plugins/plugins/tne/engine/invoker.py.
  *
  * - agent-harness (default): @tne-ai/agent-harness streaming agent
- * - claude-agent-sdk: Anthropic Claude Agent SDK
+ * - claude-agent-sdk: @anthropic-ai/claude-agent-sdk via agent-harness wrapper
  * - claude-cli: `claude -p` subprocess
  * - http: HTTP POST to FSM_INVOKE_URL (Horizon API)
  */
@@ -13,13 +13,17 @@ import { spawn } from 'child_process';
 import { existsSync } from 'fs';
 import { heartbeat } from '@temporalio/activity';
 import {
+  createClaudeSDKAgent,
+  resolveModelId,
+} from '@tne-ai/agent-harness';
+import {
   FSM_INVOKE_URL,
   FSM_INVOKE_SECRET,
   SKILL_INVOCATION_TIMEOUT_MS,
   HEARTBEAT_INTERVAL_MS,
   AGENT_BACKEND,
 } from '../shared/constants.js';
-import type { InvocationResult, Step } from '../shared/types.js';
+import type { AgentBackend, InvocationResult, Step } from '../shared/types.js';
 import { resolveTemplateVars } from '../config/templateResolver.js';
 
 /**
@@ -229,11 +233,15 @@ async function invokeViaHarness(
 ): Promise<InvocationResult> {
   try {
     const { createAgent } = await import('@tne-ai/agent-harness');
+    const resolvedModel = resolveModelId(model, 'agent');
+    // Support both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN
+    const apiKey = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_CODE_OAUTH_TOKEN;
     const agent = createAgent({
-      model: model || 'claude-sonnet-4-6',
+      model: resolvedModel,
       cwd: workspacePath || process.cwd(),
       permissionMode: (permissionMode as any) || 'bypassPermissions',
       maxTurns: 30,
+      ...(apiKey ? { apiKey } : {}),
     });
 
     let stdout = '';
@@ -268,36 +276,79 @@ async function invokeViaHarness(
 }
 
 /**
- * Invoke a skill via the Anthropic SDK directly (messages API with agentic loop).
+ * Invoke a skill via the official Claude Agent SDK.
  *
- * Uses the @anthropic-ai/sdk to call Claude's messages API. For simple
- * single-turn skill invocations this is sufficient. For multi-turn tool-using
- * agents, consider switching to agent-harness or extending with tool definitions.
+ * Uses @tne-ai/agent-harness's createClaudeSDKAgent() wrapper which provides:
+ * - Full tool support (Read, Write, Edit, Bash, Glob, Grep, WebSearch, etc.)
+ * - System prompt from CLAUDE.md
+ * - Extended thinking (16k budget)
+ * - 1M context window
+ * - bypassPermissions mode
+ * - Model resolution (aliases → full IDs)
  */
 async function invokeViaClaudeAgentSDK(
   prompt: string,
   model?: string,
-  _workspacePath?: string,
+  workspacePath?: string,
 ): Promise<InvocationResult> {
-  try {
-    const Anthropic = (await import('@anthropic-ai/sdk')).default;
-    const client = new Anthropic();
+  const resolvedModel = resolveModelId(model, 'agent');
+  console.log(`[invokeViaClaudeAgentSDK] model=${resolvedModel}, workspace=${workspacePath || 'cwd'}`);
 
-    const message = await client.messages.create({
-      model: model || 'claude-sonnet-4-6',
-      max_tokens: 16384,
-      messages: [{ role: 'user', content: prompt }],
+  try {
+    const agent = createClaudeSDKAgent({
+      model: resolvedModel,
+      cwd: workspacePath || process.cwd(),
+      permissionMode: 'bypassPermissions',
+      persistSession: false,
+      maxTurns: 30,
+      wrapPrompt: true,
+      workspacePath,
+      env: {
+        ...process.env as Record<string, string>,
+        // Ensure OAuth token is available
+        ...(process.env.CLAUDE_CODE_OAUTH_TOKEN && !process.env.ANTHROPIC_API_KEY
+          ? { ANTHROPIC_API_KEY: process.env.CLAUDE_CODE_OAUTH_TOKEN }
+          : {}),
+      },
     });
 
     let stdout = '';
-    for (const block of message.content) {
-      if (block.type === 'text') {
-        stdout += block.text;
+    let lastHeartbeat = Date.now();
+
+    for await (const event of agent.query(prompt)) {
+      // Capture text from assistant messages
+      if (event.type === 'assistant' && event.message?.content) {
+        for (const block of event.message.content) {
+          if (block.type === 'text') stdout += block.text;
+        }
+      }
+
+      // Capture final result
+      if (event.type === 'result') {
+        if (event.result) stdout = event.result;
+
+        if (event.is_error || event.subtype !== 'success') {
+          const errorMsg = event.errors?.join('; ') || event.subtype || 'Unknown error';
+          console.error('[invokeViaClaudeAgentSDK] SDK error:', errorMsg);
+          return {
+            success: false,
+            stdout,
+            stderr: errorMsg,
+            exitCode: 1,
+          };
+        }
+      }
+
+      // Heartbeat
+      if (Date.now() - lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
+        heartbeat({ status: 'running', backend: 'claude-agent-sdk', len: stdout.length });
+        lastHeartbeat = Date.now();
       }
     }
 
     return { success: true, stdout, stderr: '', exitCode: 0 };
   } catch (err) {
+    console.error('[invokeViaClaudeAgentSDK] Error:', err);
     return {
       success: false,
       stdout: '',
@@ -308,23 +359,28 @@ async function invokeViaClaudeAgentSDK(
 }
 
 /**
- * Invoke a skill using the configured backend.
+ * Invoke a skill using the specified or configured backend.
  *
  * Backend selection priority:
  * 1. FSM_INVOKE_URL (HTTP override) — always takes priority if set
- * 2. AGENT_BACKEND env var — 'harness' | 'claude-agent-sdk' | 'claude-cli'
+ * 2. Per-request agentBackend parameter (from workflow input)
+ * 3. AGENT_BACKEND env var — 'harness' | 'claude-agent-sdk' | 'claude-cli'
  */
 export async function invokeSkill(
   step: Step,
   prompt: string,
   workspacePath?: string,
+  agentBackend?: AgentBackend,
 ): Promise<InvocationResult> {
   // HTTP override takes priority
   if (FSM_INVOKE_URL) {
     return invokeViaHorizon(prompt, step.model || undefined);
   }
 
-  switch (AGENT_BACKEND) {
+  const backend = agentBackend || AGENT_BACKEND;
+  console.log(`[invokeSkill] backend=${backend}, skill=${step.skill}, model=${step.model || 'default'}`);
+
+  switch (backend) {
     case 'harness':
       return invokeViaHarness(prompt, step.model || undefined, step.permissionMode, workspacePath);
     case 'claude-agent-sdk':

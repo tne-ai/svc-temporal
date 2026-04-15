@@ -22,7 +22,7 @@ const INLINE_STEP_RE = /^\(.*\)$|^[A-Z][A-Z0-9_]+$/;
  * This activity heartbeats throughout to keep Temporal informed of progress.
  */
 export async function executeStep(params: StepExecutionParams): Promise<StepResult> {
-  const { step, iteration, templateVars, feedback, humanNotes, workspacePath, manifestPath } = params;
+  const { step, iteration, templateVars, feedback, humanNotes, workspacePath, manifestPath, agentBackend } = params;
 
   heartbeat({ step: step.number, skill: step.skill, status: 'starting' });
 
@@ -42,7 +42,7 @@ export async function executeStep(params: StepExecutionParams): Promise<StepResu
     heartbeat({ step: step.number, skill: step.skill, status: 'invoking', retry: retries });
 
     // Invoke the skill
-    const invResult = await invokeSkill(step, prompt + (currentFeedback ? `\n\n## Revision Feedback\n\n${currentFeedback}` : ''), workspacePath);
+    const invResult = await invokeSkill(step, prompt + (currentFeedback ? `\n\n## Revision Feedback\n\n${currentFeedback}` : ''), workspacePath, agentBackend);
 
     if (!invResult.success) {
       // Check for stage review pause (nested orchestrator)

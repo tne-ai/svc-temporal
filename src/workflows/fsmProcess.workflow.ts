@@ -380,6 +380,7 @@ function buildStepParams(
     feedback,
     humanNotes: state.steps[`${stepPhase(step, input)}.${step.number}`]?.humanNotes,
     workspacePath: input.workspacePath,
+    agentBackend: input.agentBackend,
   };
 }
 

@@ -138,6 +138,8 @@ export interface FsmProcessInput {
   s3Bucket?: string;
   /** S3 key prefix (usually userId) */
   s3Prefix?: string;
+  /** Agent backend override — if unset, falls back to AGENT_BACKEND env var */
+  agentBackend?: AgentBackend;
 }
 
 export interface FsmProcessResult {
@@ -183,6 +185,7 @@ export interface StepExecutionParams {
   humanNotes?: string;
   workspacePath: string;
   manifestPath?: string;
+  agentBackend?: AgentBackend;
 }
 
 export interface StepResult {
@@ -248,6 +251,8 @@ export interface JobInput {
   s3Prefix?: string;
   /** Output folder within workspace (e.g., "jobs/my-job") */
   outputFolder?: string;
+  /** Agent backend override — if unset, falls back to AGENT_BACKEND env var */
+  agentBackend?: AgentBackend;
 }
 
 export interface JobResult {
