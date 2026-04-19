@@ -5,6 +5,13 @@
  * and starts polling for tasks on the configured task queues.
  */
 
+// Remove AWS_PROFILE before any imports touch the AWS SDK credential chain.
+// When both AWS_PROFILE and static credentials (from eval) are present,
+// the SDK warns and picks the profile path — which can resolve stale creds.
+if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && process.env.AWS_PROFILE) {
+  delete process.env.AWS_PROFILE;
+}
+
 import { config } from 'dotenv';
 config();
 

@@ -122,8 +122,10 @@ export interface ProcessConfig {
 export interface FsmProcessInput {
   /** Unique run identifier (maps to ProcessRun.id in Horizon) */
   runId: string;
-  /** Parsed process config from SKILL.md */
-  config: ProcessConfig;
+  /** Skill name to resolve and parse (e.g., "p-ceo1-strategy") */
+  skillName?: string;
+  /** Parsed process config from SKILL.md — if omitted, resolved via skillName */
+  config?: ProcessConfig;
   /** Template variables resolved from inputs file */
   templateVars: Record<string, string>;
   /** Path to the workspace directory */
@@ -186,6 +188,14 @@ export interface StepExecutionParams {
   workspacePath: string;
   manifestPath?: string;
   agentBackend?: AgentBackend;
+  /** Parent FSM run id — passed to the agent so nested fsm-start calls link back. */
+  parentRunId?: string;
+  /** User id — forwarded to horizon's /api/fsm-invoke/start for nested FSM runs. */
+  userId?: string;
+  /** S3 bucket for periodic workspace sync during long-running skill invocations. */
+  s3Bucket?: string;
+  /** S3 key prefix (usually userId) for periodic workspace sync. */
+  s3Prefix?: string;
 }
 
 export interface StepResult {

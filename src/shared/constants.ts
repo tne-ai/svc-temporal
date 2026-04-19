@@ -82,6 +82,44 @@ export const FSM_INVOKE_URL = typeof process !== 'undefined' ? (process.env.FSM_
 /** Secret for Horizon API authentication */
 export const FSM_INVOKE_SECRET = typeof process !== 'undefined' ? (process.env.FSM_INVOKE_SECRET || '') : '';
 
+/**
+ * Base URL for Horizon's /api/fsm-invoke endpoints. Set this once and
+ * HORIZON_FSM_START_URL / HORIZON_FSM_EVENTS_URL derive from it. Lets non-HTTP
+ * backends (claude-agent-sdk, harness, cli) still emit events back to Horizon
+ * without needing FSM_INVOKE_URL set.
+ *
+ * Resolution order: HORIZON_API_BASE_URL → FSM_INVOKE_URL (stripped of /invoke).
+ */
+const HORIZON_FSM_BASE = (() => {
+  if (typeof process === 'undefined') return '';
+  if (process.env.HORIZON_API_BASE_URL) return process.env.HORIZON_API_BASE_URL.replace(/\/+$/, '');
+  const invoke = process.env.FSM_INVOKE_URL || '';
+  if (!invoke) return '';
+  return invoke.replace(/\/invoke\/?$/, '');
+})();
+
+/**
+ * Horizon's /api/fsm-invoke/start URL, used by the FSM_START PreToolUse hook so
+ * nested fsm-start calls made inside a worker skill register as child FsmRuns in
+ * Horizon's DB with parentRunId set.
+ */
+export const HORIZON_FSM_START_URL = (() => {
+  if (typeof process === 'undefined') return '';
+  if (process.env.HORIZON_FSM_START_URL) return process.env.HORIZON_FSM_START_URL;
+  return HORIZON_FSM_BASE ? `${HORIZON_FSM_BASE}/start` : '';
+})();
+
+/**
+ * Horizon's /api/fsm-invoke/events URL — where the worker POSTs message /
+ * tool_use / file_change / heartbeat events so the App Events tab can render
+ * them live. Without this set, every event is silently dropped.
+ */
+export const HORIZON_FSM_EVENTS_URL = (() => {
+  if (typeof process === 'undefined') return '';
+  if (process.env.HORIZON_FSM_EVENTS_URL) return process.env.HORIZON_FSM_EVENTS_URL;
+  return HORIZON_FSM_BASE ? `${HORIZON_FSM_BASE}/events` : '';
+})();
+
 // ─── Agent Backend ─────────────────────────────────────────────────────────
 
 /** Which agent backend to use for skill invocation */
@@ -102,10 +140,22 @@ export const WORKSPACE_SYNC_TIMEOUT = '15m';
 /** Max concurrent S3 operations during sync */
 export const S3_SYNC_CONCURRENCY = 20;
 
+/** Interval for periodic S3 sync during long-running skill invocations */
+export const PERIODIC_S3_SYNC_INTERVAL_MS = 30_000; // 30 seconds
+
 /** Files/dirs to exclude from S3 sync */
 export const SYNC_EXCLUDE_PATTERNS = [
   'node_modules', '.git', '.venv', '__pycache__', '*.pyc',
   'dist', 'build', '.next', '.cache', 'coverage', '.nyc_output',
   '.DS_Store', 'Thumbs.db', '.vscode', '.idea', '*.log',
   '.env.local', '.env.*.local',
+  // Conflict-resolution side paths written back to S3 when S3 was newer than local.
+  // Never sync them: they'd pull down into the workspace and get re-scanned/pushed,
+  // amplifying every cycle (observed: 4 backup generations per file).
+  '*.temporal-*',
+  // Agent scaffolding materialized on every invocation — prompts, skill cache,
+  // project state, debug output. Syncing these re-uploads thousands of static
+  // files per 30s tick and pollutes S3 with ephemeral debugger state.
+  '.claude/skills', '.claude/projects', '.claude/EBP', '.claude/debug',
+  '*.lock', '*.tmp',
 ];

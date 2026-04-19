@@ -22,9 +22,75 @@ import {
   SKILL_INVOCATION_TIMEOUT_MS,
   HEARTBEAT_INTERVAL_MS,
   AGENT_BACKEND,
+  HORIZON_FSM_START_URL,
+  PERIODIC_S3_SYNC_INTERVAL_MS,
 } from '../shared/constants.js';
 import type { AgentBackend, InvocationResult, Step } from '../shared/types.js';
 import { resolveTemplateVars } from '../config/templateResolver.js';
+import { emitEvent } from './emitEvent.js';
+import { pushWorkspaceToS3 } from './workspaceSync.js';
+
+/** Extract a short text preview for message events (strip surrounding whitespace). */
+function previewText(text: string, max = 600): string {
+  const s = text.trim();
+  return s.length <= max ? s : s.slice(0, max) + '…';
+}
+
+/** Detect Write/Edit tool uses that touch files — used to emit file_change events. */
+function fileFromToolUse(toolName: string, input: any): string | null {
+  if (!input || typeof input !== 'object') return null;
+  if (toolName === 'Write' || toolName === 'Edit' || toolName === 'NotebookEdit') {
+    return input.file_path || input.path || null;
+  }
+  return null;
+}
+
+/**
+ * Start a background timer that pushes the workspace to S3 every 30s while the
+ * skill invocation runs. Returns a stop() function that clears the timer and
+ * awaits any in-flight upload. Failures are non-fatal — work-in-progress visibility
+ * should never fail an invocation.
+ */
+function startPeriodicS3Sync(
+  workspacePath: string,
+  s3Bucket?: string,
+  s3Prefix?: string,
+  runId?: string,
+): () => Promise<void> {
+  if (!s3Bucket || !s3Prefix || !workspacePath) return async () => {};
+  let inFlight: Promise<void> | null = null;
+  let stopped = false;
+  const tick = async () => {
+    if (stopped) return;
+    try {
+      const result = await pushWorkspaceToS3({
+        bucket: s3Bucket,
+        prefix: s3Prefix,
+        localPath: workspacePath,
+      });
+      if (result.fileCount > 0) {
+        emitEvent(runId, 'heartbeat', {
+          status: 's3_sync',
+          fileCount: result.fileCount,
+          bytes: result.bytes,
+        });
+      }
+    } catch (err) {
+      console.error('[periodic-s3-sync] failed:', err);
+    }
+  };
+  const timer = setInterval(() => {
+    if (inFlight) return; // skip if previous tick still running
+    inFlight = tick().finally(() => { inFlight = null; });
+  }, PERIODIC_S3_SYNC_INTERVAL_MS);
+  return async () => {
+    stopped = true;
+    clearInterval(timer);
+    if (inFlight) await inFlight;
+    // Final sync to capture last changes
+    await tick();
+  };
+}
 
 /**
  * Build the full prompt for a skill invocation.
@@ -92,17 +158,24 @@ export function buildPrompt(
 async function invokeViaHorizon(
   prompt: string,
   model?: string,
+  context?: { parentRunId?: string; userId?: string },
 ): Promise<InvocationResult> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (FSM_INVOKE_SECRET) {
     headers['Authorization'] = `Bearer ${FSM_INVOKE_SECRET}`;
+    headers['x-fsm-secret'] = FSM_INVOKE_SECRET;
   }
 
   try {
     const response = await fetch(FSM_INVOKE_URL, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ prompt, model: model || '' }),
+      body: JSON.stringify({
+        prompt,
+        model: model || '',
+        runId: context?.parentRunId,
+        userId: context?.userId,
+      }),
       signal: AbortSignal.timeout(SKILL_INVOCATION_TIMEOUT_MS),
     });
 
@@ -230,31 +303,44 @@ async function invokeViaHarness(
   model?: string,
   permissionMode?: string,
   workspacePath?: string,
+  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string },
 ): Promise<InvocationResult> {
+  const stopSync = startPeriodicS3Sync(workspacePath || '', context?.s3Bucket, context?.s3Prefix, context?.parentRunId);
   try {
     const { createAgent } = await import('@tne-ai/agent-harness');
     const resolvedModel = resolveModelId(model, 'agent');
     const cwd = workspacePath || process.cwd();
     if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true });
-    // Support both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN
-    const apiKey = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    // Only pass a real API key as apiKey; OAuth tokens flow via env var and
+    // must NOT be passed as ANTHROPIC_API_KEY (they're rejected as invalid).
+    const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
     const agent = createAgent({
       model: resolvedModel,
       cwd,
       permissionMode: (permissionMode as any) || 'bypassPermissions',
-      maxTurns: 30,
+      // FSM steps can legitimately need many tool rounds (read/grep/edit/write
+      // across a big workspace, plus nested skill invocations). 30 was too tight.
+      maxTurns: 200,
       ...(apiKey ? { apiKey } : {}),
     });
 
     let stdout = '';
     let lastHeartbeat = Date.now();
+    const runId = context?.parentRunId;
 
     for await (const event of agent.query(prompt)) {
       // Agent harness emits various event types — capture text content from assistant messages
       const ev = event as any;
       if (ev.type === 'assistant' && ev.message?.content) {
         for (const block of ev.message.content) {
-          if (block.type === 'text') stdout += block.text;
+          if (block.type === 'text') {
+            stdout += block.text;
+            emitEvent(runId, 'message', { backend: 'harness', text: previewText(block.text) });
+          } else if (block.type === 'tool_use') {
+            emitEvent(runId, 'tool_use', { backend: 'harness', tool: block.name, input: block.input });
+            const file = fileFromToolUse(block.name, block.input);
+            if (file) emitEvent(runId, 'file_change', { tool: block.name, path: file });
+          }
         }
       } else if (ev.type === 'result') {
         if (typeof ev.text === 'string') stdout += ev.text;
@@ -274,7 +360,108 @@ async function invokeViaHarness(
       stderr: String(err),
       exitCode: 1,
     };
+  } finally {
+    await stopSync().catch(() => {});
   }
+}
+
+/**
+ * Build a PreToolUse hook that intercepts `fsm-start` bash commands and routes
+ * them to Horizon's /api/fsm-invoke/start with parentRunId set. This makes
+ * nested p-* orchestrator invocations register as child FsmRuns.
+ *
+ * If HORIZON_FSM_START_URL is not configured the hooks object is empty and the
+ * fsm-start command falls through to whatever the subprocess PATH resolves —
+ * same behavior as before this change.
+ */
+function buildNestedFsmHooks(
+  context?: { parentRunId?: string; userId?: string },
+): Record<string, any[]> | undefined {
+  if (!HORIZON_FSM_START_URL || !context?.parentRunId) return undefined;
+
+  return {
+    PreToolUse: [
+      {
+        matcher: 'Bash',
+        hooks: [
+          async (input: any) => {
+            try {
+              const command: string | undefined = input?.tool_input?.command;
+              if (!command || typeof command !== 'string') return {};
+              const match = command.match(
+                /(?:^|\s|&&\s*|;\s*)(?:\.\/)?(?:\.local\/bin\/)?fsm-start\s+([\w-]+)(.*)$/,
+              );
+              if (!match) return {};
+              const skillName = match[1];
+              const flags = match[2] || '';
+              const resume = /\s--resume\b/.test(flags);
+
+              const headers: Record<string, string> = {
+                'Content-Type': 'application/json',
+              };
+              if (FSM_INVOKE_SECRET) headers['x-fsm-secret'] = FSM_INVOKE_SECRET;
+
+              const response = await fetch(HORIZON_FSM_START_URL, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                  skillName,
+                  userId: context.userId,
+                  resume,
+                  parentRunId: context.parentRunId,
+                  useTemporal: true,
+                }),
+              });
+
+              if (!response.ok) {
+                const text = await response.text().catch(() => '');
+                return {
+                  hookSpecificOutput: {
+                    ...input,
+                    tool_input: {
+                      ...input.tool_input,
+                      command: `echo 'fsm-start failed: HTTP ${response.status} — ${text.replace(/'/g, "'\\''")}'`,
+                    },
+                  },
+                };
+              }
+
+              const data: any = await response.json().catch(() => ({}));
+
+              // Surface the spawn on the parent's event stream so the Agent
+              // Tree / App Events views update immediately, before the child
+              // starts emitting its own events.
+              emitEvent(context.parentRunId, 'child_run_started', {
+                childRunId: data.runId,
+                skill: skillName,
+                resumed: resume,
+              });
+
+              return {
+                hookSpecificOutput: {
+                  ...input,
+                  tool_input: {
+                    ...input.tool_input,
+                    command: `echo 'FSM child run started. Parent: ${context.parentRunId} Child: ${data.runId || 'unknown'} Skill: ${skillName}'`,
+                  },
+                },
+              };
+            } catch (err: any) {
+              return {
+                hookSpecificOutput: {
+                  ...input,
+                  tool_input: {
+                    ...input.tool_input,
+                    command: `echo 'fsm-start hook error: ${String(err?.message || err).replace(/'/g, "'\\''")}'`,
+                  },
+                },
+              };
+            }
+          },
+        ],
+      },
+    ],
+  };
 }
 
 /**
@@ -292,6 +479,7 @@ async function invokeViaClaudeAgentSDK(
   prompt: string,
   model?: string,
   workspacePath?: string,
+  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string },
 ): Promise<InvocationResult> {
   const resolvedModel = resolveModelId(model, 'agent');
   const cwd = workspacePath || process.cwd();
@@ -299,32 +487,50 @@ async function invokeViaClaudeAgentSDK(
   if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true });
   console.log(`[invokeViaClaudeAgentSDK] model=${resolvedModel}, workspace=${cwd}`);
 
+  const stopSync = startPeriodicS3Sync(cwd, context?.s3Bucket, context?.s3Prefix, context?.parentRunId);
   try {
     const agent = createClaudeSDKAgent({
       model: resolvedModel,
       cwd,
       permissionMode: 'bypassPermissions',
       persistSession: false,
-      maxTurns: 30,
+      // FSM steps can legitimately need many tool rounds. 30 was the observed
+      // cap that failed p-cso1-write-business-plan mid-execution.
+      maxTurns: 200,
       wrapPrompt: true,
       workspacePath,
-      env: {
-        ...process.env as Record<string, string>,
-        // Ensure OAuth token is available
-        ...(process.env.CLAUDE_CODE_OAUTH_TOKEN && !process.env.ANTHROPIC_API_KEY
-          ? { ANTHROPIC_API_KEY: process.env.CLAUDE_CODE_OAUTH_TOKEN }
-          : {}),
-      },
+      hooks: buildNestedFsmHooks(context),
+      env: (() => {
+        // OAuth tokens (sk-ant-oat01-…) must stay in CLAUDE_CODE_OAUTH_TOKEN.
+        // They are NOT valid as ANTHROPIC_API_KEY and will be rejected with
+        // "Invalid API key" if sent via x-api-key.
+        const out: Record<string, string> = { ...(process.env as Record<string, string>) };
+        const oauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+        const apiKey = process.env.ANTHROPIC_API_KEY;
+        if (oauth && (!apiKey || !apiKey.trim())) {
+          delete out.ANTHROPIC_API_KEY;
+          out.CLAUDE_CODE_OAUTH_TOKEN = oauth;
+        }
+        return out;
+      })(),
     });
 
     let stdout = '';
     let lastHeartbeat = Date.now();
+    const runId = context?.parentRunId;
 
     for await (const event of agent.query(prompt)) {
-      // Capture text from assistant messages
+      // Capture text from assistant messages + emit message/tool_use/file_change events
       if (event.type === 'assistant' && event.message?.content) {
         for (const block of event.message.content) {
-          if (block.type === 'text') stdout += block.text;
+          if (block.type === 'text') {
+            stdout += block.text;
+            emitEvent(runId, 'message', { backend: 'claude-agent-sdk', text: previewText(block.text) });
+          } else if (block.type === 'tool_use') {
+            emitEvent(runId, 'tool_use', { backend: 'claude-agent-sdk', tool: block.name, input: block.input });
+            const file = fileFromToolUse(block.name, block.input);
+            if (file) emitEvent(runId, 'file_change', { tool: block.name, path: file });
+          }
         }
       }
 
@@ -361,6 +567,8 @@ async function invokeViaClaudeAgentSDK(
       stderr: String(err),
       exitCode: 1,
     };
+  } finally {
+    await stopSync().catch(() => {});
   }
 }
 
@@ -377,20 +585,21 @@ export async function invokeSkill(
   prompt: string,
   workspacePath?: string,
   agentBackend?: AgentBackend,
+  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string },
 ): Promise<InvocationResult> {
   // HTTP override takes priority
   if (FSM_INVOKE_URL) {
-    return invokeViaHorizon(prompt, step.model || undefined);
+    return invokeViaHorizon(prompt, step.model || undefined, context);
   }
 
   const backend = agentBackend || AGENT_BACKEND;
-  console.log(`[invokeSkill] backend=${backend}, skill=${step.skill}, model=${step.model || 'default'}`);
+  console.log(`[invokeSkill] backend=${backend}, skill=${step.skill}, model=${step.model || 'default'}, parentRunId=${context?.parentRunId || ''}`);
 
   switch (backend) {
     case 'harness':
-      return invokeViaHarness(prompt, step.model || undefined, step.permissionMode, workspacePath);
+      return invokeViaHarness(prompt, step.model || undefined, step.permissionMode, workspacePath, context);
     case 'claude-agent-sdk':
-      return invokeViaClaudeAgentSDK(prompt, step.model || undefined, workspacePath);
+      return invokeViaClaudeAgentSDK(prompt, step.model || undefined, workspacePath, context);
     case 'claude-cli':
     default:
       return invokeViaSubprocess(prompt, step.model || undefined, step.permissionMode);

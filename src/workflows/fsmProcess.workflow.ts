@@ -27,6 +27,7 @@ import type {
   FsmProcessInput,
   FsmProcessResult,
   FsmWorkflowState,
+  ProcessConfig,
   StepState,
   Step,
   IterationRecord,
@@ -86,8 +87,32 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
     retry: { maximumAttempts: 2, initialInterval: '5s', backoffCoefficient: 2 },
   });
 
+  // Config activity proxy (short timeout — just file reads)
+  const configActivities = proxyActivities<typeof activities>({
+    startToCloseTimeout: '30s',
+    retry: { maximumAttempts: 2, initialInterval: '2s', backoffCoefficient: 2 },
+  });
+
+  // ── Resolve config: either provided directly or parsed from skillName ──
+  let config: import('../shared/types.js').ProcessConfig;
+  if (input.config) {
+    config = input.config;
+  } else if (input.skillName) {
+    const parsed = await configActivities.parseConfig({
+      skillName: input.skillName,
+      workspacePath: input.workspacePath,
+      variables: input.templateVars,
+    });
+    config = parsed.config;
+  } else {
+    return {
+      status: 'failed',
+      state: { phase: Phase.INIT, iteration: 0, steps: {}, iterations: [], earlyExit: true },
+    };
+  }
+
   // Initialize or resume state
-  const state: FsmWorkflowState = input.resumeState || initializeState(input);
+  const state: FsmWorkflowState = input.resumeState || initializeState(config);
 
   // ── Pull workspace from S3 (skip on resume — already pulled) ──────────
   if (!input.resumeState && input.s3Bucket && input.s3Prefix) {
@@ -131,7 +156,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   if (state.phase === Phase.INIT || state.phase === Phase.PREAMBLE) {
     state.phase = Phase.PREAMBLE;
 
-    for (const step of input.config.preamble) {
+    for (const step of config.preamble) {
       if (cancelled) return { status: 'cancelled', state };
 
       const stepKey = `preamble.${step.number}`;
@@ -140,7 +165,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
       // Skip already completed steps (resume case)
       if (stepState?.status === StepStatus.COMPLETE) continue;
 
-      const result = await executeStep(buildStepParams(step, 0, input, state));
+      const result = await executeStep(buildStepParams(step, 0, input, config, state));
       updateStepState(state, stepKey, result);
 
       if (!result.success) {
@@ -148,7 +173,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
       }
 
       // Stage review: wait for human approval signal
-      if (input.config.stageReview && !input.autoApprove) {
+      if (config.stageReview && !input.autoApprove) {
         state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
         approvalReceived = false;
         await condition(() => approvalReceived || cancelled, '7 days');
@@ -161,7 +186,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
 
   // ─── APPROVAL GATE ─────────────────────────────────────────────────────
 
-  if (input.config.approvalGate && state.phase === Phase.PREAMBLE) {
+  if (config.approvalGate && state.phase === Phase.PREAMBLE) {
     state.phase = Phase.APPROVAL_GATE;
     approvalReceived = false;
     await condition(() => approvalReceived || cancelled, '7 days');
@@ -170,18 +195,18 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
 
   // ─── GENERATOR ↔ EVALUATOR LOOP ───────────────────────────────────────
 
-  if (input.config.evaluatorMode !== EvaluatorMode.SEQUENTIAL_ONLY) {
+  if (config.evaluatorMode !== EvaluatorMode.SEQUENTIAL_ONLY) {
     if (state.phase === Phase.PREAMBLE || state.phase === Phase.APPROVAL_GATE) {
       state.phase = Phase.GENERATOR;
       state.iteration = 1;
     }
 
-    while (state.iteration <= input.config.maxIterations && !cancelled) {
+    while (state.iteration <= config.maxIterations && !cancelled) {
       // Generator phase
       state.phase = Phase.GENERATOR;
       const feedback = collectFeedback(state);
 
-      for (const step of input.config.generator) {
+      for (const step of config.generator) {
         if (cancelled) return { status: 'cancelled', state };
 
         const stepKey = `generator.${step.number}`;
@@ -192,7 +217,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
         }
 
         const result = await executeStep(
-          buildStepParams(step, state.iteration, input, state, feedback)
+          buildStepParams(step, state.iteration, input, config, state, feedback)
         );
         updateStepState(state, stepKey, result);
 
@@ -200,7 +225,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
           return { status: 'failed', state };
         }
 
-        if (input.config.stageReview && !input.autoApprove) {
+        if (config.stageReview && !input.autoApprove) {
           state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
           approvalReceived = false;
           await condition(() => approvalReceived || cancelled, '7 days');
@@ -216,14 +241,14 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
       const keyIssues: string[] = [];
       let stoppingEvaluator = '';
 
-      for (const step of input.config.evaluator) {
+      for (const step of config.evaluator) {
         if (cancelled) return { status: 'cancelled', state };
 
         const stepKey = `evaluator.${step.number}`;
         resetStepState(state, stepKey);
 
         const result = await executeStep(
-          buildStepParams(step, state.iteration, input, state)
+          buildStepParams(step, state.iteration, input, config, state)
         );
         updateStepState(state, stepKey, result);
 
@@ -232,7 +257,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
           stoppingEvaluator = step.skill;
           keyIssues.push(result.feedback || result.error || 'Evaluator failed');
 
-          if (input.config.evaluatorMode === EvaluatorMode.FAIL_FAST) break;
+          if (config.evaluatorMode === EvaluatorMode.FAIL_FAST) break;
         }
       }
 
@@ -255,12 +280,13 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
         state.phase = Phase.GENERATOR;
         await continueAsNew<typeof FsmProcessWorkflow>({
           ...input,
+          config,
           resumeState: state,
         });
       }
     }
 
-    if (state.iteration > input.config.maxIterations) {
+    if (state.iteration > config.maxIterations) {
       state.earlyExit = true;
     }
   } else {
@@ -275,28 +301,28 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   if (state.phase !== Phase.FINALIZATION && state.phase !== Phase.COMPLETE) {
     state.phase = Phase.POSTAMBLE;
 
-    if (input.config.postamble.length > 0) {
-      const hasDeps = input.config.postamble.some(s => s.dependsOn.length > 0);
+    if (config.postamble.length > 0) {
+      const hasDeps = config.postamble.some(s => s.dependsOn.length > 0);
 
       if (hasDeps) {
-        await runPostambleParallel(input, state, executeStep);
+        await runPostambleParallel(input, config, state, executeStep);
       } else {
         // Sequential postamble
-        for (const step of input.config.postamble) {
+        for (const step of config.postamble) {
           if (cancelled) return { status: 'cancelled', state };
 
           const stepKey = `postamble.${step.number}`;
           const stepState = state.steps[stepKey];
           if (stepState?.status === StepStatus.COMPLETE) continue;
 
-          const result = await executeStep(buildStepParams(step, 0, input, state));
+          const result = await executeStep(buildStepParams(step, 0, input, config, state));
           updateStepState(state, stepKey, result);
 
           if (!result.success) {
             return { status: 'failed', state };
           }
 
-          if (input.config.stageReview && !input.autoApprove) {
+          if (config.stageReview && !input.autoApprove) {
             state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
             approvalReceived = false;
             await condition(() => approvalReceived || cancelled, '7 days');
@@ -340,14 +366,14 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
 
 // ─── Helper Functions ───────────────────────────────────────────────────────
 
-function initializeState(input: FsmProcessInput): FsmWorkflowState {
+function initializeState(config: ProcessConfig): FsmWorkflowState {
   const steps: Record<string, StepState> = {};
 
   for (const [phaseName, phaseSteps] of Object.entries({
-    preamble: input.config.preamble,
-    generator: input.config.generator,
-    evaluator: input.config.evaluator,
-    postamble: input.config.postamble,
+    preamble: config.preamble,
+    generator: config.generator,
+    evaluator: config.evaluator,
+    postamble: config.postamble,
   })) {
     for (const step of phaseSteps) {
       steps[`${phaseName}.${step.number}`] = {
@@ -370,6 +396,7 @@ function buildStepParams(
   step: Step,
   iteration: number,
   input: FsmProcessInput,
+  config: ProcessConfig,
   state: FsmWorkflowState,
   feedback?: string,
 ): StepExecutionParams {
@@ -378,16 +405,20 @@ function buildStepParams(
     iteration,
     templateVars: input.templateVars,
     feedback,
-    humanNotes: state.steps[`${stepPhase(step, input)}.${step.number}`]?.humanNotes,
+    humanNotes: state.steps[`${stepPhase(step, config)}.${step.number}`]?.humanNotes,
     workspacePath: input.workspacePath,
     agentBackend: input.agentBackend,
+    parentRunId: input.runId,
+    userId: input.userId,
+    s3Bucket: input.s3Bucket,
+    s3Prefix: input.s3Prefix,
   };
 }
 
-function stepPhase(step: Step, input: FsmProcessInput): string {
-  if (input.config.preamble.includes(step)) return 'preamble';
-  if (input.config.generator.includes(step)) return 'generator';
-  if (input.config.evaluator.includes(step)) return 'evaluator';
+function stepPhase(step: Step, config: ProcessConfig): string {
+  if (config.preamble.includes(step)) return 'preamble';
+  if (config.generator.includes(step)) return 'generator';
+  if (config.evaluator.includes(step)) return 'evaluator';
   return 'postamble';
 }
 
@@ -439,10 +470,11 @@ function collectFeedback(state: FsmWorkflowState): string {
  */
 async function runPostambleParallel(
   input: FsmProcessInput,
+  config: ProcessConfig,
   state: FsmWorkflowState,
   executeStep: (params: StepExecutionParams) => Promise<StepResult>,
 ): Promise<void> {
-  const steps = input.config.postamble;
+  const steps = config.postamble;
   const completed = new Set<number>();
   const failed = new Set<number>();
 
@@ -481,7 +513,7 @@ async function runPostambleParallel(
     // Fan out ready steps in parallel
     const results = await Promise.all(
       ready.map(async (step) => {
-        const result = await executeStep(buildStepParams(step, 0, input, state));
+        const result = await executeStep(buildStepParams(step, 0, input, config, state));
         return { step, result };
       })
     );
