@@ -182,15 +182,28 @@ function normalizeRow(row: Record<string, string>): Record<string, string> {
 
 // ─── Config Block Extraction ────────────────────────────────────────────────
 
+function hasStepTables(block: string): boolean {
+  return /^\s*\|---/m.test(block);
+}
+
 function extractRcooBlock(content: string): string | null {
-  // Strategy 1: fenced code block
+  // Strategy 1: fenced code blocks containing /r-coo-sop1-process.
+  // Collect all candidates; prefer the one with step tables (some skills
+  // lead with a short param-only reference block before the full one).
   const fencedRe = /```[^\n]*\n(.*?)```/gs;
+  const candidates: string[] = [];
   let match;
   while ((match = fencedRe.exec(content)) !== null) {
     const block = match[1];
     if (block.includes('/r-coo-sop1-process') && block.includes('SCOPE=')) {
-      return block;
+      candidates.push(block);
     }
+  }
+  if (candidates.length > 0) {
+    for (const block of candidates) {
+      if (hasStepTables(block)) return block;
+    }
+    return candidates[0];
   }
 
   // Strategy 2: unfenced

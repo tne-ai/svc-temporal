@@ -7,8 +7,25 @@ import { readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative } from 'path';
 import { heartbeat } from '@temporalio/activity';
 
-const s3 = new S3Client({});
-const BUCKET = process.env.S3_BUCKET || '';
+let _s3: S3Client | undefined;
+function getS3(): S3Client {
+  if (!_s3) {
+    _s3 = new S3Client({
+      region: process.env.AWS_REGION || 'us-west-2',
+      ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY
+        ? {
+            credentials: {
+              accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+              secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+              ...(process.env.AWS_SESSION_TOKEN ? { sessionToken: process.env.AWS_SESSION_TOKEN } : {}),
+            },
+          }
+        : {}),
+    });
+  }
+  return _s3;
+}
+const BUCKET = process.env.AWS_BUCKET || '';
 
 interface SyncParams {
   workspacePath: string;
@@ -35,7 +52,7 @@ export async function syncToS3(params: SyncParams): Promise<{ uploaded: number }
       const key = `${prefix}/${relative(dir, file)}`;
       const body = readFileSync(file);
 
-      await s3.send(new PutObjectCommand({
+      await getS3().send(new PutObjectCommand({
         Bucket: BUCKET,
         Key: key,
         Body: body,

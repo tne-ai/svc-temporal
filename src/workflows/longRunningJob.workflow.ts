@@ -30,7 +30,7 @@ export const getJobStatusQuery = defineQuery<{
 }>('getJobStatus');
 
 export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult> {
-  const { invokeSkill, syncToS3 } = proxyActivities<typeof activities>({
+  const { invokeSkill } = proxyActivities<typeof activities>({
     startToCloseTimeout: '8h',
     heartbeatTimeout: '120s',
     retry: {
@@ -40,20 +40,50 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
     },
   });
 
+  // Separate proxy for sync activities with shorter timeout
+  const syncActivities = proxyActivities<typeof activities>({
+    startToCloseTimeout: '15m',
+    heartbeatTimeout: '60s',
+    retry: { maximumAttempts: 2, initialInterval: '5s', backoffCoefficient: 2 },
+  });
+
   let status = 'running';
   let progress = 0;
   let cancelled = false;
   let approvalReceived = false;
+  let statusMessage = 'Initializing...';
 
   setHandler(approveJobSignal, () => { approvalReceived = true; });
   setHandler(cancelJobSignal, () => { cancelled = true; });
-  setHandler(getJobStatusQuery, () => ({ status, progress }));
+  setHandler(getJobStatusQuery, () => ({ status, progress, message: statusMessage }));
 
   if (cancelled) {
     return { status: 'failed', output: 'Job cancelled before start' };
   }
 
-  // Invoke the agent task
+  // ── Step 1: Pull user workspace from S3 ────────────────────────────────
+  const workspacePath = `/tmp/temporal-jobs/${input.jobId}`;
+  const outputFolder = input.outputFolder || `jobs/${input.jobId}`;
+
+  if (input.s3Bucket && input.s3Prefix) {
+    statusMessage = 'Syncing workspace from S3...';
+    progress = 5;
+    try {
+      await syncActivities.pullWorkspaceFromS3({
+        bucket: input.s3Bucket,
+        prefix: input.s3Prefix,
+        localPath: workspacePath,
+        scopePath: outputFolder,
+      });
+    } catch {
+      // Non-fatal — workspace may be empty for new jobs
+    }
+    progress = 10;
+  }
+
+  // ── Step 2: Invoke the agent task ──────────────────────────────────────
+  statusMessage = 'Running agent...';
+
   const result = await invokeSkill(
     {
       number: 0,
@@ -72,26 +102,34 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
       model: input.model || '',
     },
     input.prompt,
+    workspacePath,
+    input.agentBackend,
   );
 
-  progress = 100;
+  progress = 90;
   status = result.success ? 'completed' : 'failed';
 
-  // Sync output files to S3
-  if (result.success) {
+  // ── Step 3: Push results back to S3 ────────────────────────────────────
+  if (input.s3Bucket && input.s3Prefix) {
+    statusMessage = 'Syncing results to S3...';
     try {
-      await syncToS3({
-        workspacePath: input.workspaceId,
-        outputDir: '',
-        prefix: `jobs/${input.jobId}`,
+      // Push all files from the workspace root; prefix S3 keys with outputFolder
+      // so they land under {userId}/{outputFolder}/ in S3
+      await syncActivities.pushWorkspaceToS3({
+        bucket: input.s3Bucket,
+        prefix: `${input.s3Prefix}/${outputFolder}`,
+        localPath: workspacePath,
       });
     } catch {
       // Non-fatal
     }
   }
 
+  progress = 100;
+  statusMessage = result.success ? 'Complete' : 'Failed';
+
   return {
     status: result.success ? 'completed' : 'failed',
-    output: result.stdout,
+    output: result.success ? result.stdout : (result.stderr || result.stdout || 'Unknown error'),
   };
 }

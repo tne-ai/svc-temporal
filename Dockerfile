@@ -16,9 +16,9 @@ FROM node:20-slim
 
 WORKDIR /app
 
-# Install claude CLI for skill invocation
+# ca-certificates needed for S3/HTTPS; git needed for agent-harness git dep
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip curl ca-certificates \
+    ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json* ./

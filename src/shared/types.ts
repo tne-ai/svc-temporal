@@ -122,8 +122,10 @@ export interface ProcessConfig {
 export interface FsmProcessInput {
   /** Unique run identifier (maps to ProcessRun.id in Horizon) */
   runId: string;
-  /** Parsed process config from SKILL.md */
-  config: ProcessConfig;
+  /** Skill name to resolve and parse (e.g., "p-ceo1-strategy") */
+  skillName?: string;
+  /** Parsed process config from SKILL.md — if omitted, resolved via skillName */
+  config?: ProcessConfig;
   /** Template variables resolved from inputs file */
   templateVars: Record<string, string>;
   /** Path to the workspace directory */
@@ -134,6 +136,12 @@ export interface FsmProcessInput {
   autoApprove: boolean;
   /** Resumed state from continueAsNew */
   resumeState?: FsmWorkflowState;
+  /** S3 bucket for workspace sync */
+  s3Bucket?: string;
+  /** S3 key prefix (usually userId) */
+  s3Prefix?: string;
+  /** Agent backend override — if unset, falls back to AGENT_BACKEND env var */
+  agentBackend?: AgentBackend;
 }
 
 export interface FsmProcessResult {
@@ -179,6 +187,15 @@ export interface StepExecutionParams {
   humanNotes?: string;
   workspacePath: string;
   manifestPath?: string;
+  agentBackend?: AgentBackend;
+  /** Parent FSM run id — passed to the agent so nested fsm-start calls link back. */
+  parentRunId?: string;
+  /** User id — forwarded to horizon's /api/fsm-invoke/start for nested FSM runs. */
+  userId?: string;
+  /** S3 bucket for periodic workspace sync during long-running skill invocations. */
+  s3Bucket?: string;
+  /** S3 key prefix (usually userId) for periodic workspace sync. */
+  s3Prefix?: string;
 }
 
 export interface StepResult {
@@ -238,6 +255,14 @@ export interface JobInput {
   workspaceId: string;
   tools?: string[];
   model?: string;
+  /** S3 bucket for workspace sync */
+  s3Bucket?: string;
+  /** S3 key prefix (usually userId) */
+  s3Prefix?: string;
+  /** Output folder within workspace (e.g., "jobs/my-job") */
+  outputFolder?: string;
+  /** Agent backend override — if unset, falls back to AGENT_BACKEND env var */
+  agentBackend?: AgentBackend;
 }
 
 export interface JobResult {
@@ -252,3 +277,40 @@ export interface ApprovalSignalPayload {
   approved: boolean;
   notes?: string;
 }
+
+// ─── S3 Workspace Types ───────────────────────────────────────────────────
+
+export interface WorkspaceSyncParams {
+  /** S3 bucket name */
+  bucket: string;
+  /** S3 key prefix — typically the userId (all user files live under this) */
+  prefix: string;
+  /** Local directory to sync to/from */
+  localPath: string;
+  /** Optional subdirectory within the workspace to scope the sync */
+  scopePath?: string;
+}
+
+export interface WorkspaceSyncResult {
+  /** Number of files downloaded or uploaded */
+  fileCount: number;
+  /** Files that had conflicts (S3 version differs from local) */
+  conflicts: FileConflict[];
+  /** Total bytes transferred */
+  bytes: number;
+}
+
+export interface FileConflict {
+  /** Relative path within workspace */
+  path: string;
+  /** What happened */
+  resolution: 'skipped' | 'overwritten' | 'renamed';
+  /** If renamed, the new path */
+  renamedTo?: string;
+  /** ETag of the S3 version */
+  s3ETag?: string;
+  /** Last modified time of local version */
+  localModified?: string;
+}
+
+export type AgentBackend = 'harness' | 'claude-agent-sdk' | 'claude-cli' | 'http';
