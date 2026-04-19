@@ -303,7 +303,7 @@ async function invokeViaHarness(
   model?: string,
   permissionMode?: string,
   workspacePath?: string,
-  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string },
+  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: number; skill?: string },
 ): Promise<InvocationResult> {
   const stopSync = startPeriodicS3Sync(workspacePath || '', context?.s3Bucket, context?.s3Prefix, context?.parentRunId);
   try {
@@ -344,6 +344,22 @@ async function invokeViaHarness(
         }
       } else if (ev.type === 'result') {
         if (typeof ev.text === 'string') stdout += ev.text;
+        // Surface token usage so the UI can render per-step spend. The harness
+        // forwards Anthropic's usage object straight through on the result event.
+        const usage = ev.usage;
+        if (runId && usage && (typeof usage.input_tokens === 'number' || typeof usage.output_tokens === 'number')) {
+          emitEvent(runId, 'token_update', {
+            backend: 'harness',
+            stepNumber: context?.stepNumber,
+            skill: context?.skill,
+            model: resolvedModel,
+            inputTokens: usage.input_tokens ?? 0,
+            outputTokens: usage.output_tokens ?? 0,
+            cacheCreationInputTokens: usage.cache_creation_input_tokens,
+            cacheReadInputTokens: usage.cache_read_input_tokens,
+            costUsd: typeof ev.total_cost_usd === 'number' ? ev.total_cost_usd : undefined,
+          });
+        }
       }
       // Heartbeat every 5 seconds
       if (Date.now() - lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
@@ -479,7 +495,7 @@ async function invokeViaClaudeAgentSDK(
   prompt: string,
   model?: string,
   workspacePath?: string,
-  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string },
+  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: number; skill?: string },
 ): Promise<InvocationResult> {
   const resolvedModel = resolveModelId(model, 'agent');
   const cwd = workspacePath || process.cwd();
@@ -538,6 +554,21 @@ async function invokeViaClaudeAgentSDK(
       if (event.type === 'result') {
         if (event.result) stdout = event.result;
 
+        const usage = (event as any).usage;
+        if (runId && usage && (typeof usage.input_tokens === 'number' || typeof usage.output_tokens === 'number')) {
+          emitEvent(runId, 'token_update', {
+            backend: 'claude-agent-sdk',
+            stepNumber: context?.stepNumber,
+            skill: context?.skill,
+            model: resolvedModel,
+            inputTokens: usage.input_tokens ?? 0,
+            outputTokens: usage.output_tokens ?? 0,
+            cacheCreationInputTokens: usage.cache_creation_input_tokens,
+            cacheReadInputTokens: usage.cache_read_input_tokens,
+            costUsd: typeof (event as any).total_cost_usd === 'number' ? (event as any).total_cost_usd : undefined,
+          });
+        }
+
         // Trust subtype over is_error — the SDK may set is_error on successful completions
         if (event.subtype !== 'success') {
           const errorMsg = event.errors?.join('; ') || event.subtype || 'Unknown error';
@@ -595,11 +626,17 @@ export async function invokeSkill(
   const backend = agentBackend || AGENT_BACKEND;
   console.log(`[invokeSkill] backend=${backend}, skill=${step.skill}, model=${step.model || 'default'}, parentRunId=${context?.parentRunId || ''}`);
 
+  // Thread step identity into the inner invocation so the harness/SDK paths can
+  // stamp `stepNumber` + `skill` onto the `token_update` event they emit from
+  // the final `result`. Without this, per-step spend can't be attributed on
+  // the UI side.
+  const innerContext = { ...(context || {}), stepNumber: step.number, skill: step.skill };
+
   switch (backend) {
     case 'harness':
-      return invokeViaHarness(prompt, step.model || undefined, step.permissionMode, workspacePath, context);
+      return invokeViaHarness(prompt, step.model || undefined, step.permissionMode, workspacePath, innerContext);
     case 'claude-agent-sdk':
-      return invokeViaClaudeAgentSDK(prompt, step.model || undefined, workspacePath, context);
+      return invokeViaClaudeAgentSDK(prompt, step.model || undefined, workspacePath, innerContext);
     case 'claude-cli':
     default:
       return invokeViaSubprocess(prompt, step.model || undefined, step.permissionMode);

@@ -14,7 +14,8 @@ export type FsmEventType =
   | 'step_start' | 'step_complete' | 'step_failed'
   | 'gate_start' | 'gate_result'
   | 'message' | 'tool_use' | 'tool_result' | 'file_change'
-  | 'heartbeat' | 'phase_change' | 'child_run_started';
+  | 'heartbeat' | 'phase_change' | 'child_run_started'
+  | 'token_update';
 
 export async function emitEvent(
   runId: string | undefined,
