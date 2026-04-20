@@ -8,3 +8,4 @@ export { runGateCascade } from './runGateCascade.js';
 export { syncToS3 } from './syncToS3.js';
 export { pullWorkspaceFromS3, pushWorkspaceToS3 } from './workspaceSync.js';
 export { parseConfig } from './parseConfig.js';
+export { emitFsmEventActivity } from './emitEvent.js';

@@ -437,6 +437,7 @@ function parseConfigBlock(content: string): ProcessConfig {
   const inputsFile = params['INPUTS_FILE'] || '';
   const inputsBackprop = (params['INPUTS_BACKPROP'] || 'true').toLowerCase() !== 'false';
   const inputsBackpropGate = params['INPUTS_BACKPROP_GATE'] || 'after_evaluator';
+  const parallelGenerator = (params['PARALLEL_GENERATOR'] || 'false').toLowerCase() === 'true';
 
   let evaluatorMode: EvaluatorMode;
   try {
@@ -462,6 +463,7 @@ function parseConfigBlock(content: string): ProcessConfig {
     inputsFile,
     inputsBackprop,
     inputsBackpropGate,
+    parallelGenerator,
     preamble: parseStepTable(sections['preamble'] || ''),
     generator: parseStepTable(sections['generator'] || ''),
     evaluator: parseStepTable(sections['evaluator'] || ''),

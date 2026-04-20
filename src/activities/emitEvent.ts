@@ -3,15 +3,15 @@
  * Gives the UI real-time visibility into what the worker is doing
  * (step transitions, claude messages, tool uses, file changes, gates).
  *
- * URL resolution lives in constants.ts (HORIZON_FSM_EVENTS_URL) so all backends
- * can emit events even when FSM_INVOKE_URL is unset (e.g. harness, sdk, cli).
- * If no URL is configured, silently drops events (dev ergonomics — don't crash).
+ * URL resolution lives in constants.ts (HORIZON_FSM_EVENTS_URL, derived from
+ * HORIZON_API_BASE_URL). If no URL is configured, silently drops events (dev
+ * ergonomics — don't crash).
  */
 
 import { HORIZON_FSM_EVENTS_URL, FSM_INVOKE_SECRET } from '../shared/constants.js';
 
 export type FsmEventType =
-  | 'step_start' | 'step_complete' | 'step_failed'
+  | 'step_start' | 'step_complete' | 'step_failed' | 'step_cancelled'
   | 'gate_start' | 'gate_result'
   | 'message' | 'tool_use' | 'tool_result' | 'file_change'
   | 'heartbeat' | 'phase_change' | 'child_run_started'
@@ -39,4 +39,15 @@ export async function emitEvent(
   } catch {
     // Fire-and-forget — never block the activity on event emission
   }
+}
+
+/** Activity wrapper so the workflow itself can emit events (e.g. step_cancelled
+ *  for siblings killed by a failed peer). Workflow code cannot call fetch
+ *  directly, so we route through an activity. */
+export async function emitFsmEventActivity(params: {
+  runId?: string;
+  type: FsmEventType;
+  data?: Record<string, any>;
+}): Promise<void> {
+  await emitEvent(params.runId, params.type, params.data || {});
 }

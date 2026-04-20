@@ -106,6 +106,10 @@ export interface ProcessConfig {
   inputsFile: string;
   inputsBackprop: boolean;
   inputsBackpropGate: string;
+  /** Run generator phase steps in parallel (DAG-resolved by `dependsOn`).
+   *  Postamble always uses the parallel runner; preamble/evaluator stay
+   *  sequential. */
+  parallelGenerator: boolean;
 
   preamble: Step[];
   generator: Step[];
@@ -128,8 +132,13 @@ export interface FsmProcessInput {
   config?: ProcessConfig;
   /** Template variables resolved from inputs file */
   templateVars: Record<string, string>;
-  /** Path to the workspace directory */
+  /** Path to the workspace root on the worker filesystem. S3 pull/push target
+   *  this directory (scoped by `workingDir` when set). */
   workspacePath: string;
+  /** Relative subdirectory inside `workspacePath` that the agent's cwd lands
+   *  in. S3 pull/push are scoped to this subtree so sibling subdirs stay
+   *  untouched. Empty/undefined → cwd is the workspace root. */
+  workingDir?: string;
   /** User ID for audit tracking */
   userId: string;
   /** Whether to auto-approve all review gates */
@@ -185,7 +194,15 @@ export interface StepExecutionParams {
   templateVars: Record<string, string>;
   feedback?: string;
   humanNotes?: string;
+  /** Which FSM phase owns this step. Included in step_start/step_complete
+   *  events so the UI can group siblings and render parallel lanes. */
+  phase?: 'preamble' | 'generator' | 'evaluator' | 'postamble';
+  /** True when this step is running as part of a parallel wave. */
+  parallel?: boolean;
+  /** Workspace root directory (same semantics as `FsmProcessInput.workspacePath`). */
   workspacePath: string;
+  /** Relative subdir under `workspacePath` — scopes S3 sync and the agent's cwd. */
+  workingDir?: string;
   manifestPath?: string;
   agentBackend?: AgentBackend;
   /** Parent FSM run id — passed to the agent so nested fsm-start calls link back. */

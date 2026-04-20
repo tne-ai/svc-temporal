@@ -21,6 +21,8 @@ import {
   defineQuery,
   setHandler,
   sleep,
+  CancellationScope,
+  isCancellation,
 } from '@temporalio/workflow';
 
 import type {
@@ -93,6 +95,13 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
     retry: { maximumAttempts: 2, initialInterval: '2s', backoffCoefficient: 2 },
   });
 
+  // Fire-and-forget event emission proxy. Used by the workflow itself to emit
+  // cancellation events (the activity-side executeStep handles its own events).
+  const eventActivities = proxyActivities<typeof activities>({
+    startToCloseTimeout: '15s',
+    retry: { maximumAttempts: 1 },
+  });
+
   // ── Resolve config: either provided directly or parsed from skillName ──
   let config: import('../shared/types.js').ProcessConfig;
   if (input.config) {
@@ -115,12 +124,15 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   const state: FsmWorkflowState = input.resumeState || initializeState(config);
 
   // ── Pull workspace from S3 (skip on resume — already pulled) ──────────
+  // Scoped by `workingDir` so a run in "<root>/test1" only pulls S3
+  // `{userId}/test1/*` and never spills sibling subdirs into cwd.
   if (!input.resumeState && input.s3Bucket && input.s3Prefix) {
     try {
       await syncActivities.pullWorkspaceFromS3({
         bucket: input.s3Bucket,
         prefix: input.s3Prefix,
         localPath: input.workspacePath,
+        scopePath: input.workingDir,
       });
     } catch {
       // Non-fatal — may be first run with empty workspace
@@ -206,32 +218,49 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
       state.phase = Phase.GENERATOR;
       const feedback = collectFeedback(state);
 
-      for (const step of config.generator) {
-        if (cancelled) return { status: 'cancelled', state };
-
-        const stepKey = `generator.${step.number}`;
-
-        // Reset steps on iteration > 1
-        if (state.iteration > 1) {
-          resetStepState(state, stepKey);
+      // Reset generator step state on iterations > 1 before running
+      if (state.iteration > 1) {
+        for (const step of config.generator) {
+          resetStepState(state, `generator.${step.number}`);
         }
+      }
 
-        const result = await executeStep(
-          buildStepParams(step, state.iteration, input, config, state, feedback)
+      // Parallel generator (opt-in via PARALLEL_GENERATOR=true).
+      // Stage review + parallel fan-out don't compose cleanly (humans can't
+      // realistically gate between fanned-out siblings), so parallel mode
+      // bypasses per-step stage review inside the generator wave.
+      if (config.parallelGenerator) {
+        const outcome = await runPhaseParallel(
+          'generator', config.generator, input, config, state, executeStep,
+          state.iteration, feedback, () => cancelled,
+          (data) => eventActivities.emitFsmEventActivity({ runId: input.runId, type: 'step_cancelled', data }),
         );
-        updateStepState(state, stepKey, result);
-
-        if (!result.success) {
+        if (cancelled) return { status: 'cancelled', state };
+        if (outcome.failed) {
           return { status: 'failed', state };
         }
-
-        if (config.stageReview && !input.autoApprove) {
-          state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
-          approvalReceived = false;
-          await condition(() => approvalReceived || cancelled, '7 days');
+      } else {
+        for (const step of config.generator) {
           if (cancelled) return { status: 'cancelled', state };
-          state.steps[stepKey]!.humanNotes = approvalNotes;
-          state.steps[stepKey]!.status = StepStatus.COMPLETE;
+
+          const stepKey = `generator.${step.number}`;
+          const result = await executeStep(
+            buildStepParams(step, state.iteration, input, config, state, feedback)
+          );
+          updateStepState(state, stepKey, result);
+
+          if (!result.success) {
+            return { status: 'failed', state };
+          }
+
+          if (config.stageReview && !input.autoApprove) {
+            state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
+            approvalReceived = false;
+            await condition(() => approvalReceived || cancelled, '7 days');
+            if (cancelled) return { status: 'cancelled', state };
+            state.steps[stepKey]!.humanNotes = approvalNotes;
+            state.steps[stepKey]!.status = StepStatus.COMPLETE;
+          }
         }
       }
 
@@ -302,36 +331,15 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
     state.phase = Phase.POSTAMBLE;
 
     if (config.postamble.length > 0) {
-      const hasDeps = config.postamble.some(s => s.dependsOn.length > 0);
-
-      if (hasDeps) {
-        await runPostambleParallel(input, config, state, executeStep);
-      } else {
-        // Sequential postamble
-        for (const step of config.postamble) {
-          if (cancelled) return { status: 'cancelled', state };
-
-          const stepKey = `postamble.${step.number}`;
-          const stepState = state.steps[stepKey];
-          if (stepState?.status === StepStatus.COMPLETE) continue;
-
-          const result = await executeStep(buildStepParams(step, 0, input, config, state));
-          updateStepState(state, stepKey, result);
-
-          if (!result.success) {
-            return { status: 'failed', state };
-          }
-
-          if (config.stageReview && !input.autoApprove) {
-            state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
-            approvalReceived = false;
-            await condition(() => approvalReceived || cancelled, '7 days');
-            if (cancelled) return { status: 'cancelled', state };
-            state.steps[stepKey]!.humanNotes = approvalNotes;
-            state.steps[stepKey]!.status = StepStatus.COMPLETE;
-          }
-        }
-      }
+      // Always route postamble through the parallel runner. When every step
+      // has empty `dependsOn`, wave 1 fans them all out; when deps form a
+      // DAG, waves respect it. Sequential is the degenerate case.
+      await runPhaseParallel(
+        'postamble', config.postamble, input, config, state, executeStep,
+        0, undefined, () => cancelled,
+        (data) => eventActivities.emitFsmEventActivity({ runId: input.runId, type: 'step_cancelled', data }),
+      );
+      if (cancelled) return { status: 'cancelled', state };
     }
   }
 
@@ -399,19 +407,25 @@ function buildStepParams(
   config: ProcessConfig,
   state: FsmWorkflowState,
   feedback?: string,
+  overridePhase?: 'preamble' | 'generator' | 'evaluator' | 'postamble',
+  parallel?: boolean,
 ): StepExecutionParams {
+  const phase = overridePhase || (stepPhase(step, config) as 'preamble' | 'generator' | 'evaluator' | 'postamble');
   return {
     step,
     iteration,
     templateVars: input.templateVars,
     feedback,
-    humanNotes: state.steps[`${stepPhase(step, config)}.${step.number}`]?.humanNotes,
+    humanNotes: state.steps[`${phase}.${step.number}`]?.humanNotes,
     workspacePath: input.workspacePath,
+    workingDir: input.workingDir,
     agentBackend: input.agentBackend,
     parentRunId: input.runId,
     userId: input.userId,
     s3Bucket: input.s3Bucket,
     s3Prefix: input.s3Prefix,
+    phase,
+    parallel,
   };
 }
 
@@ -466,75 +480,150 @@ function collectFeedback(state: FsmWorkflowState): string {
 }
 
 /**
- * Run postamble steps in parallel with dependency resolution.
+ * Run a phase's steps in parallel with DAG-ordered waves and cancel-siblings
+ * semantics on failure.
+ *
+ * Semantics:
+ *   • Build a dependency map from `step.dependsOn` — supports bare numbers
+ *     (`"3"`), phase-qualified keys (`"postamble.3"`), and mixed forms.
+ *   • Each wave runs every step whose deps are all in `completed`, wrapped
+ *     in a single `CancellationScope`. If any step fails mid-wave the scope
+ *     is cancelled, in-flight siblings receive cancellation errors, and they
+ *     are recorded as `cancelled` (not `failed`) so the UI can render them
+ *     distinctly.
+ *   • After each wave, failures and cancellations cascade to any step
+ *     transitively blocked on them — those are also marked cancelled.
+ *   • Returns `failed=true` if any non-cascade failure occurred (lets the
+ *     caller decide whether to abort the workflow or continue).
  */
-async function runPostambleParallel(
+async function runPhaseParallel(
+  phaseKey: 'preamble' | 'generator' | 'evaluator' | 'postamble',
+  steps: Step[],
   input: FsmProcessInput,
   config: ProcessConfig,
   state: FsmWorkflowState,
   executeStep: (params: StepExecutionParams) => Promise<StepResult>,
-): Promise<void> {
-  const steps = config.postamble;
+  iteration: number,
+  feedback: string | undefined,
+  isCancelled: () => boolean,
+  emitCancelEvent: (data: Record<string, any>) => Promise<void>,
+): Promise<{ failed: boolean }> {
+  if (steps.length === 0) return { failed: false };
+
   const completed = new Set<number>();
   const failed = new Set<number>();
+  const cancelledSteps = new Set<number>();
 
-  // Build dependency map: step.number → set of step numbers it depends on
   const depMap = new Map<number, Set<number>>();
   for (const step of steps) {
     const deps = new Set<number>();
     for (const depKey of step.dependsOn) {
       const parts = depKey.split('.');
-      if (parts.length === 2 && parts[0] === 'postamble') {
-        const num = parseInt(parts[1], 10);
-        if (!isNaN(num)) deps.add(num);
-      }
+      const raw = parts.length === 2 ? parts[1] : parts[0];
+      const num = parseInt(raw, 10);
+      if (!isNaN(num)) deps.add(num);
     }
     depMap.set(step.number, deps);
   }
 
-  // Pre-seed already-complete steps
+  // Pre-seed already-complete steps (resume case)
   for (const step of steps) {
-    const ss = state.steps[`postamble.${step.number}`];
-    if (ss?.status === StepStatus.COMPLETE) {
-      completed.add(step.number);
-    }
+    const ss = state.steps[`${phaseKey}.${step.number}`];
+    if (ss?.status === StepStatus.COMPLETE) completed.add(step.number);
   }
 
-  while (completed.size + failed.size < steps.length) {
-    // Find ready steps
+  while (completed.size + failed.size + cancelledSteps.size < steps.length) {
+    if (isCancelled()) return { failed: failed.size > 0 };
+
     const ready = steps.filter(s => {
-      if (completed.has(s.number) || failed.has(s.number)) return false;
+      if (completed.has(s.number) || failed.has(s.number) || cancelledSteps.has(s.number)) return false;
       const deps = depMap.get(s.number) || new Set();
-      return [...deps].every(d => completed.has(d)) && ![...deps].some(d => failed.has(d));
+      if ([...deps].some(d => failed.has(d) || cancelledSteps.has(d))) return false;
+      return [...deps].every(d => completed.has(d));
     });
 
     if (ready.length === 0) break;
 
-    // Fan out ready steps in parallel
-    const results = await Promise.all(
-      ready.map(async (step) => {
-        const result = await executeStep(buildStepParams(step, 0, input, config, state));
-        return { step, result };
-      })
-    );
+    const isFanOut = ready.length > 1;
+    const waveResults = new Map<number, { step: Step; result: StepResult | null; wasCancelled: boolean }>();
 
-    for (const { step, result } of results) {
-      updateStepState(state, `postamble.${step.number}`, result);
-      if (result.success) {
-        completed.add(step.number);
-      } else {
-        failed.add(step.number);
+    try {
+      await CancellationScope.cancellable(async () => {
+        await Promise.all(
+          ready.map(async (step) => {
+            try {
+              const result = await executeStep(
+                buildStepParams(step, iteration, input, config, state, feedback, phaseKey, isFanOut)
+              );
+              waveResults.set(step.number, { step, result, wasCancelled: false });
+              if (!result.success) {
+                // Cancel in-flight siblings. They'll throw CancelledFailure at
+                // their next suspension point and be caught below as cancelled.
+                CancellationScope.current().cancel();
+              }
+            } catch (err) {
+              if (isCancellation(err)) {
+                waveResults.set(step.number, { step, result: null, wasCancelled: true });
+              } else {
+                throw err;
+              }
+            }
+          }),
+        );
+      });
+    } catch (err) {
+      if (!isCancellation(err)) throw err;
+    }
+
+    // Commit wave outcomes to state + notify UI for cancelled siblings.
+    for (const { step, result, wasCancelled } of waveResults.values()) {
+      const stepKey = `${phaseKey}.${step.number}`;
+      if (wasCancelled) {
+        cancelledSteps.add(step.number);
+        state.steps[stepKey] = {
+          ...state.steps[stepKey],
+          status: StepStatus.FAILED,
+          error: 'cancelled: sibling step failed',
+          completedAt: new Date().toISOString(),
+          retries: state.steps[stepKey]?.retries || 0,
+        };
+        await emitCancelEvent({
+          stepNumber: step.number, skill: step.skill, iteration, phase: phaseKey,
+          reason: 'sibling_failed',
+        });
+      } else if (result) {
+        updateStepState(state, stepKey, result);
+        if (result.success) completed.add(step.number);
+        else failed.add(step.number);
       }
     }
 
-    // Cascade failures to blocked dependents
-    for (const step of steps) {
-      if (!completed.has(step.number) && !failed.has(step.number)) {
+    // Cascade failures/cancellations to transitively blocked dependents.
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const step of steps) {
+        if (completed.has(step.number) || failed.has(step.number) || cancelledSteps.has(step.number)) continue;
         const deps = depMap.get(step.number) || new Set();
-        if ([...deps].some(d => failed.has(d))) {
-          failed.add(step.number);
+        if ([...deps].some(d => failed.has(d) || cancelledSteps.has(d))) {
+          cancelledSteps.add(step.number);
+          changed = true;
+          const stepKey = `${phaseKey}.${step.number}`;
+          state.steps[stepKey] = {
+            ...state.steps[stepKey],
+            status: StepStatus.FAILED,
+            error: 'cancelled: dependency failed',
+            completedAt: new Date().toISOString(),
+            retries: 0,
+          };
+          await emitCancelEvent({
+            stepNumber: step.number, skill: step.skill, iteration, phase: phaseKey,
+            reason: 'dependency_failed',
+          });
         }
       }
     }
   }
+
+  return { failed: failed.size > 0 };
 }
