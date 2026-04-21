@@ -9,6 +9,7 @@
 
 import { readFileSync } from 'fs';
 import { basename, dirname } from 'path';
+import { parse as parseYaml } from 'yaml';
 import {
   CouncilMember,
   EvaluatorMode,
@@ -181,6 +182,28 @@ function normalizeRow(row: Record<string, string>): Record<string, string> {
 }
 
 // ─── Config Block Extraction ────────────────────────────────────────────────
+
+/**
+ * Fast path: extract the SOP config from YAML frontmatter `sop:` key.
+ * Returns the raw string value (same text format as legacy fenced blocks)
+ * or null if no frontmatter or no `sop:` key.
+ *
+ * Mirrors Python's _parse_frontmatter_sop in tne-plugins/engine/parser.py.
+ */
+function extractFrontmatterSop(content: string): string | null {
+  if (!content.startsWith('---')) return null;
+  const end = content.indexOf('\n---', 3);
+  if (end === -1) return null;
+  const fmText = content.slice(3, end);
+  let fm: any;
+  try {
+    fm = parseYaml(fmText);
+  } catch {
+    return null;
+  }
+  const sop = fm?.sop;
+  return typeof sop === 'string' ? sop : null;
+}
 
 function hasStepTables(block: string): boolean {
   return /^\s*\|---/m.test(block);
@@ -502,6 +525,15 @@ export function parseSkillFile(
   const resolved = Object.keys(merged).length > 0
     ? resolveVariables(content, merged)
     : content;
+
+  // Fast path: frontmatter `sop:` key holds the raw config block.
+  // Skills migrated to the YAML-frontmatter format store their phase
+  // tables there; the legacy fenced /r-coo-sop1-process block in the body
+  // is a stub pointing at the frontmatter.
+  const sopBlock = extractFrontmatterSop(resolved);
+  if (sopBlock) {
+    return parseConfigBlock(sopBlock);
+  }
 
   return parseConfigBlock(resolved);
 }
