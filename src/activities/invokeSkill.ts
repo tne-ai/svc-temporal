@@ -1,23 +1,22 @@
 /**
- * Skill invocation activity — four execution backends.
+ * Skill invocation activity — three execution backends.
  *
  * Ported from tne-plugins/plugins/tne/engine/invoker.py.
  *
  * - agent-harness (default): @tne-ai/agent-harness streaming agent
  * - claude-agent-sdk: @anthropic-ai/claude-agent-sdk via agent-harness wrapper
  * - claude-cli: `claude -p` subprocess
- * - http: HTTP POST to FSM_INVOKE_URL (Horizon API)
  */
 
 import { spawn } from 'child_process';
 import { existsSync, mkdirSync } from 'fs';
+import { join } from 'path';
 import { heartbeat } from '@temporalio/activity';
 import {
   createClaudeSDKAgent,
   resolveModelId,
 } from '@tne-ai/agent-harness';
 import {
-  FSM_INVOKE_URL,
   FSM_INVOKE_SECRET,
   SKILL_INVOCATION_TIMEOUT_MS,
   HEARTBEAT_INTERVAL_MS,
@@ -29,6 +28,7 @@ import type { AgentBackend, InvocationResult, Step } from '../shared/types.js';
 import { resolveTemplateVars } from '../config/templateResolver.js';
 import { emitEvent } from './emitEvent.js';
 import { pushWorkspaceToS3 } from './workspaceSync.js';
+import { ensureSkillsInWorkspace } from './setupSkills.js';
 
 /** Extract a short text preview for message events (strip surrounding whitespace). */
 function previewText(text: string, max = 600): string {
@@ -56,6 +56,7 @@ function startPeriodicS3Sync(
   s3Bucket?: string,
   s3Prefix?: string,
   runId?: string,
+  workingDir?: string,
 ): () => Promise<void> {
   if (!s3Bucket || !s3Prefix || !workspacePath) return async () => {};
   let inFlight: Promise<void> | null = null;
@@ -67,6 +68,7 @@ function startPeriodicS3Sync(
         bucket: s3Bucket,
         prefix: s3Prefix,
         localPath: workspacePath,
+        scopePath: workingDir,
       });
       if (result.fileCount > 0) {
         emitEvent(runId, 'heartbeat', {
@@ -150,50 +152,6 @@ export function buildPrompt(
   }
 
   return parts.join('\n\n');
-}
-
-/**
- * Invoke a skill via the Horizon API (HTTP POST).
- */
-async function invokeViaHorizon(
-  prompt: string,
-  model?: string,
-  context?: { parentRunId?: string; userId?: string },
-): Promise<InvocationResult> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (FSM_INVOKE_SECRET) {
-    headers['Authorization'] = `Bearer ${FSM_INVOKE_SECRET}`;
-    headers['x-fsm-secret'] = FSM_INVOKE_SECRET;
-  }
-
-  try {
-    const response = await fetch(FSM_INVOKE_URL, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        prompt,
-        model: model || '',
-        runId: context?.parentRunId,
-        userId: context?.userId,
-      }),
-      signal: AbortSignal.timeout(SKILL_INVOCATION_TIMEOUT_MS),
-    });
-
-    const text = await response.text();
-    return {
-      success: response.ok,
-      stdout: text,
-      stderr: '',
-      exitCode: response.ok ? 0 : 1,
-    };
-  } catch (err) {
-    return {
-      success: false,
-      stdout: '',
-      stderr: String(err),
-      exitCode: 1,
-    };
-  }
 }
 
 /**
@@ -303,14 +261,18 @@ async function invokeViaHarness(
   model?: string,
   permissionMode?: string,
   workspacePath?: string,
-  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: number; skill?: string },
+  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: number; skill?: string; workingDir?: string },
 ): Promise<InvocationResult> {
-  const stopSync = startPeriodicS3Sync(workspacePath || '', context?.s3Bucket, context?.s3Prefix, context?.parentRunId);
+  const stopSync = startPeriodicS3Sync(workspacePath || '', context?.s3Bucket, context?.s3Prefix, context?.parentRunId, context?.workingDir);
   try {
     const { createAgent } = await import('@tne-ai/agent-harness');
     const resolvedModel = resolveModelId(model, 'agent');
-    const cwd = workspacePath || process.cwd();
+    const workspaceRoot = workspacePath || process.cwd();
+    const cwd = context?.workingDir ? join(workspaceRoot, context.workingDir) : workspaceRoot;
     if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true });
+    try { await ensureSkillsInWorkspace(cwd); } catch (err: any) {
+      console.warn('[invokeViaHarness] ensureSkillsInWorkspace failed:', err?.message);
+    }
     // Only pass a real API key as apiKey; OAuth tokens flow via env var and
     // must NOT be passed as ANTHROPIC_API_KEY (they're rejected as invalid).
     const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
@@ -335,11 +297,11 @@ async function invokeViaHarness(
         for (const block of ev.message.content) {
           if (block.type === 'text') {
             stdout += block.text;
-            emitEvent(runId, 'message', { backend: 'harness', text: previewText(block.text) });
+            emitEvent(runId, 'message', { backend: 'harness', text: previewText(block.text), stepNumber: context?.stepNumber, skill: context?.skill });
           } else if (block.type === 'tool_use') {
-            emitEvent(runId, 'tool_use', { backend: 'harness', tool: block.name, input: block.input });
+            emitEvent(runId, 'tool_use', { backend: 'harness', tool: block.name, input: block.input, stepNumber: context?.stepNumber, skill: context?.skill });
             const file = fileFromToolUse(block.name, block.input);
-            if (file) emitEvent(runId, 'file_change', { tool: block.name, path: file });
+            if (file) emitEvent(runId, 'file_change', { tool: block.name, path: file, stepNumber: context?.stepNumber, skill: context?.skill });
           }
         }
       } else if (ev.type === 'result') {
@@ -495,15 +457,26 @@ async function invokeViaClaudeAgentSDK(
   prompt: string,
   model?: string,
   workspacePath?: string,
-  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: number; skill?: string },
+  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: number; skill?: string; workingDir?: string },
 ): Promise<InvocationResult> {
   const resolvedModel = resolveModelId(model, 'agent');
-  const cwd = workspacePath || process.cwd();
+  const workspaceRoot = workspacePath || process.cwd();
+  const cwd = context?.workingDir ? join(workspaceRoot, context.workingDir) : workspaceRoot;
   // Ensure workspace directory exists before spawning Claude Code
   if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true });
+  // Populate `.claude/skills/` with symlinks to tne-plugins so Skill() lookups
+  // resolve from cwd. Non-fatal on failure — the agent will just miss the
+  // skill and have to improvise, which is what we saw before this fix.
+  try { await ensureSkillsInWorkspace(cwd); } catch (err: any) {
+    console.warn('[invokeViaClaudeAgentSDK] ensureSkillsInWorkspace failed:', err?.message);
+  }
   console.log(`[invokeViaClaudeAgentSDK] model=${resolvedModel}, workspace=${cwd}`);
 
-  const stopSync = startPeriodicS3Sync(cwd, context?.s3Bucket, context?.s3Prefix, context?.parentRunId);
+  // Sync loop walks the workspace ROOT, scoped to workingDir, so the S3 key
+  // layout matches what horizon pushed (e.g. `{userId}/test1/file.md`). Using
+  // `cwd` as localPath unscoped would nest already-present siblings under
+  // the subdir on subsequent pulls.
+  const stopSync = startPeriodicS3Sync(workspaceRoot, context?.s3Bucket, context?.s3Prefix, context?.parentRunId, context?.workingDir);
   try {
     const agent = createClaudeSDKAgent({
       model: resolvedModel,
@@ -541,11 +514,11 @@ async function invokeViaClaudeAgentSDK(
         for (const block of event.message.content) {
           if (block.type === 'text') {
             stdout += block.text;
-            emitEvent(runId, 'message', { backend: 'claude-agent-sdk', text: previewText(block.text) });
+            emitEvent(runId, 'message', { backend: 'claude-agent-sdk', text: previewText(block.text), stepNumber: context?.stepNumber, skill: context?.skill });
           } else if (block.type === 'tool_use') {
-            emitEvent(runId, 'tool_use', { backend: 'claude-agent-sdk', tool: block.name, input: block.input });
+            emitEvent(runId, 'tool_use', { backend: 'claude-agent-sdk', tool: block.name, input: block.input, stepNumber: context?.stepNumber, skill: context?.skill });
             const file = fileFromToolUse(block.name, block.input);
-            if (file) emitEvent(runId, 'file_change', { tool: block.name, path: file });
+            if (file) emitEvent(runId, 'file_change', { tool: block.name, path: file, stepNumber: context?.stepNumber, skill: context?.skill });
           }
         }
       }
@@ -607,22 +580,16 @@ async function invokeViaClaudeAgentSDK(
  * Invoke a skill using the specified or configured backend.
  *
  * Backend selection priority:
- * 1. FSM_INVOKE_URL (HTTP override) — always takes priority if set
- * 2. Per-request agentBackend parameter (from workflow input)
- * 3. AGENT_BACKEND env var — 'harness' | 'claude-agent-sdk' | 'claude-cli'
+ * 1. Per-request agentBackend parameter (from workflow input)
+ * 2. AGENT_BACKEND env var — 'harness' | 'claude-agent-sdk' | 'claude-cli'
  */
 export async function invokeSkill(
   step: Step,
   prompt: string,
   workspacePath?: string,
   agentBackend?: AgentBackend,
-  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string },
+  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; workingDir?: string },
 ): Promise<InvocationResult> {
-  // HTTP override takes priority
-  if (FSM_INVOKE_URL) {
-    return invokeViaHorizon(prompt, step.model || undefined, context);
-  }
-
   const backend = agentBackend || AGENT_BACKEND;
   console.log(`[invokeSkill] backend=${backend}, skill=${step.skill}, model=${step.model || 'default'}, parentRunId=${context?.parentRunId || ''}`);
 

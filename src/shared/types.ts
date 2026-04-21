@@ -199,6 +199,10 @@ export interface StepExecutionParams {
   phase?: 'preamble' | 'generator' | 'evaluator' | 'postamble';
   /** True when this step is running as part of a parallel wave. */
   parallel?: boolean;
+  /** Wave index within the phase — all siblings in the same BFS level share a
+   *  waveIdx so the UI can cluster them regardless of actual start-time skew
+   *  (worker concurrency may serialize activities that are logically parallel). */
+  waveIdx?: number;
   /** Workspace root directory (same semantics as `FsmProcessInput.workspacePath`). */
   workspacePath: string;
   /** Relative subdir under `workspacePath` — scopes S3 sync and the agent's cwd. */

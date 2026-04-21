@@ -409,6 +409,7 @@ function buildStepParams(
   feedback?: string,
   overridePhase?: 'preamble' | 'generator' | 'evaluator' | 'postamble',
   parallel?: boolean,
+  waveIdx?: number,
 ): StepExecutionParams {
   const phase = overridePhase || (stepPhase(step, config) as 'preamble' | 'generator' | 'evaluator' | 'postamble');
   return {
@@ -426,6 +427,7 @@ function buildStepParams(
     s3Prefix: input.s3Prefix,
     phase,
     parallel,
+    waveIdx,
   };
 }
 
@@ -513,6 +515,7 @@ async function runPhaseParallel(
   const completed = new Set<number>();
   const failed = new Set<number>();
   const cancelledSteps = new Set<number>();
+  let waveIdx = 0;
 
   const depMap = new Map<number, Set<number>>();
   for (const step of steps) {
@@ -544,6 +547,7 @@ async function runPhaseParallel(
 
     if (ready.length === 0) break;
 
+    waveIdx++;
     const isFanOut = ready.length > 1;
     const waveResults = new Map<number, { step: Step; result: StepResult | null; wasCancelled: boolean }>();
 
@@ -553,7 +557,7 @@ async function runPhaseParallel(
           ready.map(async (step) => {
             try {
               const result = await executeStep(
-                buildStepParams(step, iteration, input, config, state, feedback, phaseKey, isFanOut)
+                buildStepParams(step, iteration, input, config, state, feedback, phaseKey, isFanOut, waveIdx)
               );
               waveResults.set(step.number, { step, result, wasCancelled: false });
               if (!result.success) {

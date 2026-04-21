@@ -23,10 +23,10 @@ const INLINE_STEP_RE = /^\(.*\)$|^[A-Z][A-Z0-9_]+$/;
  * This activity heartbeats throughout to keep Temporal informed of progress.
  */
 export async function executeStep(params: StepExecutionParams): Promise<StepResult> {
-  const { step, iteration, templateVars, feedback, humanNotes, workspacePath, workingDir, manifestPath, agentBackend, parentRunId, userId, s3Bucket, s3Prefix, phase, parallel } = params;
+  const { step, iteration, templateVars, feedback, humanNotes, workspacePath, workingDir, manifestPath, agentBackend, parentRunId, userId, s3Bucket, s3Prefix, phase, parallel, waveIdx } = params;
 
   heartbeat({ step: step.number, skill: step.skill, status: 'starting' });
-  emitEvent(parentRunId, 'step_start', { stepNumber: step.number, skill: step.skill, iteration, phase, parallel });
+  emitEvent(parentRunId, 'step_start', { stepNumber: step.number, skill: step.skill, iteration, phase, parallel, waveIdx });
 
   // Handle inline/manual steps
   if (INLINE_STEP_RE.test(step.skill)) {
