@@ -1,0 +1,3 @@
+[submodule "tne-plugins"]
+	path = tne-plugins
+	url = git@github.com:tne-ai/tne-plugins.git
