@@ -61,8 +61,7 @@ function startPeriodicS3Sync(
   if (!s3Bucket || !s3Prefix || !workspacePath) return async () => {};
   let inFlight: Promise<void> | null = null;
   let stopped = false;
-  const tick = async () => {
-    if (stopped) return;
+  const doSync = async () => {
     try {
       const result = await pushWorkspaceToS3({
         bucket: s3Bucket,
@@ -82,15 +81,19 @@ function startPeriodicS3Sync(
     }
   };
   const timer = setInterval(() => {
-    if (inFlight) return; // skip if previous tick still running
-    inFlight = tick().finally(() => { inFlight = null; });
+    if (stopped || inFlight) return;
+    inFlight = doSync().finally(() => { inFlight = null; });
   }, PERIODIC_S3_SYNC_INTERVAL_MS);
   return async () => {
-    stopped = true;
     clearInterval(timer);
     if (inFlight) await inFlight;
-    // Final sync to capture last changes
-    await tick();
+    stopped = true;
+    // Final sync captures writes made after the last interval tick.
+    // Most skill invocations finish faster than the 30s interval, so
+    // without this final push the workspace never makes it to S3 before
+    // the workflow parks at stage review — leaving the UI with nothing
+    // to show the approver.
+    await doSync();
   };
 }
 
