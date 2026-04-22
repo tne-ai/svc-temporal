@@ -49,6 +49,11 @@ RUN npm ci --omit=dev && \
 
 COPY --from=builder /app/dist ./dist
 
+# Bundle the tne-plugins submodule so parseConfig can resolve p-* SKILL.md
+# files. Mirrors the layout orion-backend uses (/app/tne-plugins/plugins/tne).
+# Fetched via troopship's recursive submodule checkout at build time.
+COPY tne-plugins/plugins/tne ./tne-plugins/plugins/tne
+
 ENV NODE_ENV=production
 
 CMD ["node", "dist/worker.js"]
