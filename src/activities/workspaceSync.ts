@@ -17,6 +17,7 @@ import {
   DeleteObjectsCommand,
 } from '@aws-sdk/client-s3';
 import { heartbeat } from '@temporalio/activity';
+import { createHash } from 'crypto';
 import { mkdir, readFile, writeFile, stat, readdir, unlink } from 'fs/promises';
 import { join, dirname, relative, posix } from 'path';
 import { Readable } from 'stream';
@@ -420,10 +421,31 @@ export async function pushWorkspaceToS3(
         // Object doesn't exist in S3 — will upload
       }
 
+      // Content-identical fast path. S3 ETag for single-part PutObjectCommand
+      // uploads is the MD5 of the body wrapped in quotes. Compare hashes
+      // before looking at timestamps — we push every 30s during a run, and
+      // without this check unchanged files would trip the "S3 newer than
+      // local mtime" branch below on every tick, exploding the workspace
+      // with `.temporal-<ts>` backup debris.
+      //
+      // Skip for multipart uploads (ETag of form "md5-N", with a dash) and
+      // SSE-KMS objects — those ETags aren't plain MD5. Falling through to
+      // the timestamp comparison is safe in both cases.
+      if (s3Exists && s3ETag) {
+        const s3Hash = s3ETag.replace(/^"|"$/g, '');
+        if (!s3Hash.includes('-')) {
+          const localMd5 = createHash('md5').update(body).digest('hex');
+          if (localMd5 === s3Hash) {
+            return { uploaded: false, bytes: 0 };
+          }
+        }
+      }
+
       if (s3Exists && s3LastModified && s3LastModified > localStat.mtime) {
-        // S3 is newer — conflict! Upload to a side path so we never lose work.
-        // Guard against chaining: if the key is already a backup, just overwrite
-        // rather than producing `foo.temporal-X.temporal-Y` debris.
+        // Content differs AND S3 is newer — a real conflict: another writer
+        // updated S3 after our pull. Save local to a side path so we never
+        // lose work. Guard against chaining: if the key is already a backup,
+        // just overwrite rather than producing `foo.temporal-X.temporal-Y`.
         if (/\.temporal-\d+/.test(s3Key)) {
           await getS3().send(
             new PutObjectCommand({ Bucket: bucket, Key: s3Key, Body: body }),
