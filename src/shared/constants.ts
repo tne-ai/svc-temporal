@@ -90,7 +90,7 @@ export const FSM_INVOKE_SECRET = typeof process !== 'undefined' ? (process.env.F
  *
  * Resolution order: HORIZON_API_BASE_URL → FSM_INVOKE_URL (stripped of /invoke).
  */
-const HORIZON_FSM_BASE = (() => {
+export const HORIZON_FSM_BASE = (() => {
   if (typeof process === 'undefined') return '';
   if (process.env.HORIZON_API_BASE_URL) return process.env.HORIZON_API_BASE_URL.replace(/\/+$/, '');
   const invoke = process.env.FSM_INVOKE_URL || '';
