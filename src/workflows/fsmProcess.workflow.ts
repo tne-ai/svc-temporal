@@ -21,12 +21,15 @@ import {
   defineQuery,
   setHandler,
   sleep,
+  CancellationScope,
+  isCancellation,
 } from '@temporalio/workflow';
 
 import type {
   FsmProcessInput,
   FsmProcessResult,
   FsmWorkflowState,
+  ProcessConfig,
   StepState,
   Step,
   IterationRecord,
@@ -43,7 +46,7 @@ import {
   STEP_ACTIVITY_TIMEOUT,
   STEP_HEARTBEAT_TIMEOUT,
   STEP_RETRY_POLICY,
-  S3_SYNC_TIMEOUT,
+  WORKSPACE_SYNC_TIMEOUT,
   CONTINUE_AS_NEW_INTERVAL,
 } from '../shared/constants.js';
 
@@ -73,14 +76,68 @@ export const getPhaseQuery = defineQuery<string>('getPhase');
 
 export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmProcessResult> {
   // Proxy activities with appropriate timeouts
-  const { executeStep, syncToS3 } = proxyActivities<typeof activities>({
+  const { executeStep } = proxyActivities<typeof activities>({
     startToCloseTimeout: STEP_ACTIVITY_TIMEOUT,
     heartbeatTimeout: STEP_HEARTBEAT_TIMEOUT,
     retry: STEP_RETRY_POLICY,
   });
 
+  // Separate proxy for sync activities with shorter timeout
+  const syncActivities = proxyActivities<typeof activities>({
+    startToCloseTimeout: WORKSPACE_SYNC_TIMEOUT,
+    heartbeatTimeout: '60s',
+    retry: { maximumAttempts: 2, initialInterval: '5s', backoffCoefficient: 2 },
+  });
+
+  // Config activity proxy (short timeout — just file reads)
+  const configActivities = proxyActivities<typeof activities>({
+    startToCloseTimeout: '30s',
+    retry: { maximumAttempts: 2, initialInterval: '2s', backoffCoefficient: 2 },
+  });
+
+  // Fire-and-forget event emission proxy. Used by the workflow itself to emit
+  // cancellation events (the activity-side executeStep handles its own events).
+  const eventActivities = proxyActivities<typeof activities>({
+    startToCloseTimeout: '15s',
+    retry: { maximumAttempts: 1 },
+  });
+
+  // ── Resolve config: either provided directly or parsed from skillName ──
+  let config: import('../shared/types.js').ProcessConfig;
+  if (input.config) {
+    config = input.config;
+  } else if (input.skillName) {
+    const parsed = await configActivities.parseConfig({
+      skillName: input.skillName,
+      workspacePath: input.workspacePath,
+      variables: input.templateVars,
+    });
+    config = parsed.config;
+  } else {
+    return {
+      status: 'failed',
+      state: { phase: Phase.INIT, iteration: 0, steps: {}, iterations: [], earlyExit: true },
+    };
+  }
+
   // Initialize or resume state
-  const state: FsmWorkflowState = input.resumeState || initializeState(input);
+  const state: FsmWorkflowState = input.resumeState || initializeState(config);
+
+  // ── Pull workspace from S3 (skip on resume — already pulled) ──────────
+  // Scoped by `workingDir` so a run in "<root>/test1" only pulls S3
+  // `{userId}/test1/*` and never spills sibling subdirs into cwd.
+  if (!input.resumeState && input.s3Bucket && input.s3Prefix) {
+    try {
+      await syncActivities.pullWorkspaceFromS3({
+        bucket: input.s3Bucket,
+        prefix: input.s3Prefix,
+        localPath: input.workspacePath,
+        scopePath: input.workingDir,
+      });
+    } catch {
+      // Non-fatal — may be first run with empty workspace
+    }
+  }
 
   // Signal state
   let approvalReceived = false;
@@ -111,7 +168,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   if (state.phase === Phase.INIT || state.phase === Phase.PREAMBLE) {
     state.phase = Phase.PREAMBLE;
 
-    for (const step of input.config.preamble) {
+    for (const step of config.preamble) {
       if (cancelled) return { status: 'cancelled', state };
 
       const stepKey = `preamble.${step.number}`;
@@ -120,7 +177,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
       // Skip already completed steps (resume case)
       if (stepState?.status === StepStatus.COMPLETE) continue;
 
-      const result = await executeStep(buildStepParams(step, 0, input, state));
+      const result = await executeStep(buildStepParams(step, 0, input, config, state));
       updateStepState(state, stepKey, result);
 
       if (!result.success) {
@@ -128,7 +185,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
       }
 
       // Stage review: wait for human approval signal
-      if (input.config.stageReview && !input.autoApprove) {
+      if (config.stageReview && !input.autoApprove) {
         state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
         approvalReceived = false;
         await condition(() => approvalReceived || cancelled, '7 days');
@@ -141,7 +198,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
 
   // ─── APPROVAL GATE ─────────────────────────────────────────────────────
 
-  if (input.config.approvalGate && state.phase === Phase.PREAMBLE) {
+  if (config.approvalGate && state.phase === Phase.PREAMBLE) {
     state.phase = Phase.APPROVAL_GATE;
     approvalReceived = false;
     await condition(() => approvalReceived || cancelled, '7 days');
@@ -150,43 +207,60 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
 
   // ─── GENERATOR ↔ EVALUATOR LOOP ───────────────────────────────────────
 
-  if (input.config.evaluatorMode !== EvaluatorMode.SEQUENTIAL_ONLY) {
+  if (config.evaluatorMode !== EvaluatorMode.SEQUENTIAL_ONLY) {
     if (state.phase === Phase.PREAMBLE || state.phase === Phase.APPROVAL_GATE) {
       state.phase = Phase.GENERATOR;
       state.iteration = 1;
     }
 
-    while (state.iteration <= input.config.maxIterations && !cancelled) {
+    while (state.iteration <= config.maxIterations && !cancelled) {
       // Generator phase
       state.phase = Phase.GENERATOR;
       const feedback = collectFeedback(state);
 
-      for (const step of input.config.generator) {
-        if (cancelled) return { status: 'cancelled', state };
-
-        const stepKey = `generator.${step.number}`;
-
-        // Reset steps on iteration > 1
-        if (state.iteration > 1) {
-          resetStepState(state, stepKey);
+      // Reset generator step state on iterations > 1 before running
+      if (state.iteration > 1) {
+        for (const step of config.generator) {
+          resetStepState(state, `generator.${step.number}`);
         }
+      }
 
-        const result = await executeStep(
-          buildStepParams(step, state.iteration, input, state, feedback)
+      // Parallel generator (opt-in via PARALLEL_GENERATOR=true).
+      // Stage review + parallel fan-out don't compose cleanly (humans can't
+      // realistically gate between fanned-out siblings), so parallel mode
+      // bypasses per-step stage review inside the generator wave.
+      if (config.parallelGenerator) {
+        const outcome = await runPhaseParallel(
+          'generator', config.generator, input, config, state, executeStep,
+          state.iteration, feedback, () => cancelled,
+          (data) => eventActivities.emitFsmEventActivity({ runId: input.runId, type: 'step_cancelled', data }),
         );
-        updateStepState(state, stepKey, result);
-
-        if (!result.success) {
+        if (cancelled) return { status: 'cancelled', state };
+        if (outcome.failed) {
           return { status: 'failed', state };
         }
-
-        if (input.config.stageReview && !input.autoApprove) {
-          state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
-          approvalReceived = false;
-          await condition(() => approvalReceived || cancelled, '7 days');
+      } else {
+        for (const step of config.generator) {
           if (cancelled) return { status: 'cancelled', state };
-          state.steps[stepKey]!.humanNotes = approvalNotes;
-          state.steps[stepKey]!.status = StepStatus.COMPLETE;
+
+          const stepKey = `generator.${step.number}`;
+          const result = await executeStep(
+            buildStepParams(step, state.iteration, input, config, state, feedback)
+          );
+          updateStepState(state, stepKey, result);
+
+          if (!result.success) {
+            return { status: 'failed', state };
+          }
+
+          if (config.stageReview && !input.autoApprove) {
+            state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
+            approvalReceived = false;
+            await condition(() => approvalReceived || cancelled, '7 days');
+            if (cancelled) return { status: 'cancelled', state };
+            state.steps[stepKey]!.humanNotes = approvalNotes;
+            state.steps[stepKey]!.status = StepStatus.COMPLETE;
+          }
         }
       }
 
@@ -196,14 +270,14 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
       const keyIssues: string[] = [];
       let stoppingEvaluator = '';
 
-      for (const step of input.config.evaluator) {
+      for (const step of config.evaluator) {
         if (cancelled) return { status: 'cancelled', state };
 
         const stepKey = `evaluator.${step.number}`;
         resetStepState(state, stepKey);
 
         const result = await executeStep(
-          buildStepParams(step, state.iteration, input, state)
+          buildStepParams(step, state.iteration, input, config, state)
         );
         updateStepState(state, stepKey, result);
 
@@ -212,7 +286,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
           stoppingEvaluator = step.skill;
           keyIssues.push(result.feedback || result.error || 'Evaluator failed');
 
-          if (input.config.evaluatorMode === EvaluatorMode.FAIL_FAST) break;
+          if (config.evaluatorMode === EvaluatorMode.FAIL_FAST) break;
         }
       }
 
@@ -235,12 +309,13 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
         state.phase = Phase.GENERATOR;
         await continueAsNew<typeof FsmProcessWorkflow>({
           ...input,
+          config,
           resumeState: state,
         });
       }
     }
 
-    if (state.iteration > input.config.maxIterations) {
+    if (state.iteration > config.maxIterations) {
       state.earlyExit = true;
     }
   } else {
@@ -255,37 +330,16 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   if (state.phase !== Phase.FINALIZATION && state.phase !== Phase.COMPLETE) {
     state.phase = Phase.POSTAMBLE;
 
-    if (input.config.postamble.length > 0) {
-      const hasDeps = input.config.postamble.some(s => s.dependsOn.length > 0);
-
-      if (hasDeps) {
-        await runPostambleParallel(input, state, executeStep);
-      } else {
-        // Sequential postamble
-        for (const step of input.config.postamble) {
-          if (cancelled) return { status: 'cancelled', state };
-
-          const stepKey = `postamble.${step.number}`;
-          const stepState = state.steps[stepKey];
-          if (stepState?.status === StepStatus.COMPLETE) continue;
-
-          const result = await executeStep(buildStepParams(step, 0, input, state));
-          updateStepState(state, stepKey, result);
-
-          if (!result.success) {
-            return { status: 'failed', state };
-          }
-
-          if (input.config.stageReview && !input.autoApprove) {
-            state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
-            approvalReceived = false;
-            await condition(() => approvalReceived || cancelled, '7 days');
-            if (cancelled) return { status: 'cancelled', state };
-            state.steps[stepKey]!.humanNotes = approvalNotes;
-            state.steps[stepKey]!.status = StepStatus.COMPLETE;
-          }
-        }
-      }
+    if (config.postamble.length > 0) {
+      // Always route postamble through the parallel runner. When every step
+      // has empty `dependsOn`, wave 1 fans them all out; when deps form a
+      // DAG, waves respect it. Sequential is the degenerate case.
+      await runPhaseParallel(
+        'postamble', config.postamble, input, config, state, executeStep,
+        0, undefined, () => cancelled,
+        (data) => eventActivities.emitFsmEventActivity({ runId: input.runId, type: 'step_cancelled', data }),
+      );
+      if (cancelled) return { status: 'cancelled', state };
     }
   }
 
@@ -298,20 +352,18 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   // are already in place from the generator). Full finalization (versioned → final
   // file copy) can be added as an activity.
 
-  // ─── SYNC TO S3 ───────────────────────────────────────────────────────
+  // ─── PUSH WORKSPACE TO S3 ───────────────────────────────────────────
 
-  const s3Activity = proxyActivities<typeof activities>({
-    startToCloseTimeout: S3_SYNC_TIMEOUT,
-  });
-
-  try {
-    await s3Activity.syncToS3({
-      workspacePath: input.workspacePath,
-      outputDir: '', // Will be resolved from config
-      prefix: `fsm/${input.runId}`,
-    });
-  } catch {
-    // Non-fatal: S3 sync failure doesn't fail the workflow
+  if (input.s3Bucket && input.s3Prefix) {
+    try {
+      await syncActivities.pushWorkspaceToS3({
+        bucket: input.s3Bucket,
+        prefix: input.s3Prefix,
+        localPath: input.workspacePath,
+      });
+    } catch {
+      // Non-fatal: S3 sync failure doesn't fail the workflow
+    }
   }
 
   // ─── COMPLETE ──────────────────────────────────────────────────────────
@@ -322,14 +374,14 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
 
 // ─── Helper Functions ───────────────────────────────────────────────────────
 
-function initializeState(input: FsmProcessInput): FsmWorkflowState {
+function initializeState(config: ProcessConfig): FsmWorkflowState {
   const steps: Record<string, StepState> = {};
 
   for (const [phaseName, phaseSteps] of Object.entries({
-    preamble: input.config.preamble,
-    generator: input.config.generator,
-    evaluator: input.config.evaluator,
-    postamble: input.config.postamble,
+    preamble: config.preamble,
+    generator: config.generator,
+    evaluator: config.evaluator,
+    postamble: config.postamble,
   })) {
     for (const step of phaseSteps) {
       steps[`${phaseName}.${step.number}`] = {
@@ -352,23 +404,37 @@ function buildStepParams(
   step: Step,
   iteration: number,
   input: FsmProcessInput,
+  config: ProcessConfig,
   state: FsmWorkflowState,
   feedback?: string,
+  overridePhase?: 'preamble' | 'generator' | 'evaluator' | 'postamble',
+  parallel?: boolean,
+  waveIdx?: number,
 ): StepExecutionParams {
+  const phase = overridePhase || (stepPhase(step, config) as 'preamble' | 'generator' | 'evaluator' | 'postamble');
   return {
     step,
     iteration,
     templateVars: input.templateVars,
     feedback,
-    humanNotes: state.steps[`${stepPhase(step, input)}.${step.number}`]?.humanNotes,
+    humanNotes: state.steps[`${phase}.${step.number}`]?.humanNotes,
     workspacePath: input.workspacePath,
+    workingDir: input.workingDir,
+    agentBackend: input.agentBackend,
+    parentRunId: input.runId,
+    userId: input.userId,
+    s3Bucket: input.s3Bucket,
+    s3Prefix: input.s3Prefix,
+    phase,
+    parallel,
+    waveIdx,
   };
 }
 
-function stepPhase(step: Step, input: FsmProcessInput): string {
-  if (input.config.preamble.includes(step)) return 'preamble';
-  if (input.config.generator.includes(step)) return 'generator';
-  if (input.config.evaluator.includes(step)) return 'evaluator';
+function stepPhase(step: Step, config: ProcessConfig): string {
+  if (config.preamble.includes(step)) return 'preamble';
+  if (config.generator.includes(step)) return 'generator';
+  if (config.evaluator.includes(step)) return 'evaluator';
   return 'postamble';
 }
 
@@ -416,74 +482,152 @@ function collectFeedback(state: FsmWorkflowState): string {
 }
 
 /**
- * Run postamble steps in parallel with dependency resolution.
+ * Run a phase's steps in parallel with DAG-ordered waves and cancel-siblings
+ * semantics on failure.
+ *
+ * Semantics:
+ *   • Build a dependency map from `step.dependsOn` — supports bare numbers
+ *     (`"3"`), phase-qualified keys (`"postamble.3"`), and mixed forms.
+ *   • Each wave runs every step whose deps are all in `completed`, wrapped
+ *     in a single `CancellationScope`. If any step fails mid-wave the scope
+ *     is cancelled, in-flight siblings receive cancellation errors, and they
+ *     are recorded as `cancelled` (not `failed`) so the UI can render them
+ *     distinctly.
+ *   • After each wave, failures and cancellations cascade to any step
+ *     transitively blocked on them — those are also marked cancelled.
+ *   • Returns `failed=true` if any non-cascade failure occurred (lets the
+ *     caller decide whether to abort the workflow or continue).
  */
-async function runPostambleParallel(
+async function runPhaseParallel(
+  phaseKey: 'preamble' | 'generator' | 'evaluator' | 'postamble',
+  steps: Step[],
   input: FsmProcessInput,
+  config: ProcessConfig,
   state: FsmWorkflowState,
   executeStep: (params: StepExecutionParams) => Promise<StepResult>,
-): Promise<void> {
-  const steps = input.config.postamble;
+  iteration: number,
+  feedback: string | undefined,
+  isCancelled: () => boolean,
+  emitCancelEvent: (data: Record<string, any>) => Promise<void>,
+): Promise<{ failed: boolean }> {
+  if (steps.length === 0) return { failed: false };
+
   const completed = new Set<number>();
   const failed = new Set<number>();
+  const cancelledSteps = new Set<number>();
+  let waveIdx = 0;
 
-  // Build dependency map: step.number → set of step numbers it depends on
   const depMap = new Map<number, Set<number>>();
   for (const step of steps) {
     const deps = new Set<number>();
     for (const depKey of step.dependsOn) {
       const parts = depKey.split('.');
-      if (parts.length === 2 && parts[0] === 'postamble') {
-        const num = parseInt(parts[1], 10);
-        if (!isNaN(num)) deps.add(num);
-      }
+      const raw = parts.length === 2 ? parts[1] : parts[0];
+      const num = parseInt(raw, 10);
+      if (!isNaN(num)) deps.add(num);
     }
     depMap.set(step.number, deps);
   }
 
-  // Pre-seed already-complete steps
+  // Pre-seed already-complete steps (resume case)
   for (const step of steps) {
-    const ss = state.steps[`postamble.${step.number}`];
-    if (ss?.status === StepStatus.COMPLETE) {
-      completed.add(step.number);
-    }
+    const ss = state.steps[`${phaseKey}.${step.number}`];
+    if (ss?.status === StepStatus.COMPLETE) completed.add(step.number);
   }
 
-  while (completed.size + failed.size < steps.length) {
-    // Find ready steps
+  while (completed.size + failed.size + cancelledSteps.size < steps.length) {
+    if (isCancelled()) return { failed: failed.size > 0 };
+
     const ready = steps.filter(s => {
-      if (completed.has(s.number) || failed.has(s.number)) return false;
+      if (completed.has(s.number) || failed.has(s.number) || cancelledSteps.has(s.number)) return false;
       const deps = depMap.get(s.number) || new Set();
-      return [...deps].every(d => completed.has(d)) && ![...deps].some(d => failed.has(d));
+      if ([...deps].some(d => failed.has(d) || cancelledSteps.has(d))) return false;
+      return [...deps].every(d => completed.has(d));
     });
 
     if (ready.length === 0) break;
 
-    // Fan out ready steps in parallel
-    const results = await Promise.all(
-      ready.map(async (step) => {
-        const result = await executeStep(buildStepParams(step, 0, input, state));
-        return { step, result };
-      })
-    );
+    waveIdx++;
+    const isFanOut = ready.length > 1;
+    const waveResults = new Map<number, { step: Step; result: StepResult | null; wasCancelled: boolean }>();
 
-    for (const { step, result } of results) {
-      updateStepState(state, `postamble.${step.number}`, result);
-      if (result.success) {
-        completed.add(step.number);
-      } else {
-        failed.add(step.number);
+    try {
+      await CancellationScope.cancellable(async () => {
+        await Promise.all(
+          ready.map(async (step) => {
+            try {
+              const result = await executeStep(
+                buildStepParams(step, iteration, input, config, state, feedback, phaseKey, isFanOut, waveIdx)
+              );
+              waveResults.set(step.number, { step, result, wasCancelled: false });
+              if (!result.success) {
+                // Cancel in-flight siblings. They'll throw CancelledFailure at
+                // their next suspension point and be caught below as cancelled.
+                CancellationScope.current().cancel();
+              }
+            } catch (err) {
+              if (isCancellation(err)) {
+                waveResults.set(step.number, { step, result: null, wasCancelled: true });
+              } else {
+                throw err;
+              }
+            }
+          }),
+        );
+      });
+    } catch (err) {
+      if (!isCancellation(err)) throw err;
+    }
+
+    // Commit wave outcomes to state + notify UI for cancelled siblings.
+    for (const { step, result, wasCancelled } of waveResults.values()) {
+      const stepKey = `${phaseKey}.${step.number}`;
+      if (wasCancelled) {
+        cancelledSteps.add(step.number);
+        state.steps[stepKey] = {
+          ...state.steps[stepKey],
+          status: StepStatus.FAILED,
+          error: 'cancelled: sibling step failed',
+          completedAt: new Date().toISOString(),
+          retries: state.steps[stepKey]?.retries || 0,
+        };
+        await emitCancelEvent({
+          stepNumber: step.number, skill: step.skill, iteration, phase: phaseKey,
+          reason: 'sibling_failed',
+        });
+      } else if (result) {
+        updateStepState(state, stepKey, result);
+        if (result.success) completed.add(step.number);
+        else failed.add(step.number);
       }
     }
 
-    // Cascade failures to blocked dependents
-    for (const step of steps) {
-      if (!completed.has(step.number) && !failed.has(step.number)) {
+    // Cascade failures/cancellations to transitively blocked dependents.
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const step of steps) {
+        if (completed.has(step.number) || failed.has(step.number) || cancelledSteps.has(step.number)) continue;
         const deps = depMap.get(step.number) || new Set();
-        if ([...deps].some(d => failed.has(d))) {
-          failed.add(step.number);
+        if ([...deps].some(d => failed.has(d) || cancelledSteps.has(d))) {
+          cancelledSteps.add(step.number);
+          changed = true;
+          const stepKey = `${phaseKey}.${step.number}`;
+          state.steps[stepKey] = {
+            ...state.steps[stepKey],
+            status: StepStatus.FAILED,
+            error: 'cancelled: dependency failed',
+            completedAt: new Date().toISOString(),
+            retries: 0,
+          };
+          await emitCancelEvent({
+            stepNumber: step.number, skill: step.skill, iteration, phase: phaseKey,
+            reason: 'dependency_failed',
+          });
         }
       }
     }
   }
+
+  return { failed: failed.size > 0 };
 }

@@ -5,6 +5,19 @@
  * and starts polling for tasks on the configured task queues.
  */
 
+// Load .env BEFORE any other import so module-level captures in
+// ./shared/constants.js (HORIZON_FSM_EVENTS_URL, FSM_INVOKE_SECRET, etc) see
+// the values. Under ESM all imports evaluate before top-level code runs, so a
+// later `config()` call is too late — constants are already frozen to ''.
+import 'dotenv/config';
+
+// Remove AWS_PROFILE before any imports touch the AWS SDK credential chain.
+// When both AWS_PROFILE and static credentials (from eval) are present,
+// the SDK warns and picks the profile path — which can resolve stale creds.
+if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && process.env.AWS_PROFILE) {
+  delete process.env.AWS_PROFILE;
+}
+
 import { Worker, NativeConnection } from '@temporalio/worker';
 import { TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE, FSM_TASK_QUEUE, JOBS_TASK_QUEUE } from './shared/constants.js';
 
@@ -24,7 +37,7 @@ async function run() {
     taskQueue: FSM_TASK_QUEUE,
     workflowsPath: new URL('./workflows/index.js', import.meta.url).pathname,
     activities,
-    maxConcurrentActivityTaskExecutions: 4,
+    maxConcurrentActivityTaskExecutions: 25,
     maxConcurrentWorkflowTaskExecutions: 10,
   });
 

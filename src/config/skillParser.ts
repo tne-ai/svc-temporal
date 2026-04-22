@@ -9,6 +9,7 @@
 
 import { readFileSync } from 'fs';
 import { basename, dirname } from 'path';
+import { parse as parseYaml } from 'yaml';
 import {
   CouncilMember,
   EvaluatorMode,
@@ -182,15 +183,50 @@ function normalizeRow(row: Record<string, string>): Record<string, string> {
 
 // ─── Config Block Extraction ────────────────────────────────────────────────
 
+/**
+ * Fast path: extract the SOP config from YAML frontmatter `sop:` key.
+ * Returns the raw string value (same text format as legacy fenced blocks)
+ * or null if no frontmatter or no `sop:` key.
+ *
+ * Mirrors Python's _parse_frontmatter_sop in tne-plugins/engine/parser.py.
+ */
+function extractFrontmatterSop(content: string): string | null {
+  if (!content.startsWith('---')) return null;
+  const end = content.indexOf('\n---', 3);
+  if (end === -1) return null;
+  const fmText = content.slice(3, end);
+  let fm: any;
+  try {
+    fm = parseYaml(fmText);
+  } catch {
+    return null;
+  }
+  const sop = fm?.sop;
+  return typeof sop === 'string' ? sop : null;
+}
+
+function hasStepTables(block: string): boolean {
+  return /^\s*\|---/m.test(block);
+}
+
 function extractRcooBlock(content: string): string | null {
-  // Strategy 1: fenced code block
+  // Strategy 1: fenced code blocks containing /r-coo-sop1-process.
+  // Collect all candidates; prefer the one with step tables (some skills
+  // lead with a short param-only reference block before the full one).
   const fencedRe = /```[^\n]*\n(.*?)```/gs;
+  const candidates: string[] = [];
   let match;
   while ((match = fencedRe.exec(content)) !== null) {
     const block = match[1];
     if (block.includes('/r-coo-sop1-process') && block.includes('SCOPE=')) {
-      return block;
+      candidates.push(block);
     }
+  }
+  if (candidates.length > 0) {
+    for (const block of candidates) {
+      if (hasStepTables(block)) return block;
+    }
+    return candidates[0];
   }
 
   // Strategy 2: unfenced
@@ -199,6 +235,55 @@ function extractRcooBlock(content: string): string | null {
   if (m2) return m2[1];
 
   return null;
+}
+
+/**
+ * Primary format (PR #1061): `## SOP` heading followed by a fenced block.
+ * Returns the fenced block body, or null if `## SOP` is absent or empty.
+ */
+function extractBodySopBlock(content: string): string | null {
+  let body = content;
+  if (content.startsWith('---')) {
+    const end = content.indexOf('\n---', 3);
+    if (end !== -1) body = content.slice(end + 4);
+  }
+  const sopMatch = body.match(/^## SOP\s*$/m);
+  if (!sopMatch || sopMatch.index === undefined) return null;
+  const after = body.slice(sopMatch.index + sopMatch[0].length);
+  const fence = after.match(/^```[^\n]*\n(.*?)^```/ms);
+  return fence ? fence[1] : null;
+}
+
+/**
+ * Legacy-inline format: `/r-coo-sop1-process` appears with sibling
+ * `## Preamble / ## Generator / …` headings. The `/r-coo-sop1-process` line
+ * itself may or may not be fenced; the phase sections are outside any fence.
+ * Assembles a synthetic block by collecting lines from the first
+ * `/r-coo-sop1-process` through the next non-phase `##` heading or `---`
+ * separator, stripping fence markers so `splitSections` parses cleanly.
+ */
+function extractInlineLegacyBlock(content: string): string | null {
+  const lines = content.split('\n');
+  const PHASE = /^##\s+(preamble|generator|evaluator|postamble|finalization|expert|council)\b/i;
+
+  let startIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\/r-coo-sop1-process\b/.test(lines[i].trim())) { startIdx = i; break; }
+  }
+  if (startIdx === -1) return null;
+
+  const collected: string[] = [];
+  for (let i = startIdx; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim().startsWith('```')) continue;  // strip fence markers
+    const trimmed = line.trim();
+    // Note: bare `---` is a markdown horizontal rule inside the body — not a
+    // terminator. Only `##` non-phase headings end the config section.
+    if (/^##\s+/.test(trimmed) && !PHASE.test(trimmed) && i !== startIdx) break;
+    collected.push(line);
+  }
+  const block = collected.join('\n').trim();
+  return block || null;
 }
 
 // ─── Block Parsing ──────────────────────────────────────────────────────────
@@ -399,15 +484,7 @@ function parseCouncilTable(sectionText: string): CouncilMember[] {
 
 // ─── Main Entry Point ───────────────────────────────────────────────────────
 
-function parseConfigBlock(content: string): ProcessConfig {
-  const block = extractRcooBlock(content);
-  if (!block) {
-    throw new Error(
-      "No /r-coo-sop1-process config block found in SKILL.md. " +
-      "Expected a fenced code block containing '/r-coo-sop1-process'."
-    );
-  }
-
+function parseBlockText(block: string): ProcessConfig {
   const lines = block.trim().split('\n');
   const params = parseParams(lines);
 
@@ -424,6 +501,7 @@ function parseConfigBlock(content: string): ProcessConfig {
   const inputsFile = params['INPUTS_FILE'] || '';
   const inputsBackprop = (params['INPUTS_BACKPROP'] || 'true').toLowerCase() !== 'false';
   const inputsBackpropGate = params['INPUTS_BACKPROP_GATE'] || 'after_evaluator';
+  const parallelGenerator = (params['PARALLEL_GENERATOR'] || 'false').toLowerCase() === 'true';
 
   let evaluatorMode: EvaluatorMode;
   try {
@@ -449,6 +527,7 @@ function parseConfigBlock(content: string): ProcessConfig {
     inputsFile,
     inputsBackprop,
     inputsBackpropGate,
+    parallelGenerator,
     preamble: parseStepTable(sections['preamble'] || ''),
     generator: parseStepTable(sections['generator'] || ''),
     evaluator: parseStepTable(sections['evaluator'] || ''),
@@ -457,6 +536,17 @@ function parseConfigBlock(content: string): ProcessConfig {
     expert: parseExpertTable(sections['expert'] || ''),
     council: parseCouncilTable(sections['council'] || ''),
   };
+}
+
+function parseConfigBlock(content: string): ProcessConfig {
+  const block = extractRcooBlock(content);
+  if (!block) {
+    throw new Error(
+      "No /r-coo-sop1-process config block found in SKILL.md. " +
+      "Expected a fenced code block containing '/r-coo-sop1-process'."
+    );
+  }
+  return parseBlockText(block);
 }
 
 /**
@@ -488,7 +578,39 @@ export function parseSkillFile(
     ? resolveVariables(content, merged)
     : content;
 
-  return parseConfigBlock(resolved);
+  // Strategy ladder. tne-plugins has three SOP formats in the wild:
+  //   1. ## SOP body block   — current primary (PR #1061)
+  //   2. frontmatter `sop:`  — PR #991 middle format, still in flight
+  //   3. inline legacy       — unfenced /r-coo-sop1-process with sibling
+  //                            ## Preamble / ## Generator / … headings
+  // Each extractor returns a block string; we accept the first one whose
+  // parsed config has any phases. A 0-phase result means we hit a stub
+  // (e.g. ## SOP with only SCOPE=…) and must fall through. If every
+  // strategy yields 0 phases, keep the first non-null candidate so
+  // callers still get scope/params back.
+  const extractors: Array<() => string | null> = [
+    () => extractBodySopBlock(resolved),
+    () => extractFrontmatterSop(resolved),
+    () => extractRcooBlock(resolved),
+    () => extractInlineLegacyBlock(resolved),
+  ];
+
+  let fallback: ProcessConfig | null = null;
+  for (const extract of extractors) {
+    const block = extract();
+    if (!block) continue;
+    const cfg = parseBlockText(block);
+    const phases =
+      cfg.preamble.length + cfg.generator.length + cfg.evaluator.length + cfg.postamble.length;
+    if (phases > 0) return cfg;
+    if (!fallback) fallback = cfg;
+  }
+
+  if (fallback) return fallback;
+  throw new Error(
+    "No /r-coo-sop1-process config block found in SKILL.md. " +
+    "Expected a fenced code block containing '/r-coo-sop1-process'."
+  );
 }
 
 // Re-export for testing
