@@ -43,6 +43,23 @@ RUN if [ -n "$GITHUB_TOKEN" ]; then \
       git config --global --add url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "git@github.com:"; \
     fi
 
+# Install Claude Code CLI. The Claude Agent SDK spawns the `claude` binary
+# as a subprocess, so the worker image must ship it. Uses the same installer
+# and move-to-/usr/local/bin pattern as horizon/backend/Dockerfile so the
+# binary is on PATH for node (UID 0) at runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+RUN export USE_BUILTIN_RIPGREP=0 && \
+    for i in 1 2 3; do \
+      curl -fsSL https://claude.ai/install.sh | bash && break || \
+      echo "Attempt $i failed, retrying in 10s..." && sleep 10; \
+    done && \
+    chmod a+rx /root /root/.local /root/.local/share && \
+    chmod -R a+rX /root/.local/share/claude && \
+    mv /root/.local/bin/claude /usr/local/bin/claude && \
+    chmod +x /usr/local/bin/claude
+
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev && \
     git config --global --unset-all url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf 2>/dev/null || true
