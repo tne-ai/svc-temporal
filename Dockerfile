@@ -71,6 +71,15 @@ COPY --from=builder /app/dist ./dist
 # Fetched via troopship's recursive submodule checkout at build time.
 COPY tne-plugins/plugins/tne ./tne-plugins/plugins/tne
 
+# Run as the built-in `node` user (UID 1000) rather than root. The Claude
+# Agent SDK invokes `claude --allow-dangerously-skip-permissions`, which
+# the CLI rejects when running as root:
+#   "--dangerously-skip-permissions cannot be used with root/sudo privileges
+#    for security reasons"
+# Ensure /app and the node user's HOME are writable for runtime state.
+RUN chown -R node:node /app && mkdir -p /home/node/.claude && chown -R node:node /home/node
+USER node
+
 ENV NODE_ENV=production
 
 CMD ["node", "dist/worker.js"]
