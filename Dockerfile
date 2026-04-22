@@ -2,6 +2,21 @@ FROM node:20-slim AS builder
 
 WORKDIR /app
 
+# git is needed to install the @tne-ai/agent-harness GitHub dependency
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure git auth for private GitHub repos. npm resolves github URLs to
+# git+ssh://git@github.com/... even when package.json specifies https, so we
+# rewrite both forms to HTTPS with a token.
+ARG GITHUB_TOKEN=""
+RUN if [ -n "$GITHUB_TOKEN" ]; then \
+      git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/" && \
+      git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "ssh://git@github.com/" && \
+      git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "git@github.com:"; \
+    fi
+
 # Install dependencies
 COPY package.json package-lock.json* ./
 RUN npm ci
@@ -21,8 +36,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
+ARG GITHUB_TOKEN=""
+RUN if [ -n "$GITHUB_TOKEN" ]; then \
+      git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/" && \
+      git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "ssh://git@github.com/" && \
+      git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "git@github.com:"; \
+    fi
+
 COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev && \
+    git config --global --unset-all url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf 2>/dev/null || true
 
 COPY --from=builder /app/dist ./dist
 

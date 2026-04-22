@@ -18,7 +18,7 @@
     "@temporalio/client": "^1.16.0",
     "@temporalio/worker": "^1.16.0",
     "@temporalio/workflow": "^1.16.0",
-    "@tne-ai/agent-harness": "file:../agent-harness",
+    "@tne-ai/agent-harness": "git+https://github.com/tne-ai/agent-harness.git#main",
     "dotenv": "^17.4.2",
     "yaml": "^2.8.3"
   },
