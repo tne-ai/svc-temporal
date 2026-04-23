@@ -8,13 +8,20 @@
 
 import {
   condition,
+  executeChild,
   proxyActivities,
   defineSignal,
   defineQuery,
   setHandler,
 } from '@temporalio/workflow';
 
-import type { JobInput, JobResult, ApprovalSignalPayload } from '../shared/types.js';
+import type {
+  ApprovalSignalPayload,
+  FsmProcessInput,
+  FsmProcessResult,
+  JobInput,
+  JobResult,
+} from '../shared/types.js';
 
 import type * as activities from '../activities/index.js';
 
@@ -59,6 +66,57 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
 
   if (cancelled) {
     return { status: 'failed', output: 'Job cancelled before start' };
+  }
+
+  // ── Skill dispatch: delegate to FsmProcessWorkflow as a child ──────────
+  // When the job was created via /api/jobs/skill-run (skillName set and a
+  // ProcessRun row pre-created), run the skill through the FSM engine on
+  // tne-fsm-queue rather than the generic agent-task path. The child writes
+  // its own workspace sync, progress events, and approval signals — the
+  // parent just awaits and summarizes.
+  if (input.skillName && input.processRunId) {
+    statusMessage = `Running skill ${input.skillName}...`;
+    progress = 10;
+    const fsmWorkspacePath =
+      input.workspacePath ?? `/tmp/claude-agent-s3/${input.workspaceId}`;
+    const fsmInput: FsmProcessInput = {
+      runId: input.processRunId,
+      skillName: input.skillName,
+      templateVars: {},
+      workspacePath: fsmWorkspacePath,
+      workingDir: input.workingDir,
+      userId: input.userId,
+      autoApprove: input.autoApprove ?? false,
+      s3Bucket: input.s3Bucket,
+      s3Prefix: input.s3Prefix,
+      agentBackend: input.agentBackend,
+    };
+    try {
+      const fsmResult = await executeChild<(i: FsmProcessInput) => Promise<FsmProcessResult>>(
+        'FsmProcessWorkflow',
+        {
+          taskQueue: 'tne-fsm-queue',
+          workflowId: `fsm-${input.processRunId}`,
+          args: [fsmInput],
+        },
+      );
+      progress = 100;
+      const terminal: 'completed' | 'failed' =
+        fsmResult.status === 'completed' ? 'completed' : 'failed';
+      status = terminal;
+      statusMessage = terminal === 'completed' ? 'Complete' : 'Failed';
+      return {
+        status: terminal,
+        output:
+          `FSM ${fsmResult.status}. Final phase: ${fsmResult.state.phase}, ` +
+          `iteration: ${fsmResult.state.iteration}.`,
+      };
+    } catch (err: any) {
+      return {
+        status: 'failed',
+        output: `FSM child workflow error: ${err?.message ?? String(err)}`,
+      };
+    }
   }
 
   // ── Step 1: Pull user workspace from S3 ────────────────────────────────
