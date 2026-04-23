@@ -295,6 +295,10 @@ export interface JobInput {
   /** Absolute workspace path on the worker — overrides the default
    *  `/tmp/temporal-jobs/${jobId}` for FSM dispatch. */
   workspacePath?: string;
+  /** When true, FSM approval gates and stage reviews auto-approve so
+   *  headless / M2M callers aren't parked forever waiting for a human
+   *  approval signal. Ignored outside the FSM dispatch path. */
+  autoApprove?: boolean;
 }
 
 export interface JobResult {
