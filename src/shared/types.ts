@@ -284,6 +284,17 @@ export interface JobInput {
   outputFolder?: string;
   /** Agent backend override — if unset, falls back to AGENT_BACKEND env var */
   agentBackend?: AgentBackend;
+  /** Skill name to run via the FSM engine. When set with `processRunId`,
+   *  the workflow dispatches to FsmProcessWorkflow as a child on the
+   *  tne-fsm-queue instead of running the generic agent-task path. */
+  skillName?: string;
+  /** Relative subdirectory inside the user workspace; forwarded to FSM. */
+  workingDir?: string;
+  /** Pre-created ProcessRun.id in Horizon — reused as the FSM child runId. */
+  processRunId?: string;
+  /** Absolute workspace path on the worker — overrides the default
+   *  `/tmp/temporal-jobs/${jobId}` for FSM dispatch. */
+  workspacePath?: string;
 }
 
 export interface JobResult {
