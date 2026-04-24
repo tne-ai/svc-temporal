@@ -64,6 +64,18 @@ export const rejectSignal = defineSignal<[ApprovalSignalPayload]>('reject');
 /** Signal to cancel the workflow gracefully */
 export const cancelSignal = defineSignal('cancel');
 
+/**
+ * Signal to flip the run into "auto-approve the rest" mode. Any in-flight
+ * `condition(() => approvalReceived)` wait resolves immediately, and every
+ * subsequent stage review / approval gate is skipped.
+ *
+ * Use case: user watching a long run decides mid-flight "just go ahead,
+ * don't ask me again". Separate from the per-gate `approve` signal so a
+ * second click doesn't accidentally upgrade a one-off approval to
+ * whole-run auto-approve.
+ */
+export const autoApproveSignal = defineSignal('autoApprove');
+
 // ─── Queries ────────────────────────────────────────────────────────────────
 
 /** Query the current workflow state (phase, steps, iterations) */
@@ -156,6 +168,9 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   let approvalReceived = false;
   let approvalNotes = '';
   let cancelled = false;
+  // Mutable copy of input.autoApprove — the autoApprove signal can flip it
+  // true mid-run. `input` is readonly from the workflow's perspective.
+  let autoApprove = !!input.autoApprove;
 
   // Register signal handlers
   setHandler(approveSignal, (payload) => {
@@ -170,6 +185,13 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
 
   setHandler(cancelSignal, () => {
     cancelled = true;
+  });
+
+  // User hit "skip remaining approvals" — release the current gate (if any)
+  // and short-circuit every future one.
+  setHandler(autoApproveSignal, () => {
+    autoApprove = true;
+    approvalReceived = true;
   });
 
   // Register query handlers
@@ -200,7 +222,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
       // Stage review: wait for human approval signal. Push the workspace to
       // S3 first so the reviewer (on a different pod in prod) can actually
       // fetch the step's artifacts while the workflow blocks.
-      if (config.stageReview && !input.autoApprove) {
+      if (config.stageReview && !autoApprove) {
         await syncBeforeGate(syncActivities, input);
         state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
         approvalReceived = false;
@@ -214,7 +236,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
 
   // ─── APPROVAL GATE ─────────────────────────────────────────────────────
 
-  if (config.approvalGate && state.phase === Phase.PREAMBLE) {
+  if (config.approvalGate && !autoApprove && state.phase === Phase.PREAMBLE) {
     state.phase = Phase.APPROVAL_GATE;
     approvalReceived = false;
     await syncBeforeGate(syncActivities, input);
@@ -270,7 +292,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
             return { status: 'failed', state };
           }
 
-          if (config.stageReview && !input.autoApprove) {
+          if (config.stageReview && !autoApprove) {
             await syncBeforeGate(syncActivities, input);
             state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
             approvalReceived = false;
