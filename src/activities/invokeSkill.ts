@@ -264,7 +264,7 @@ async function invokeViaHarness(
   model?: string,
   permissionMode?: string,
   workspacePath?: string,
-  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: number; skill?: string; workingDir?: string },
+  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string },
 ): Promise<InvocationResult> {
   const stopSync = startPeriodicS3Sync(workspacePath || '', context?.s3Bucket, context?.s3Prefix, context?.parentRunId, context?.workingDir);
   try {
@@ -460,7 +460,7 @@ async function invokeViaClaudeAgentSDK(
   prompt: string,
   model?: string,
   workspacePath?: string,
-  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: number; skill?: string; workingDir?: string },
+  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string },
 ): Promise<InvocationResult> {
   const resolvedModel = resolveModelId(model, 'agent');
   const workspaceRoot = workspacePath || process.cwd();

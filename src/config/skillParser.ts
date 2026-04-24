@@ -210,18 +210,52 @@ function hasStepTables(block: string): boolean {
 }
 
 function extractRcooBlock(content: string): string | null {
-  // Strategy 1: fenced code blocks containing /r-coo-sop1-process.
-  // Collect all candidates; prefer the one with step tables (some skills
-  // lead with a short param-only reference block before the full one).
-  const fencedRe = /```[^\n]*\n(.*?)```/gs;
+  // Strategy 1: fenced code blocks containing /r-coo-sop1-process. Walk lines
+  // so we can track the enclosing heading level for each block.
+  //
+  // Only accept blocks at top-level (no heading before them) or under a `##`
+  // heading. Blocks nested under `###`+ subsections are rejected — those are
+  // documentary snippets (e.g. `### Phase 1: Strategy` → `#### r-coo-sop1…`
+  // in p-ceo1-manage-strategy), not the orchestrator's own SOP.
+  const lines = content.split('\n');
   const candidates: string[] = [];
-  let match;
-  while ((match = fencedRe.exec(content)) !== null) {
-    const block = match[1];
-    if (block.includes('/r-coo-sop1-process') && block.includes('SCOPE=')) {
-      candidates.push(block);
+  let currentHeadingLevel = 0;
+  let inFence = false;
+  let blockStart = -1;
+  let blockHeadingLevel = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trimStart();
+
+    if (!inFence) {
+      const h = trimmed.match(/^(#{1,6})\s+\S/);
+      if (h) {
+        currentHeadingLevel = h[1].length;
+        continue;
+      }
+      if (trimmed.startsWith('```')) {
+        inFence = true;
+        blockStart = i + 1;
+        blockHeadingLevel = currentHeadingLevel;
+      }
+    } else if (trimmed.startsWith('```')) {
+      const body = lines.slice(blockStart, i).join('\n');
+      inFence = false;
+      blockStart = -1;
+      // Level 0 = top of file; level ≤ 2 = `#` or `##` — these are acceptable
+      // top-level SOP containers. Level ≥ 3 means the block lives inside a
+      // subsection and must be ignored.
+      if (
+        blockHeadingLevel <= 2 &&
+        body.includes('/r-coo-sop1-process') &&
+        body.includes('SCOPE=')
+      ) {
+        candidates.push(body);
+      }
     }
   }
+
   if (candidates.length > 0) {
     for (const block of candidates) {
       if (hasStepTables(block)) return block;
@@ -362,11 +396,18 @@ function parseStepTable(sectionText: string): Step[] {
   for (const row of rows) {
     const norm = normalizeRow(row);
 
-    const numberStr = norm[''] || norm['number'] || '0';
-    const number = parseInt(numberStr, 10);
-    if (isNaN(number) || number === 0) continue;
+    // Accept several column names for the step identifier. `#` (the canonical
+    // SOP form) normalizes to `''`; `Phase` is used by p-ceo* skills where
+    // labels like `0a`/`1b` matter; `Number` appears in some legacy skills.
+    const rawNumber = (norm[''] || norm['number'] || norm['phase'] || '').trim();
+    if (!rawNumber || NO_DEFAULT.has(rawNumber)) continue;
+    // Sanity guard: a plain integer `0` is the parseMarkdownTable sentinel for
+    // an empty cell in older column layouts. Keep rejecting it so an alignment
+    // bug doesn't produce a phantom step.
+    if (rawNumber === '0') continue;
 
-    const skill = norm['skill'] || '';
+    // `Skill` is canonical; `Name` is the p-ceo* equivalent.
+    const skill = norm['skill'] || norm['name'] || '';
     if (!skill || NO_DEFAULT.has(skill)) continue;
 
     const inputsRaw = norm['inputs'] || norm['input'] || '';
@@ -383,7 +424,7 @@ function parseStepTable(sectionText: string): Step[] {
       stageType = stageTypeStr as StageType;
     }
 
-    const dependsOnRaw = norm['dependson'] || '';
+    const dependsOnRaw = norm['dependson'] || norm['dependencies'] || '';
     const dependsOn = (dependsOnRaw && !NO_DEFAULT.has(dependsOnRaw) && dependsOnRaw !== '[]')
       ? dependsOnRaw.split(',').map(d => d.trim()).filter(Boolean)
       : [];
@@ -400,7 +441,7 @@ function parseStepTable(sectionText: string): Step[] {
     if (NO_DEFAULT.has(model)) model = '';
 
     steps.push({
-      number,
+      number: rawNumber,
       skill,
       inputs,
       output,

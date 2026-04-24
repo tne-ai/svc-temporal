@@ -67,7 +67,7 @@ export async function RalphLoopWorkflow(input: RalphInput): Promise<RalphResult>
     // We use invokeSkill with a minimal step config
     const result = await invokeSkill(
       {
-        number: 0,
+        number: '0',
         skill: 'ralph-loop',
         inputs: [],
         output: '',

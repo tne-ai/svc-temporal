@@ -144,7 +144,7 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
 
   const result = await invokeSkill(
     {
-      number: 0,
+      number: '0',
       skill: 'agent-task',
       inputs: [],
       output: '',

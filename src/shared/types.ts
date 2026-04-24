@@ -53,7 +53,11 @@ export interface FailFastConfig {
 }
 
 export interface Step {
-  number: number;
+  /**
+   * Step identifier from the SOP table's first column. Kept as a string so
+   * skills can use labels like `"0a"` / `"3b"` in addition to plain integers.
+   */
+  number: string;
   skill: string;
   inputs: string[];
   output: string;
