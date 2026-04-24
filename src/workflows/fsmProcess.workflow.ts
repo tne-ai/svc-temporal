@@ -197,8 +197,11 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
         return { status: 'failed', state };
       }
 
-      // Stage review: wait for human approval signal
+      // Stage review: wait for human approval signal. Push the workspace to
+      // S3 first so the reviewer (on a different pod in prod) can actually
+      // fetch the step's artifacts while the workflow blocks.
       if (config.stageReview && !input.autoApprove) {
+        await syncBeforeGate(syncActivities, input);
         state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
         approvalReceived = false;
         await condition(() => approvalReceived || cancelled, '7 days');
@@ -214,6 +217,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   if (config.approvalGate && state.phase === Phase.PREAMBLE) {
     state.phase = Phase.APPROVAL_GATE;
     approvalReceived = false;
+    await syncBeforeGate(syncActivities, input);
     await condition(() => approvalReceived || cancelled, '7 days');
     if (cancelled) return { status: 'cancelled', state };
   }
@@ -267,6 +271,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
           }
 
           if (config.stageReview && !input.autoApprove) {
+            await syncBeforeGate(syncActivities, input);
             state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
             approvalReceived = false;
             await condition(() => approvalReceived || cancelled, '7 days');
@@ -386,6 +391,31 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
 }
 
 // ─── Helper Functions ───────────────────────────────────────────────────────
+
+/**
+ * Push the workspace to S3 before a human approval gate. In multi-pod prod
+ * orion-backend can't see files on the worker's local disk, so without this
+ * the reviewer's UI gets a stale (or empty) view of the step's artifacts.
+ *
+ * Best-effort — a failed push shouldn't block the gate. The workflow's
+ * existing final-push still runs at completion.
+ */
+async function syncBeforeGate(
+  syncActivities: { pushWorkspaceToS3: (p: { bucket: string; prefix: string; localPath: string; scopePath?: string }) => Promise<unknown> },
+  input: FsmProcessInput,
+): Promise<void> {
+  if (!input.s3Bucket || !input.s3Prefix) return;
+  try {
+    await syncActivities.pushWorkspaceToS3({
+      bucket: input.s3Bucket,
+      prefix: input.s3Prefix,
+      localPath: input.workspacePath,
+      scopePath: input.workingDir,
+    });
+  } catch (err) {
+    console.warn('[FsmProcessWorkflow] pre-gate pushWorkspaceToS3 failed (non-fatal):', err);
+  }
+}
 
 function initializeState(config: ProcessConfig): FsmWorkflowState {
   const steps: Record<string, StepState> = {};
