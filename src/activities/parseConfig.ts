@@ -3,11 +3,23 @@
  * and parses it into a ProcessConfig.
  *
  * Skill resolution order:
- * 1. User's workspace: {workspacePath}/.claude/skills/{skillName}/SKILL.md
- * 2. tne-plugins repo: {tnePluginsRoot}/plugins/tne/skills/{skillName}/SKILL.md
- * 3. Horizon DB via HTTP: fetched from /api/fsm-invoke/skill/:name and
- *    cached to a temp dir. Handles the case where orion's DB has been synced
- *    from a newer tne-plugins than what is baked into this worker's image.
+ * 1. Horizon DB via HTTP: fetched from /api/fsm-invoke/skill/:name and
+ *    cached to a temp dir. Authoritative — orion keeps the DB current via
+ *    `yarn sync-skills` against tne-plugins main, so it always matches the
+ *    canonical SOP format.
+ * 2. User's workspace: {workspacePath}/.claude/skills/{skillName}/SKILL.md.
+ *    Fallback for workflows that run offline or for user-authored skills
+ *    that haven't been synced to the DB yet.
+ * 3. tne-plugins repo: {tnePluginsRoot}/plugins/tne/skills/{skillName}/SKILL.md.
+ *    Last resort — the submodule shipped with the worker image can lag behind
+ *    the DB.
+ *
+ * Why DB-first (changed 2026-04-24): the user workspace is a cache of S3,
+ * and S3 can carry half-migrated skill files while the DB (populated from
+ * tne-plugins main via sync-skills) has the clean canonical version.
+ * Observed with p-ceo1-manage-strategy: S3 had a stub `## SOP` body block
+ * plus a stale `sop:` frontmatter, the parser fell through to the frontmatter
+ * and executed the wrong SOP.
  */
 
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
@@ -38,10 +50,11 @@ function getTnePluginsRoot(): string | null {
 }
 
 /**
- * Resolve a skill name to its SKILL.md file path.
- * Checks the user's workspace first, then the tne-plugins repository.
+ * Resolve a skill name to a SKILL.md file path from local sources only
+ * (workspace, then tne-plugins submodule). Used as a fallback when the
+ * Horizon DB fetch is unavailable or returns 404.
  */
-function resolveSkillPath(skillName: string, workspacePath: string): string | null {
+function resolveSkillPathLocal(skillName: string, workspacePath: string): string | null {
   // 1. User's workspace — check workspacePath and up to 2 parent dirs
   let check = workspacePath;
   for (let i = 0; i < 3; i++) {
@@ -116,14 +129,16 @@ export interface ParseConfigResult {
 export async function parseConfig(params: ParseConfigParams): Promise<ParseConfigResult> {
   const { skillName, workspacePath, variables } = params;
 
-  let skillPath = resolveSkillPath(skillName, workspacePath);
+  // Prefer Horizon DB — the canonical SOP lives there and can't drift with a
+  // stale S3 cache on the user's workspace.
+  let skillPath = await fetchSkillFromHorizon(skillName);
   if (!skillPath) {
-    skillPath = await fetchSkillFromHorizon(skillName);
+    skillPath = resolveSkillPathLocal(skillName, workspacePath);
   }
   if (!skillPath) {
     throw new Error(
       `SKILL.md not found for "${skillName}". ` +
-      `Checked workspace at ${workspacePath}, tne-plugins, and Horizon DB. ` +
+      `Checked Horizon DB, workspace at ${workspacePath}, and tne-plugins. ` +
       `Set TNE_PLUGINS_PATH env var if the repo is in a non-standard location.`
     );
   }
