@@ -18,8 +18,8 @@ import {
 } from '@aws-sdk/client-s3';
 import { heartbeat } from '@temporalio/activity';
 import { createHash } from 'crypto';
-import { mkdir, readFile, writeFile, stat, readdir, unlink } from 'fs/promises';
-import { join, dirname, relative, posix } from 'path';
+import { mkdir, readFile, writeFile, stat, readdir, unlink, rm } from 'fs/promises';
+import { join, dirname, relative, posix, resolve, isAbsolute } from 'path';
 import { Readable } from 'stream';
 
 import { S3_SYNC_CONCURRENCY, SYNC_EXCLUDE_PATTERNS } from '../shared/constants.js';
@@ -497,4 +497,63 @@ export async function pushWorkspaceToS3(
   }
 
   return { fileCount, conflicts, bytes };
+}
+
+// ─── Wipe ──────────────────────────────────────────────────────────────────
+
+export interface WipeWorkspaceParams {
+  localPath: string;
+  /**
+   * Optional subdirectory (relative to `localPath`) to wipe. When omitted,
+   * the entire `localPath` tree is cleared. Must be a relative path; absolute
+   * or parent-escaping values are refused.
+   */
+  scopePath?: string;
+}
+
+export interface WipeWorkspaceResult {
+  wipedPath: string;
+  existed: boolean;
+}
+
+/**
+ * Remove the local workspace directory (or a subpath under it) so a fresh
+ * workflow starts from a clean slate. Called before `pullWorkspaceFromS3` at
+ * workflow start — otherwise ghost files left behind by previous workflows on
+ * the same worker pod shadow S3 state non-deterministically.
+ *
+ * No-op if the target doesn't exist yet. Caller is expected to re-create the
+ * directory via `pullWorkspaceFromS3` (which `mkdir -p`s as needed).
+ */
+export async function wipeWorkspace(
+  params: WipeWorkspaceParams,
+): Promise<WipeWorkspaceResult> {
+  const { localPath, scopePath } = params;
+
+  let target = localPath;
+  if (scopePath) {
+    if (isAbsolute(scopePath) || scopePath.split(/[\\/]+/).includes('..')) {
+      throw new Error(`wipeWorkspace: refusing unsafe scopePath "${scopePath}"`);
+    }
+    target = resolve(localPath, scopePath);
+    const root = resolve(localPath);
+    if (!target.startsWith(root + '/') && target !== root) {
+      throw new Error(`wipeWorkspace: scopePath "${scopePath}" escapes localPath`);
+    }
+  }
+
+  let existed = false;
+  try {
+    await stat(target);
+    existed = true;
+  } catch {
+    // nothing to do
+  }
+
+  if (existed) {
+    await rm(target, { recursive: true, force: true });
+    console.log(`[wipeWorkspace] Cleared ${target}`);
+  }
+
+  return { wipedPath: target, existed };
 }

@@ -126,7 +126,20 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   // ── Pull workspace from S3 (skip on resume — already pulled) ──────────
   // Scoped by `workingDir` so a run in "<root>/test1" only pulls S3
   // `{userId}/test1/*` and never spills sibling subdirs into cwd.
+  //
+  // Wipe first so ghost files left behind by previous workflows on this pod
+  // can't shadow S3 state. Without this, svc-temporal workers accumulate
+  // outputs across runs and agents read stale artifacts — observed on
+  // 2026-04-24 with p-ceo1-manage-strategy picking up yesterday's outputs.
   if (!input.resumeState && input.s3Bucket && input.s3Prefix) {
+    try {
+      await syncActivities.wipeWorkspace({
+        localPath: input.workspacePath,
+        scopePath: input.workingDir,
+      });
+    } catch (err) {
+      console.warn('[FsmProcessWorkflow] wipeWorkspace failed (non-fatal):', err);
+    }
     try {
       await syncActivities.pullWorkspaceFromS3({
         bucket: input.s3Bucket,
@@ -512,19 +525,18 @@ async function runPhaseParallel(
 ): Promise<{ failed: boolean }> {
   if (steps.length === 0) return { failed: false };
 
-  const completed = new Set<number>();
-  const failed = new Set<number>();
-  const cancelledSteps = new Set<number>();
+  const completed = new Set<string>();
+  const failed = new Set<string>();
+  const cancelledSteps = new Set<string>();
   let waveIdx = 0;
 
-  const depMap = new Map<number, Set<number>>();
+  const depMap = new Map<string, Set<string>>();
   for (const step of steps) {
-    const deps = new Set<number>();
+    const deps = new Set<string>();
     for (const depKey of step.dependsOn) {
       const parts = depKey.split('.');
-      const raw = parts.length === 2 ? parts[1] : parts[0];
-      const num = parseInt(raw, 10);
-      if (!isNaN(num)) deps.add(num);
+      const raw = (parts.length === 2 ? parts[1] : parts[0]).trim();
+      if (raw) deps.add(raw);
     }
     depMap.set(step.number, deps);
   }
@@ -549,7 +561,7 @@ async function runPhaseParallel(
 
     waveIdx++;
     const isFanOut = ready.length > 1;
-    const waveResults = new Map<number, { step: Step; result: StepResult | null; wasCancelled: boolean }>();
+    const waveResults = new Map<string, { step: Step; result: StepResult | null; wasCancelled: boolean }>();
 
     try {
       await CancellationScope.cancellable(async () => {

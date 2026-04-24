@@ -130,6 +130,76 @@ ${PHASE_TABLE}
     expect(cfg.preamble).toHaveLength(1);
   });
 
+  it('ignores /r-coo-sop1-process blocks nested inside a ### subsection', () => {
+    // Mirrors p-ceo1-manage-strategy: a documentary code block under
+    // `### Phase 1: Strategy` → `#### r-coo-sop1-process Config` describes
+    // the sub-pipeline p-CSO1 runs internally. It is NOT the orchestrator's
+    // own SOP and must not be picked up as the top-level config.
+    const p = writeSkill('p-ceo1-like', `---
+name: p-ceo1-like
+---
+
+### Phase 1: Strategy
+
+#### r-coo-sop1-process Config
+
+\`\`\`
+/r-coo-sop1-process
+  SCOPE=p-ceo1-like
+  MAX_ITERATIONS=50
+
+  ## Preamble
+  ${PHASE_TABLE}
+\`\`\`
+
+## SOP
+
+\`\`\`
+/r-coo-sop1-process
+  SCOPE=p-ceo1-like
+  MAX_ITERATIONS=1
+
+  ## Postamble
+  ${PHASE_TABLE}
+\`\`\`
+`);
+    const cfg = parseSkillFile(p);
+    expect(cfg.scope).toBe('p-ceo1-like');
+    // The top-level ## SOP block wins; the nested block contributed a preamble
+    // but must be ignored, so we see only the postamble from ## SOP.
+    expect(cfg.maxIterations).toBe(1);
+    expect(cfg.preamble).toHaveLength(0);
+    expect(cfg.postamble).toHaveLength(1);
+  });
+
+  it('accepts `| Phase |` column header and non-numeric step IDs like "0a"', () => {
+    const p = writeSkill('p-phase-col', `---
+name: p-phase-col
+---
+
+## SOP
+
+\`\`\`
+/r-coo-sop1-process
+  SCOPE=p-phase-col
+  MAX_ITERATIONS=1
+
+  ## Preamble
+  | Phase | Name | Orchestrator | Run | Dependencies | Notes |
+  |-------|------|--------------|-----|--------------|-------|
+  | 0a | skill-zero-a | (inline) | inline | (none) | first |
+  | 0b | skill-zero-b | (inline) | inline | 0a | second |
+\`\`\`
+`);
+    const cfg = parseSkillFile(p);
+    expect(cfg.scope).toBe('p-phase-col');
+    expect(cfg.preamble).toHaveLength(2);
+    expect(cfg.preamble[0].number).toBe('0a');
+    expect(cfg.preamble[0].skill).toBe('skill-zero-a');
+    expect(cfg.preamble[1].number).toBe('0b');
+    expect(cfg.preamble[1].dependsOn).toEqual(['0a']);
+  });
+
   it('handles stub ## SOP + inline phase sections outside any fence', () => {
     // Mirrors p-ceo2: /r-coo-sop1-process inside a short fenced block,
     // then phase sections as siblings OUTSIDE the fence.
