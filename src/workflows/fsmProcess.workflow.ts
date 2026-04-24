@@ -547,19 +547,57 @@ function collectFeedback(state: FsmWorkflowState): string {
 }
 
 /**
+ * Dependency reference from a step's `dependsOn` list.
+ *   • `num`  — bare number (e.g. `"4"`). Resolves against this phase first,
+ *              then any other phase with a matching step number in state.
+ *   • `qual` — phase-qualified (e.g. `"generator.4"`). Resolves directly
+ *              against `state.steps["generator.4"]`.
+ *   • `all`  — wildcard meaning "every other step in this phase".
+ */
+type ParsedDep =
+  | { kind: 'num'; number: string }
+  | { kind: 'qual'; phase: string; number: string }
+  | { kind: 'all' };
+
+function parseDep(raw: string): ParsedDep | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (trimmed.toLowerCase() === 'all') return { kind: 'all' };
+  const parts = trimmed.split('.').map(p => p.trim()).filter(Boolean);
+  if (parts.length === 0) return null;
+  if (parts.length >= 2) return { kind: 'qual', phase: parts[0], number: parts.slice(1).join('.') };
+  return { kind: 'num', number: parts[0] };
+}
+
+function formatDep(dep: ParsedDep): string {
+  if (dep.kind === 'all') return 'all';
+  if (dep.kind === 'qual') return `${dep.phase}.${dep.number}`;
+  return dep.number;
+}
+
+/**
  * Run a phase's steps in parallel with DAG-ordered waves and cancel-siblings
  * semantics on failure.
  *
  * Semantics:
  *   • Build a dependency map from `step.dependsOn` — supports bare numbers
- *     (`"3"`), phase-qualified keys (`"postamble.3"`), and mixed forms.
- *   • Each wave runs every step whose deps are all in `completed`, wrapped
+ *     (`"3"`), phase-qualified keys (`"generator.4"`), the `"all"` wildcard,
+ *     and mixed forms.
+ *   • Cross-phase deps are resolved against `state.steps` globally: a
+ *     postamble step with `dependsOn: ["generator.4"]` is satisfied iff
+ *     `state.steps["generator.4"]` is COMPLETE.
+ *   • Each wave runs every step whose deps are all satisfied, wrapped
  *     in a single `CancellationScope`. If any step fails mid-wave the scope
  *     is cancelled, in-flight siblings receive cancellation errors, and they
  *     are recorded as `cancelled` (not `failed`) so the UI can render them
  *     distinctly.
  *   • After each wave, failures and cancellations cascade to any step
  *     transitively blocked on them — those are also marked cancelled.
+ *   • If the loop reaches a point where work remains but nothing is ready,
+ *     throws `PhaseDeadlockError` with the unsatisfied deps listed. This
+ *     surfaces SOP misconfigs (e.g. postamble depending on a generator step
+ *     that was skipped under `EVALUATOR_MODE=sequential-only`) as explicit
+ *     workflow failures instead of silent "completed with nothing done".
  *   • Returns `failed=true` if any non-cascade failure occurred (lets the
  *     caller decide whether to abort the workflow or continue).
  */
@@ -582,13 +620,12 @@ async function runPhaseParallel(
   const cancelledSteps = new Set<string>();
   let waveIdx = 0;
 
-  const depMap = new Map<string, Set<string>>();
+  const depMap = new Map<string, ParsedDep[]>();
   for (const step of steps) {
-    const deps = new Set<string>();
+    const deps: ParsedDep[] = [];
     for (const depKey of step.dependsOn) {
-      const parts = depKey.split('.');
-      const raw = (parts.length === 2 ? parts[1] : parts[0]).trim();
-      if (raw) deps.add(raw);
+      const parsed = parseDep(depKey);
+      if (parsed) deps.push(parsed);
     }
     depMap.set(step.number, deps);
   }
@@ -599,17 +636,68 @@ async function runPhaseParallel(
     if (ss?.status === StepStatus.COMPLETE) completed.add(step.number);
   }
 
+  // Dep resolution — unified over local (this-phase) and global (state.steps).
+  // `selfNumber` is excluded from `all` so a step can depend on "all" without
+  // waiting on itself.
+  const isSatisfied = (dep: ParsedDep, selfNumber: string): boolean => {
+    if (dep.kind === 'all') {
+      return steps.every(s => s.number === selfNumber || completed.has(s.number));
+    }
+    if (dep.kind === 'qual') {
+      return state.steps[`${dep.phase}.${dep.number}`]?.status === StepStatus.COMPLETE;
+    }
+    if (completed.has(dep.number)) return true;
+    // Cross-phase fallback: any other phase with this step number COMPLETE.
+    for (const [key, st] of Object.entries(state.steps)) {
+      if (st?.status === StepStatus.COMPLETE && key.endsWith(`.${dep.number}`)) return true;
+    }
+    return false;
+  };
+
+  const isBlockedByFailure = (dep: ParsedDep, selfNumber: string): boolean => {
+    if (dep.kind === 'all') {
+      return steps.some(s =>
+        s.number !== selfNumber && (failed.has(s.number) || cancelledSteps.has(s.number)),
+      );
+    }
+    if (dep.kind === 'qual') {
+      return state.steps[`${dep.phase}.${dep.number}`]?.status === StepStatus.FAILED;
+    }
+    if (failed.has(dep.number) || cancelledSteps.has(dep.number)) return true;
+    for (const [key, st] of Object.entries(state.steps)) {
+      if (st?.status === StepStatus.FAILED && key.endsWith(`.${dep.number}`)) return true;
+    }
+    return false;
+  };
+
   while (completed.size + failed.size + cancelledSteps.size < steps.length) {
     if (isCancelled()) return { failed: failed.size > 0 };
 
     const ready = steps.filter(s => {
       if (completed.has(s.number) || failed.has(s.number) || cancelledSteps.has(s.number)) return false;
-      const deps = depMap.get(s.number) || new Set();
-      if ([...deps].some(d => failed.has(d) || cancelledSteps.has(d))) return false;
-      return [...deps].every(d => completed.has(d));
+      const deps = depMap.get(s.number) || [];
+      if (deps.some(d => isBlockedByFailure(d, s.number))) return false;
+      return deps.every(d => isSatisfied(d, s.number));
     });
 
-    if (ready.length === 0) break;
+    if (ready.length === 0) {
+      // Deadlock: work remains but nothing is runnable. Surface the misconfig
+      // instead of silently completing with pending steps.
+      const blocked: string[] = [];
+      for (const step of steps) {
+        if (completed.has(step.number) || failed.has(step.number) || cancelledSteps.has(step.number)) continue;
+        const unresolved = (depMap.get(step.number) || [])
+          .filter(d => !isSatisfied(d, step.number))
+          .map(formatDep);
+        blocked.push(`${phaseKey}.${step.number} waiting on [${unresolved.join(', ') || '—'}]`);
+      }
+      throw new Error(
+        `runPhaseParallel[${phaseKey}]: deadlock — ${blocked.length} step(s) have unsatisfied dependencies:\n  ` +
+        blocked.join('\n  ') +
+        `\nThis usually means the SOP declares cross-phase dependencies on steps that never ran ` +
+        `(e.g. a postamble step depending on a generator step when EVALUATOR_MODE=sequential-only skips generator).`,
+      );
+    }
 
     waveIdx++;
     const isFanOut = ready.length > 1;
@@ -672,8 +760,8 @@ async function runPhaseParallel(
       changed = false;
       for (const step of steps) {
         if (completed.has(step.number) || failed.has(step.number) || cancelledSteps.has(step.number)) continue;
-        const deps = depMap.get(step.number) || new Set();
-        if ([...deps].some(d => failed.has(d) || cancelledSteps.has(d))) {
+        const deps = depMap.get(step.number) || [];
+        if (deps.some(d => isBlockedByFailure(d, step.number))) {
           cancelledSteps.add(step.number);
           changed = true;
           const stepKey = `${phaseKey}.${step.number}`;
