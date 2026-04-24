@@ -8,10 +8,12 @@
 
 import { heartbeat } from '@temporalio/activity';
 import { existsSync } from 'fs';
+import { join } from 'path';
 import type { StepExecutionParams, StepResult } from '../shared/types.js';
 import { invokeSkill, buildPrompt } from './invokeSkill.js';
 import { runGateCascade } from './runGateCascade.js';
 import { resolveTemplateVars } from '../config/templateResolver.js';
+import { buildManifestContent } from '../config/manifestGenerator.js';
 import { emitEvent } from './emitEvent.js';
 
 /** Regex matching inline/manual step names: "(gather inputs)" or "APPROVAL_GATE" */
@@ -23,7 +25,7 @@ const INLINE_STEP_RE = /^\(.*\)$|^[A-Z][A-Z0-9_]+$/;
  * This activity heartbeats throughout to keep Temporal informed of progress.
  */
 export async function executeStep(params: StepExecutionParams): Promise<StepResult> {
-  const { step, iteration, templateVars, feedback, humanNotes, workspacePath, workingDir, manifestPath, agentBackend, parentRunId, userId, s3Bucket, s3Prefix, phase, parallel, waveIdx } = params;
+  const { step, iteration, templateVars, feedback, humanNotes, workspacePath, workingDir, manifestPath, manifestContent, config, state, currentStepKey, agentBackend, parentRunId, userId, s3Bucket, s3Prefix, phase, parallel, waveIdx } = params;
 
   heartbeat({ step: step.number, skill: step.skill, status: 'starting' });
   emitEvent(parentRunId, 'step_start', { stepNumber: step.number, skill: step.skill, iteration, phase, parallel, waveIdx });
@@ -38,8 +40,23 @@ export async function executeStep(params: StepExecutionParams): Promise<StepResu
     return result;
   }
 
+  // Compute a manifest of prior-step outputs if the workflow didn't pre-build
+  // one. Paths in state.steps[*].outputPath are agent-cwd-relative, so we
+  // resolve them against the agent's cwd root (workspacePath + workingDir)
+  // to check file existence. Avoids process.chdir which would race with
+  // concurrent activities on the same worker.
+  let resolvedManifest = manifestContent || '';
+  if (!resolvedManifest && state && config && currentStepKey) {
+    const cwdRoot = workingDir ? join(workspacePath, workingDir) : workspacePath;
+    try {
+      resolvedManifest = buildManifestContent(state, config, currentStepKey, '', '', cwdRoot);
+    } catch {
+      // Non-fatal: manifest build shouldn't block step execution.
+    }
+  }
+
   // Build the prompt
-  const prompt = buildPrompt(step, iteration, templateVars, feedback, humanNotes, manifestPath);
+  const prompt = buildPrompt(step, iteration, templateVars, feedback, humanNotes, manifestPath, resolvedManifest);
 
   // Retry loop (gate cascade may fail and require re-invocation)
   let retries = 0;

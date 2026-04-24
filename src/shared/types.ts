@@ -212,6 +212,19 @@ export interface StepExecutionParams {
   /** Relative subdir under `workspacePath` — scopes S3 sync and the agent's cwd. */
   workingDir?: string;
   manifestPath?: string;
+  /** Pre-computed manifest body (markdown) listing prior completed step
+   *  outputs. Embedded inline in the agent prompt as "## Available Inputs"
+   *  so the agent has context from earlier phases without a separate file
+   *  read. Empty string means no prior context is available yet. */
+  manifestContent?: string;
+  /** Parsed SOP config — forwarded to the activity so the executeStep
+   *  activity can compute manifests locally when not pre-computed. */
+  config?: ProcessConfig;
+  /** Current workflow state snapshot — same purpose as `config`. */
+  state?: FsmWorkflowState;
+  /** Phase-scoped step key `${phase}.${step.number}` — used by manifest
+   *  generation to know which step is "current" (excluded from manifest). */
+  currentStepKey?: string;
   agentBackend?: AgentBackend;
   /** Parent FSM run id — passed to the agent so nested fsm-start calls link back. */
   parentRunId?: string;

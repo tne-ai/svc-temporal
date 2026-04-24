@@ -501,6 +501,9 @@ function buildStepParams(
     phase,
     parallel,
     waveIdx,
+    config,
+    state,
+    currentStepKey: `${phase}.${step.number}`,
   };
 }
 

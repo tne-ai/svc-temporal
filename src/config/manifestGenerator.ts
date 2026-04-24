@@ -6,14 +6,26 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, readdirSync } from 'fs';
-import { dirname, basename, join } from 'path';
+import { dirname, basename, isAbsolute, join } from 'path';
 import { ProcessConfig, StepStatus } from '../shared/types.js';
 import type { FsmWorkflowState } from '../shared/types.js';
+
+/** Resolve a (possibly-relative) path against a base directory for filesystem
+ *  checks, without mutating process.cwd. Absolute paths pass through. */
+function resolvePath(p: string, base?: string): string {
+  if (!p) return p;
+  if (isAbsolute(p)) return p;
+  if (!base) return p;
+  return join(base, p);
+}
 
 const HEADING_RE = /^#{1,3}\s+(.+)/m;
 
 interface ManifestEntry {
   filepath: string;
+  /** Path to show to the agent — usually workingDir-relative. Falls back
+   *  to `filepath` if no relative form is available. */
+  displayPath: string;
   filename: string;
   source: string;
   status: string;
@@ -43,7 +55,12 @@ function extractFirstHeading(filepath: string): string {
   }
 }
 
-function fileEntry(filepath: string, status = 'COMPLETE', sourceSkill = ''): ManifestEntry {
+function fileEntry(
+  filepath: string,
+  status = 'COMPLETE',
+  sourceSkill = '',
+  displayPath?: string,
+): ManifestEntry {
   let mtimeRaw = 0;
   try {
     mtimeRaw = statSync(filepath).mtimeMs / 1000;
@@ -53,6 +70,7 @@ function fileEntry(filepath: string, status = 'COMPLETE', sourceSkill = ''): Man
 
   return {
     filepath,
+    displayPath: displayPath || filepath,
     filename: basename(filepath),
     source: sourceSkill || basename(filepath, '.md'),
     status,
@@ -63,28 +81,31 @@ function fileEntry(filepath: string, status = 'COMPLETE', sourceSkill = ''): Man
 }
 
 /**
- * Generate a manifest of non-stale files available to the current step.
- *
- * @returns Path to the generated manifest file
+ * Build a manifest markdown string without touching disk. Used by the
+ * executeStep activity to embed prior-step context directly in the agent
+ * prompt. Returns the empty string when there are no entries to list —
+ * callers can use `if (content)` to skip emitting a "## Available Inputs"
+ * section when nothing useful is available yet.
  */
-export function generateManifest(
+export function buildManifestContent(
   state: FsmWorkflowState,
   config: ProcessConfig,
-  outputDir: string,
   currentStepKey: string,
   inputsFile = '',
   feedbackDir = '',
+  resolveBase?: string,
 ): string {
-  const manifestPath = join(outputDir, '_manifest.md');
   const entries: ManifestEntry[] = [];
 
   // 1. Always include master inputs file
-  if (inputsFile && existsSync(inputsFile)) {
-    entries.push(fileEntry(inputsFile, 'MASTER_INPUT'));
+  const resolvedInputs = resolvePath(inputsFile, resolveBase);
+  if (inputsFile && existsSync(resolvedInputs)) {
+    entries.push(fileEntry(resolvedInputs, 'MASTER_INPUT', '', inputsFile));
   }
   const envInputs = process.env['FSM_INPUTS_FILE'] || '';
-  if (envInputs && existsSync(envInputs) && envInputs !== inputsFile) {
-    entries.push(fileEntry(envInputs, 'PARENT_INPUT'));
+  const resolvedEnvInputs = resolvePath(envInputs, resolveBase);
+  if (envInputs && existsSync(resolvedEnvInputs) && envInputs !== inputsFile) {
+    entries.push(fileEntry(resolvedEnvInputs, 'PARENT_INPUT', '', envInputs));
   }
 
   // 2. Collect all COMPLETE step outputs
@@ -103,10 +124,14 @@ export function generateManifest(
     const status = stepState?.status || StepStatus.PENDING;
     if (status !== StepStatus.COMPLETE) continue;
 
-    const outputPath = step.output;
-    if (!outputPath) continue;
+    // Prefer the actual written outputPath recorded in state over the SOP
+    // template (state's path already has templateVars resolved and may reflect
+    // the agent-chosen path when the template was `{OUTPUT_DIR}/...`).
+    const recordedPath = stepState?.outputPath || step.output;
+    if (!recordedPath) continue;
+    const outputPath = resolvePath(recordedPath, resolveBase);
 
-    if (outputPath.includes('*')) {
+    if (recordedPath.includes('*')) {
       // Glob patterns — list matching files
       const dir = dirname(outputPath);
       if (existsSync(dir)) {
@@ -115,30 +140,37 @@ export function generateManifest(
         for (const file of readdirSync(dir).sort()) {
           if (re.test(file) && file !== '_manifest.md') {
             const fullPath = join(dir, file);
-            entries.push(fileEntry(fullPath, status, step.skill));
+            const displayPath = resolveBase && fullPath.startsWith(resolveBase)
+              ? fullPath.slice(resolveBase.length).replace(/^\/+/, '')
+              : fullPath;
+            entries.push(fileEntry(fullPath, status, step.skill, displayPath));
           }
         }
       }
     } else if (existsSync(outputPath)) {
-      entries.push(fileEntry(outputPath, status, step.skill));
+      entries.push(fileEntry(outputPath, status, step.skill, recordedPath));
     }
   }
 
   // 3. Include feedback files
-  if (feedbackDir && existsSync(feedbackDir)) {
+  const resolvedFeedbackDir = resolvePath(feedbackDir, resolveBase);
+  if (feedbackDir && existsSync(resolvedFeedbackDir)) {
     try {
-      for (const file of readdirSync(feedbackDir).sort()) {
+      for (const file of readdirSync(resolvedFeedbackDir).sort()) {
         if (file.endsWith('.md') && file !== '_manifest.md') {
-          entries.push(fileEntry(join(feedbackDir, file), 'FEEDBACK'));
+          const fullPath = join(resolvedFeedbackDir, file);
+          const displayPath = join(feedbackDir, file);
+          entries.push(fileEntry(fullPath, 'FEEDBACK', '', displayPath));
         }
       }
     } catch { /* ignore */ }
   }
 
-  // 4. Write manifest
+  if (entries.length === 0) return '';
+
   const now = new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
   const tableRows = entries.map((e, i) =>
-    `| ${i + 1} | \`${e.filename}\` | ${e.source} | ${e.status} | ${e.mtime} | ${e.summary} |`
+    `| ${i + 1} | \`${e.displayPath}\` | ${e.source} | ${e.status} | ${e.mtime} | ${e.summary} |`
   );
   const table = [
     '| # | File | Source | Status | Modified | Summary |',
@@ -146,9 +178,7 @@ export function generateManifest(
     ...tableRows,
   ].join('\n');
 
-  const manifestContent = [
-    `# Input Manifest for ${currentStepKey}`,
-    '',
+  return [
     `Generated: ${now}`,
     `Files available: ${entries.length}`,
     '',
@@ -156,11 +186,32 @@ export function generateManifest(
     '',
     '**Instructions:** Read files relevant to your task. ' +
     'You do NOT need to read all files — select based on your skill\'s purpose.',
-    '',
   ].join('\n');
+}
+
+/**
+ * Generate a manifest of non-stale files available to the current step and
+ * write it to `{outputDir}/_manifest.md`. Returns the file path.
+ *
+ * Kept for callers that want the manifest as a file on disk (e.g. some
+ * downstream skills expect it at `{MANIFEST}` in the working directory).
+ * Most new code should use `buildManifestContent` and embed inline in the
+ * prompt instead.
+ */
+export function generateManifest(
+  state: FsmWorkflowState,
+  config: ProcessConfig,
+  outputDir: string,
+  currentStepKey: string,
+  inputsFile = '',
+  feedbackDir = '',
+): string {
+  const manifestPath = join(outputDir, '_manifest.md');
+  const body = buildManifestContent(state, config, currentStepKey, inputsFile, feedbackDir);
+  const content = [`# Input Manifest for ${currentStepKey}`, '', body, ''].join('\n');
 
   mkdirSync(dirname(manifestPath), { recursive: true });
-  writeFileSync(manifestPath, manifestContent);
+  writeFileSync(manifestPath, content);
 
   return manifestPath;
 }

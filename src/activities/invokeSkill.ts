@@ -129,8 +129,10 @@ function startPeriodicS3Sync(
 /**
  * Build the full prompt for a skill invocation.
  *
- * Assembles the skill name, manifest reference, iteration context,
- * feedback from previous evaluators, and human notes.
+ * Assembles the skill name, user task context (templateVars.PROMPT),
+ * manifest of prior step outputs, iteration context, feedback, and notes.
+ * Without templateVars.PROMPT the agent has no idea what the user actually
+ * wants — every research skill just inventories whatever's in the workspace.
  */
 export function buildPrompt(
   step: Step,
@@ -139,6 +141,7 @@ export function buildPrompt(
   feedback?: string,
   humanNotes?: string,
   manifestPath?: string,
+  manifestContent?: string,
 ): string {
   const parts: string[] = [];
 
@@ -151,36 +154,59 @@ export function buildPrompt(
     parts.push(resolvedNotes);
   }
 
-  // Manifest reference
-  if (manifestPath && existsSync(manifestPath)) {
-    parts.push(`\nRead the input manifest at: ${manifestPath}`);
+  // User task context — the actual thing the user asked for. Goes high up
+  // so every subagent knows the target before seeing the skill's SOP detail.
+  const userPrompt = (templateVars.PROMPT || '').trim();
+  if (userPrompt) {
+    parts.push(`## Task Context\n\n${userPrompt}`);
+  }
+
+  // Non-PROMPT user-supplied variables as a structured reference. Skills
+  // often have domain-specific vars (BEST_PRACTICE_DOMAINS, ORG, TOPIC, …)
+  // that agents should honor even when not explicitly referenced by
+  // {{VAR}} inside the SOP's notes column.
+  const otherVars = Object.entries(templateVars).filter(([k, v]) =>
+    k !== 'PROMPT' && k !== 'ITER' && v && String(v).trim().length > 0,
+  );
+  if (otherVars.length > 0) {
+    const lines = otherVars.map(([k, v]) => `- **${k}**: ${v}`);
+    parts.push(`## Run Variables\n\n${lines.join('\n')}`);
+  }
+
+  // Inline manifest: lists prior-step outputs the agent can consult. Faster
+  // than asking the agent to read a separate manifest file and keeps the
+  // prompt self-contained.
+  if (manifestContent && manifestContent.trim()) {
+    parts.push(`## Available Inputs\n\n${manifestContent.trim()}`);
+  } else if (manifestPath && existsSync(manifestPath)) {
+    parts.push(`Read the input manifest at: ${manifestPath}`);
   }
 
   // Output target
   if (step.output) {
     const resolvedOutput = resolveTemplateVars(step.output, templateVars)
       .replace('{{ITER}}', String(iteration || 1));
-    parts.push(`\nWrite output to: ${resolvedOutput}`);
+    parts.push(`Write output to: ${resolvedOutput}`);
   }
 
   // Iteration context
   if (iteration > 1) {
-    parts.push(`\n[Iteration ${iteration}: Revising based on evaluator feedback]`);
+    parts.push(`[Iteration ${iteration}: Revising based on evaluator feedback]`);
   }
 
   // Evaluator feedback from previous iteration
   if (feedback) {
-    parts.push(`\n## Feedback from Previous Evaluation\n\n${feedback}`);
+    parts.push(`## Feedback from Previous Evaluation\n\n${feedback}`);
   }
 
   // Human review notes
   if (humanNotes) {
-    parts.push(`\n## Human Review Notes\n\n${humanNotes}`);
+    parts.push(`## Human Review Notes\n\n${humanNotes}`);
   }
 
   // Pass condition (for evaluators)
   if (step.passCondition) {
-    parts.push(`\n## Pass Condition\n\n${step.passCondition}`);
+    parts.push(`## Pass Condition\n\n${step.passCondition}`);
   }
 
   return parts.join('\n\n');
