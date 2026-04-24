@@ -10,7 +10,7 @@
 
 import { spawn } from 'child_process';
 import { existsSync, mkdirSync } from 'fs';
-import { join } from 'path';
+import { isAbsolute, join, relative } from 'path';
 import { heartbeat } from '@temporalio/activity';
 import {
   createClaudeSDKAgent,
@@ -43,6 +43,35 @@ function fileFromToolUse(toolName: string, input: any): string | null {
     return input.file_path || input.path || null;
   }
   return null;
+}
+
+/**
+ * Normalize an agent-emitted file path to be workspace-root-relative
+ * (i.e. include `workingDir` when the run is scoped to a subdir).
+ *
+ * The agent gets `cwd = workspaceRoot/workingDir`, so its tool inputs use
+ * paths relative to that cwd — e.g. `TNE-CONTEXT/foo.md` actually lives at
+ * `<workspaceRoot>/test1/TNE-CONTEXT/foo.md`. The frontend resolves
+ * file_change paths via `/api/filesystem/read` (workspace-root-relative)
+ * and `/api/s3/files/download` (S3-key-relative-to-user-prefix), both of
+ * which need the workingDir prefix included. Without this normalization
+ * the file viewer 404s on every artifact for any run with workingDir set.
+ */
+function normalizeFilePath(
+  agentPath: string,
+  workspaceRoot: string,
+  workingDir?: string,
+): string {
+  if (!agentPath) return agentPath;
+  // Absolute path from the agent — strip workspaceRoot if present.
+  if (isAbsolute(agentPath)) {
+    if (workspaceRoot && agentPath.startsWith(workspaceRoot)) {
+      return relative(workspaceRoot, agentPath);
+    }
+    return agentPath;
+  }
+  // Relative path — interpreted against cwd, which is workspaceRoot/workingDir.
+  return workingDir ? join(workingDir, agentPath) : agentPath;
 }
 
 /**
@@ -304,7 +333,10 @@ async function invokeViaHarness(
           } else if (block.type === 'tool_use') {
             emitEvent(runId, 'tool_use', { backend: 'harness', tool: block.name, input: block.input, stepNumber: context?.stepNumber, skill: context?.skill });
             const file = fileFromToolUse(block.name, block.input);
-            if (file) emitEvent(runId, 'file_change', { tool: block.name, path: file, stepNumber: context?.stepNumber, skill: context?.skill });
+            if (file) {
+              const normalized = normalizeFilePath(file, workspaceRoot, context?.workingDir);
+              emitEvent(runId, 'file_change', { tool: block.name, path: normalized, stepNumber: context?.stepNumber, skill: context?.skill });
+            }
           }
         }
       } else if (ev.type === 'result') {
@@ -521,7 +553,10 @@ async function invokeViaClaudeAgentSDK(
           } else if (block.type === 'tool_use') {
             emitEvent(runId, 'tool_use', { backend: 'claude-agent-sdk', tool: block.name, input: block.input, stepNumber: context?.stepNumber, skill: context?.skill });
             const file = fileFromToolUse(block.name, block.input);
-            if (file) emitEvent(runId, 'file_change', { tool: block.name, path: file, stepNumber: context?.stepNumber, skill: context?.skill });
+            if (file) {
+              const normalized = normalizeFilePath(file, workspaceRoot, context?.workingDir);
+              emitEvent(runId, 'file_change', { tool: block.name, path: normalized, stepNumber: context?.stepNumber, skill: context?.skill });
+            }
           }
         }
       }
