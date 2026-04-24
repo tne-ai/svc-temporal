@@ -245,71 +245,84 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   }
 
   // ─── GENERATOR ↔ EVALUATOR LOOP ───────────────────────────────────────
+  //
+  // EVALUATOR_MODE=sequential-only means "run generator once, skip the
+  // evaluator iteration loop." We express that here as: force the iteration
+  // cap to 1 and suppress the evaluator for-loop. An empty generator +
+  // empty evaluator (the doc-typical sequential-only shape) is a pass
+  // through to postamble — identical in behavior to the pre-existing
+  // "skip generator entirely" special case, but with the critical fix that
+  // skills declaring sequential-only *with* a populated Generator table
+  // (p-ceo1-manage-strategy et al.) now actually run their generator.
 
-  if (config.evaluatorMode !== EvaluatorMode.SEQUENTIAL_ONLY) {
-    if (state.phase === Phase.PREAMBLE || state.phase === Phase.APPROVAL_GATE) {
-      state.phase = Phase.GENERATOR;
-      state.iteration = 1;
+  const sequentialOnly = config.evaluatorMode === EvaluatorMode.SEQUENTIAL_ONLY;
+  const effectiveMaxIterations = sequentialOnly ? 1 : config.maxIterations;
+
+  if (state.phase === Phase.PREAMBLE || state.phase === Phase.APPROVAL_GATE) {
+    state.phase = Phase.GENERATOR;
+    state.iteration = 1;
+  }
+
+  while (state.iteration <= effectiveMaxIterations && !cancelled) {
+    // Generator phase
+    state.phase = Phase.GENERATOR;
+    const feedback = collectFeedback(state);
+
+    // Reset generator step state on iterations > 1 before running
+    if (state.iteration > 1) {
+      for (const step of config.generator) {
+        resetStepState(state, `generator.${step.number}`);
+      }
     }
 
-    while (state.iteration <= config.maxIterations && !cancelled) {
-      // Generator phase
-      state.phase = Phase.GENERATOR;
-      const feedback = collectFeedback(state);
-
-      // Reset generator step state on iterations > 1 before running
-      if (state.iteration > 1) {
-        for (const step of config.generator) {
-          resetStepState(state, `generator.${step.number}`);
-        }
+    // Parallel generator (opt-in via PARALLEL_GENERATOR=true).
+    // Stage review + parallel fan-out don't compose cleanly (humans can't
+    // realistically gate between fanned-out siblings), so parallel mode
+    // bypasses per-step stage review inside the generator wave.
+    if (config.parallelGenerator) {
+      const outcome = await runPhaseParallel(
+        'generator', config.generator, input, config, state, executeStep,
+        state.iteration, feedback, () => cancelled,
+        (data) => eventActivities.emitFsmEventActivity({ runId: input.runId, type: 'step_cancelled', data }),
+      );
+      if (cancelled) return { status: 'cancelled', state };
+      if (outcome.failed) {
+        return { status: 'failed', state };
       }
-
-      // Parallel generator (opt-in via PARALLEL_GENERATOR=true).
-      // Stage review + parallel fan-out don't compose cleanly (humans can't
-      // realistically gate between fanned-out siblings), so parallel mode
-      // bypasses per-step stage review inside the generator wave.
-      if (config.parallelGenerator) {
-        const outcome = await runPhaseParallel(
-          'generator', config.generator, input, config, state, executeStep,
-          state.iteration, feedback, () => cancelled,
-          (data) => eventActivities.emitFsmEventActivity({ runId: input.runId, type: 'step_cancelled', data }),
-        );
+    } else {
+      for (const step of config.generator) {
         if (cancelled) return { status: 'cancelled', state };
-        if (outcome.failed) {
+
+        const stepKey = `generator.${step.number}`;
+        const result = await executeStep(
+          buildStepParams(step, state.iteration, input, config, state, feedback)
+        );
+        updateStepState(state, stepKey, result);
+
+        if (!result.success) {
           return { status: 'failed', state };
         }
-      } else {
-        for (const step of config.generator) {
+
+        if (config.stageReview && !autoApprove) {
+          await syncBeforeGate(syncActivities, input);
+          state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
+          approvalReceived = false;
+          await condition(() => approvalReceived || cancelled, '7 days');
           if (cancelled) return { status: 'cancelled', state };
-
-          const stepKey = `generator.${step.number}`;
-          const result = await executeStep(
-            buildStepParams(step, state.iteration, input, config, state, feedback)
-          );
-          updateStepState(state, stepKey, result);
-
-          if (!result.success) {
-            return { status: 'failed', state };
-          }
-
-          if (config.stageReview && !autoApprove) {
-            await syncBeforeGate(syncActivities, input);
-            state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
-            approvalReceived = false;
-            await condition(() => approvalReceived || cancelled, '7 days');
-            if (cancelled) return { status: 'cancelled', state };
-            state.steps[stepKey]!.humanNotes = approvalNotes;
-            state.steps[stepKey]!.status = StepStatus.COMPLETE;
-          }
+          state.steps[stepKey]!.humanNotes = approvalNotes;
+          state.steps[stepKey]!.status = StepStatus.COMPLETE;
         }
       }
+    }
 
-      // Evaluator phase
-      state.phase = Phase.EVALUATOR;
-      let allPassed = true;
-      const keyIssues: string[] = [];
-      let stoppingEvaluator = '';
+    // Evaluator phase. Skipped entirely under sequential-only — the whole
+    // point of that mode is "no evaluator loop."
+    state.phase = Phase.EVALUATOR;
+    let allPassed = true;
+    const keyIssues: string[] = [];
+    let stoppingEvaluator = '';
 
+    if (!sequentialOnly) {
       for (const step of config.evaluator) {
         if (cancelled) return { status: 'cancelled', state };
 
@@ -329,40 +342,35 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
           if (config.evaluatorMode === EvaluatorMode.FAIL_FAST) break;
         }
       }
-
-      // Record iteration result
-      const record: IterationRecord = {
-        iteration: state.iteration,
-        result: allPassed ? 'PASS' : 'FAIL',
-        stoppingEvaluator,
-        keyIssues: keyIssues.join('; '),
-        timestamp: new Date().toISOString(),
-      };
-      state.iterations.push(record);
-
-      if (allPassed) break;
-
-      state.iteration++;
-
-      // continueAsNew to prevent history growth on long loops
-      if (state.iteration % CONTINUE_AS_NEW_INTERVAL === 0) {
-        state.phase = Phase.GENERATOR;
-        await continueAsNew<typeof FsmProcessWorkflow>({
-          ...input,
-          config,
-          resumeState: state,
-        });
-      }
     }
 
-    if (state.iteration > config.maxIterations) {
-      state.earlyExit = true;
+    // Record iteration result
+    const record: IterationRecord = {
+      iteration: state.iteration,
+      result: allPassed ? 'PASS' : 'FAIL',
+      stoppingEvaluator,
+      keyIssues: keyIssues.join('; '),
+      timestamp: new Date().toISOString(),
+    };
+    state.iterations.push(record);
+
+    if (allPassed) break;
+
+    state.iteration++;
+
+    // continueAsNew to prevent history growth on long loops
+    if (state.iteration % CONTINUE_AS_NEW_INTERVAL === 0) {
+      state.phase = Phase.GENERATOR;
+      await continueAsNew<typeof FsmProcessWorkflow>({
+        ...input,
+        config,
+        resumeState: state,
+      });
     }
-  } else {
-    // Sequential-only mode: skip generator/evaluator, go straight to postamble
-    if (state.phase !== Phase.POSTAMBLE && state.phase !== Phase.FINALIZATION && state.phase !== Phase.COMPLETE) {
-      state.phase = Phase.POSTAMBLE;
-    }
+  }
+
+  if (state.iteration > effectiveMaxIterations) {
+    state.earlyExit = true;
   }
 
   // ─── POSTAMBLE (parallel with dependency graph) ────────────────────────
