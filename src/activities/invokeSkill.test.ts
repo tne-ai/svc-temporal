@@ -21,6 +21,10 @@ function makeStep(overrides: Partial<Step> = {}): Step {
     passCondition: '',
     stageType: StageType.DEFAULT,
     dependsOn: [],
+    backpropSkill: '',
+    failFast: { maxRetries: 3, gates: [] },
+    permissionMode: 'acceptEdits',
+    model: '',
     ...overrides,
   };
 }
