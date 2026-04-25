@@ -120,8 +120,23 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
   }
 
   // ── Step 1: Pull user workspace from S3 ────────────────────────────────
+  // Two scope modes:
+  //   workingDir present: behave like FsmProcessWorkflow — pull/push the
+  //     user's actual subtree (e.g. `test1/`), agent runs cwd=workspace/test1.
+  //     This is the "job operates on the user's files in the dir they're
+  //     looking at" mode.
+  //   workingDir absent: legacy mode — scope to `outputFolder` (default
+  //     `jobs/<jobId>`), keeping the job's writes isolated from the user's
+  //     main tree. Used by quick-fire chat jobs that don't have a session
+  //     working directory.
   const workspacePath = `/tmp/temporal-jobs/${input.jobId}`;
   const outputFolder = input.outputFolder || `jobs/${input.jobId}`;
+  // S3 scope under the user's prefix. Push uses prefix=s3Prefix +
+  // scopePath= so the key composes as `<userId>/<scopePath>/<relFile>`.
+  // Crucially we don't fold scopePath into prefix — pushWorkspaceToS3
+  // joins them itself (see workspaceSync.ts:398), so doubling the prefix
+  // would land everything at `<userId>/<scope>/<scope>/<file>`.
+  const s3Scope = input.workingDir || outputFolder;
 
   if (input.s3Bucket && input.s3Prefix) {
     statusMessage = 'Syncing workspace from S3...';
@@ -131,7 +146,7 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
         bucket: input.s3Bucket,
         prefix: input.s3Prefix,
         localPath: workspacePath,
-        scopePath: outputFolder,
+        scopePath: s3Scope,
       });
     } catch {
       // Non-fatal — workspace may be empty for new jobs
@@ -162,6 +177,16 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
     input.prompt,
     workspacePath,
     input.agentBackend,
+    // Pass jobId so the agent loop emits structured events to orion's
+    // per-job SSE stream — the Jobs panel renders them as tool_use /
+    // tool_result rows the same way FSM runs render their event stream.
+    // workingDir gets the agent's cwd into the user's actual subdir
+    // (matching what they see in the editor) instead of the workspace root.
+    {
+      jobId: input.jobId, userId: input.userId,
+      s3Bucket: input.s3Bucket, s3Prefix: input.s3Prefix,
+      workingDir: input.workingDir,
+    },
   );
 
   progress = 90;
@@ -171,12 +196,11 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
   if (input.s3Bucket && input.s3Prefix) {
     statusMessage = 'Syncing results to S3...';
     try {
-      // Push all files from the workspace root; prefix S3 keys with outputFolder
-      // so they land under {userId}/{outputFolder}/ in S3
       await syncActivities.pushWorkspaceToS3({
         bucket: input.s3Bucket,
-        prefix: `${input.s3Prefix}/${outputFolder}`,
+        prefix: input.s3Prefix,
         localPath: workspacePath,
+        scopePath: s3Scope,
       });
     } catch {
       // Non-fatal

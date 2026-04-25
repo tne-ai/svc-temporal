@@ -26,7 +26,7 @@ import {
 } from '../shared/constants.js';
 import type { AgentBackend, InvocationResult, Step } from '../shared/types.js';
 import { resolveTemplateVars } from '../config/templateResolver.js';
-import { emitEvent } from './emitEvent.js';
+import { emitEvent, emitJobEvent } from './emitEvent.js';
 import { pushWorkspaceToS3 } from './workspaceSync.js';
 import { ensureSkillsInWorkspace } from './setupSkills.js';
 
@@ -319,7 +319,7 @@ async function invokeViaHarness(
   model?: string,
   permissionMode?: string,
   workspacePath?: string,
-  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string },
+  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string },
 ): Promise<InvocationResult> {
   const stopSync = startPeriodicS3Sync(workspacePath || '', context?.s3Bucket, context?.s3Prefix, context?.parentRunId, context?.workingDir);
   try {
@@ -347,6 +347,7 @@ async function invokeViaHarness(
     let stdout = '';
     let lastHeartbeat = Date.now();
     const runId = context?.parentRunId;
+    const jobId = context?.jobId;
 
     for await (const event of agent.query(prompt)) {
       // Agent harness emits various event types — capture text content from assistant messages
@@ -355,14 +356,35 @@ async function invokeViaHarness(
         for (const block of ev.message.content) {
           if (block.type === 'text') {
             stdout += block.text;
-            emitEvent(runId, 'message', { backend: 'harness', text: previewText(block.text), stepNumber: context?.stepNumber, skill: context?.skill });
+            const text = previewText(block.text);
+            emitEvent(runId, 'message', { backend: 'harness', text, stepNumber: context?.stepNumber, skill: context?.skill });
+            emitJobEvent(jobId, 'message', { backend: 'harness', text });
           } else if (block.type === 'tool_use') {
             emitEvent(runId, 'tool_use', { backend: 'harness', tool: block.name, input: block.input, stepNumber: context?.stepNumber, skill: context?.skill });
+            emitJobEvent(jobId, 'tool_use', { backend: 'harness', tool: block.name, input: block.input, toolUseId: block.id });
             const file = fileFromToolUse(block.name, block.input);
             if (file) {
               const normalized = normalizeFilePath(file, workspaceRoot, context?.workingDir);
               emitEvent(runId, 'file_change', { tool: block.name, path: normalized, stepNumber: context?.stepNumber, skill: context?.skill });
+              emitJobEvent(jobId, 'file_change', { tool: block.name, path: normalized });
             }
+          }
+        }
+      } else if (ev.type === 'user' && ev.message?.content) {
+        // The harness emits user messages carrying tool_result blocks back from
+        // the runtime. Surface those so the UI can pair tool_use → tool_result.
+        for (const block of ev.message.content) {
+          if (block.type === 'tool_result') {
+            const out = typeof block.content === 'string' ? block.content
+              : Array.isArray(block.content)
+                ? block.content.map((c: any) => typeof c?.text === 'string' ? c.text : '').join('')
+                : '';
+            emitJobEvent(jobId, 'tool_result', {
+              backend: 'harness',
+              toolUseId: block.tool_use_id,
+              output: previewText(String(out)),
+              isError: !!block.is_error,
+            });
           }
         }
       } else if (ev.type === 'result') {
@@ -370,18 +392,18 @@ async function invokeViaHarness(
         // Surface token usage so the UI can render per-step spend. The harness
         // forwards Anthropic's usage object straight through on the result event.
         const usage = ev.usage;
-        if (runId && usage && (typeof usage.input_tokens === 'number' || typeof usage.output_tokens === 'number')) {
-          emitEvent(runId, 'token_update', {
+        if (usage && (typeof usage.input_tokens === 'number' || typeof usage.output_tokens === 'number')) {
+          const tokenPayload = {
             backend: 'harness',
-            stepNumber: context?.stepNumber,
-            skill: context?.skill,
             model: resolvedModel,
             inputTokens: usage.input_tokens ?? 0,
             outputTokens: usage.output_tokens ?? 0,
             cacheCreationInputTokens: usage.cache_creation_input_tokens,
             cacheReadInputTokens: usage.cache_read_input_tokens,
             costUsd: typeof ev.total_cost_usd === 'number' ? ev.total_cost_usd : undefined,
-          });
+          };
+          emitEvent(runId, 'token_update', { ...tokenPayload, stepNumber: context?.stepNumber, skill: context?.skill });
+          emitJobEvent(jobId, 'token_update', tokenPayload);
         }
       }
       // Heartbeat every 5 seconds
@@ -518,7 +540,7 @@ async function invokeViaClaudeAgentSDK(
   prompt: string,
   model?: string,
   workspacePath?: string,
-  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string },
+  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string },
 ): Promise<InvocationResult> {
   const resolvedModel = resolveModelId(model, 'agent');
   const workspaceRoot = workspacePath || process.cwd();
@@ -568,6 +590,7 @@ async function invokeViaClaudeAgentSDK(
     let stdout = '';
     let lastHeartbeat = Date.now();
     const runId = context?.parentRunId;
+    const jobId = context?.jobId;
 
     for await (const event of agent.query(prompt)) {
       // Capture text from assistant messages + emit message/tool_use/file_change events
@@ -575,14 +598,33 @@ async function invokeViaClaudeAgentSDK(
         for (const block of event.message.content) {
           if (block.type === 'text') {
             stdout += block.text;
-            emitEvent(runId, 'message', { backend: 'claude-agent-sdk', text: previewText(block.text), stepNumber: context?.stepNumber, skill: context?.skill });
+            const text = previewText(block.text);
+            emitEvent(runId, 'message', { backend: 'claude-agent-sdk', text, stepNumber: context?.stepNumber, skill: context?.skill });
+            emitJobEvent(jobId, 'message', { backend: 'claude-agent-sdk', text });
           } else if (block.type === 'tool_use') {
             emitEvent(runId, 'tool_use', { backend: 'claude-agent-sdk', tool: block.name, input: block.input, stepNumber: context?.stepNumber, skill: context?.skill });
+            emitJobEvent(jobId, 'tool_use', { backend: 'claude-agent-sdk', tool: block.name, input: block.input, toolUseId: (block as any).id });
             const file = fileFromToolUse(block.name, block.input);
             if (file) {
               const normalized = normalizeFilePath(file, workspaceRoot, context?.workingDir);
               emitEvent(runId, 'file_change', { tool: block.name, path: normalized, stepNumber: context?.stepNumber, skill: context?.skill });
+              emitJobEvent(jobId, 'file_change', { tool: block.name, path: normalized });
             }
+          }
+        }
+      } else if ((event as any).type === 'user' && (event as any).message?.content) {
+        for (const block of (event as any).message.content) {
+          if (block.type === 'tool_result') {
+            const out = typeof block.content === 'string' ? block.content
+              : Array.isArray(block.content)
+                ? block.content.map((c: any) => typeof c?.text === 'string' ? c.text : '').join('')
+                : '';
+            emitJobEvent(jobId, 'tool_result', {
+              backend: 'claude-agent-sdk',
+              toolUseId: block.tool_use_id,
+              output: previewText(String(out)),
+              isError: !!block.is_error,
+            });
           }
         }
       }
@@ -592,18 +634,18 @@ async function invokeViaClaudeAgentSDK(
         if (event.result) stdout = event.result;
 
         const usage = (event as any).usage;
-        if (runId && usage && (typeof usage.input_tokens === 'number' || typeof usage.output_tokens === 'number')) {
-          emitEvent(runId, 'token_update', {
+        if (usage && (typeof usage.input_tokens === 'number' || typeof usage.output_tokens === 'number')) {
+          const tokenPayload = {
             backend: 'claude-agent-sdk',
-            stepNumber: context?.stepNumber,
-            skill: context?.skill,
             model: resolvedModel,
             inputTokens: usage.input_tokens ?? 0,
             outputTokens: usage.output_tokens ?? 0,
             cacheCreationInputTokens: usage.cache_creation_input_tokens,
             cacheReadInputTokens: usage.cache_read_input_tokens,
             costUsd: typeof (event as any).total_cost_usd === 'number' ? (event as any).total_cost_usd : undefined,
-          });
+          };
+          emitEvent(runId, 'token_update', { ...tokenPayload, stepNumber: context?.stepNumber, skill: context?.skill });
+          emitJobEvent(jobId, 'token_update', tokenPayload);
         }
 
         // Trust subtype over is_error — the SDK may set is_error on successful completions
@@ -652,7 +694,7 @@ export async function invokeSkill(
   prompt: string,
   workspacePath?: string,
   agentBackend?: AgentBackend,
-  context?: { parentRunId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; workingDir?: string },
+  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; workingDir?: string },
 ): Promise<InvocationResult> {
   const backend = agentBackend || AGENT_BACKEND;
   console.log(`[invokeSkill] backend=${backend}, skill=${step.skill}, model=${step.model || 'default'}, parentRunId=${context?.parentRunId || ''}`);

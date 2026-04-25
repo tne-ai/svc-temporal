@@ -428,15 +428,30 @@ export async function pushWorkspaceToS3(
       // local mtime" branch below on every tick, exploding the workspace
       // with `.temporal-<ts>` backup debris.
       //
-      // Skip for multipart uploads (ETag of form "md5-N", with a dash) and
-      // SSE-KMS objects — those ETags aren't plain MD5. Falling through to
-      // the timestamp comparison is safe in both cases.
+      // For multipart uploads (ETag of form "md5-N", with a dash) and
+      // SSE-KMS objects, the ETag isn't plain MD5 so we can't shortcut on
+      // it. Without a fallback, every periodic push of those files would
+      // hit the conflict branch below and write a `.temporal-<ts>` side
+      // file — which is exactly what was accumulating for users on a
+      // KMS-encrypted bucket (1+ backup file per file per 30s sync). Pay
+      // a GET-and-compare for those cases; for small workspace files it's
+      // a millisecond and it eliminates the spurious side-writes.
       if (s3Exists && s3ETag) {
         const s3Hash = s3ETag.replace(/^"|"$/g, '');
         if (!s3Hash.includes('-')) {
           const localMd5 = createHash('md5').update(body).digest('hex');
           if (localMd5 === s3Hash) {
             return { uploaded: false, bytes: 0 };
+          }
+        } else {
+          try {
+            const remote = await getS3().send(new GetObjectCommand({ Bucket: bucket, Key: s3Key }));
+            const remoteBuf = await streamToBuffer(remote.Body as any);
+            if (Buffer.compare(remoteBuf, body) === 0) {
+              return { uploaded: false, bytes: 0 };
+            }
+          } catch {
+            // Fall through to the existing branches; not worse than before.
           }
         }
       }

@@ -8,7 +8,7 @@
  * ergonomics — don't crash).
  */
 
-import { HORIZON_FSM_EVENTS_URL, FSM_INVOKE_SECRET } from '../shared/constants.js';
+import { HORIZON_FSM_EVENTS_URL, HORIZON_JOB_EVENTS_URL, FSM_INVOKE_SECRET } from '../shared/constants.js';
 
 export type FsmEventType =
   | 'step_start' | 'step_complete' | 'step_failed' | 'step_cancelled'
@@ -16,6 +16,10 @@ export type FsmEventType =
   | 'message' | 'tool_use' | 'tool_result' | 'file_change'
   | 'heartbeat' | 'phase_change' | 'child_run_started'
   | 'token_update';
+
+export type JobEventType =
+  | 'message' | 'tool_use' | 'tool_result' | 'file_change'
+  | 'token_update' | 'heartbeat';
 
 export async function emitEvent(
   runId: string | undefined,
@@ -50,4 +54,37 @@ export async function emitFsmEventActivity(params: {
   data?: Record<string, any>;
 }): Promise<void> {
   await emitEvent(params.runId, params.type, params.data || {});
+}
+
+/**
+ * Per-job parallel of `emitEvent`. Posts to Horizon's job-events endpoint,
+ * keyed by jobId. Same shared-secret auth, same fire-and-forget shape — drops
+ * silently when no jobId or no URL is configured.
+ *
+ * Why a separate function: jobs and FSM runs have different identifiers and
+ * different ring buffers on the orion side. Conflating them would force orion
+ * to disambiguate per-payload and risk leaking events into the wrong stream.
+ */
+export async function emitJobEvent(
+  jobId: string | undefined,
+  type: JobEventType,
+  data: Record<string, any> = {},
+): Promise<void> {
+  if (!jobId || !HORIZON_JOB_EVENTS_URL) return;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    await fetch(HORIZON_JOB_EVENTS_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-fsm-secret': FSM_INVOKE_SECRET,
+      },
+      body: JSON.stringify({ jobId, type, data }),
+      signal: controller.signal,
+    }).catch(() => {});
+    clearTimeout(timer);
+  } catch {
+    // Fire-and-forget — never block the activity on event emission
+  }
 }
