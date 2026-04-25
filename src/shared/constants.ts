@@ -120,6 +120,18 @@ export const HORIZON_FSM_EVENTS_URL = (() => {
   return HORIZON_FSM_BASE ? `${HORIZON_FSM_BASE}/events` : '';
 })();
 
+/**
+ * Horizon's /api/fsm-invoke/job-events URL — same shared-secret auth as the
+ * FSM events endpoint, but keyed by jobId instead of runId. Lets the
+ * LongRunningJobWorkflow agent loop emit structured tool_use / tool_result /
+ * message / file_change events to the Jobs panel UI.
+ */
+export const HORIZON_JOB_EVENTS_URL = (() => {
+  if (typeof process === 'undefined') return '';
+  if (process.env.HORIZON_JOB_EVENTS_URL) return process.env.HORIZON_JOB_EVENTS_URL;
+  return HORIZON_FSM_BASE ? `${HORIZON_FSM_BASE}/job-events` : '';
+})();
+
 // ─── Agent Backend ─────────────────────────────────────────────────────────
 
 /** Which agent backend to use for skill invocation */

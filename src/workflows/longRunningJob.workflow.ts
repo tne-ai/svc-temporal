@@ -162,6 +162,10 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
     input.prompt,
     workspacePath,
     input.agentBackend,
+    // Pass jobId so the agent loop emits structured events to orion's
+    // per-job SSE stream — the Jobs panel renders them as tool_use /
+    // tool_result rows the same way FSM runs render their event stream.
+    { jobId: input.jobId, userId: input.userId, s3Bucket: input.s3Bucket, s3Prefix: input.s3Prefix },
   );
 
   progress = 90;
