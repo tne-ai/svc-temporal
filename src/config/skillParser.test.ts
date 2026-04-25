@@ -200,6 +200,67 @@ name: p-phase-col
     expect(cfg.preamble[1].dependsOn).toEqual(['0a']);
   });
 
+  it('prefers the populated body-sop block over a stale frontmatter sop', () => {
+    // Mirrors the half-migrated p-ceo1-manage-strategy we hit in S3 on
+    // 2026-04-24: the `## SOP` block was populated with the NEW canonical
+    // config, but the `sop:` frontmatter still carried a stale one-row
+    // preamble from the previous format. The old "first extractor with any
+    // phases wins" rule meant a 1-row frontmatter beat a rich but
+    // 0-row body-sop stub; flipping to "max phases wins" keeps the body-sop
+    // whenever it has more real content.
+    const p = writeSkill('p-halfmigrated', `---
+name: p-halfmigrated
+sop: "/r-coo-sop1-process\\n  SCOPE=p-halfmigrated\\n  MAX_ITERATIONS=50\\n\\n  ## Preamble\\n  | # | Skill | Inputs | Output | Verify | Notes |\\n  |---|-------|--------|--------|--------|-------|\\n  | 1 | stale-skill | — | stale-out.md | — | — |"
+---
+
+## SOP
+
+\`\`\`
+/r-coo-sop1-process
+  SCOPE=p-halfmigrated
+  MAX_ITERATIONS=1
+
+  ## Preamble
+  ${PHASE_TABLE}
+
+  ## Generator
+  | # | Skill | Inputs | Output | Verify | Notes |
+  |---|-------|--------|--------|--------|-------|
+  | 1 | gen-one | — | g1.md | — | — |
+  | 2 | gen-two | — | g2.md | — | — |
+\`\`\`
+`);
+    const cfg = parseSkillFile(p);
+    expect(cfg.scope).toBe('p-halfmigrated');
+    // Body-sop has 3 phase rows (1 preamble + 2 generator); frontmatter has 1.
+    // Max-phases rule → body-sop wins.
+    expect(cfg.maxIterations).toBe(1);
+    expect(cfg.preamble).toHaveLength(1);
+    expect(cfg.preamble[0].skill).toBe('step-one');
+    expect(cfg.generator).toHaveLength(2);
+  });
+
+  it('falls through to frontmatter sop when body-sop is a SCOPE-only stub', () => {
+    // Body-sop with no tables at all: frontmatter (if present and populated)
+    // is the only source of phase info and must still parse.
+    const p = writeSkill('p-bodysop-stub', `---
+name: p-bodysop-stub
+sop: "/r-coo-sop1-process\\n  SCOPE=p-bodysop-stub\\n\\n  ## Preamble\\n  | # | Skill | Inputs | Output | Verify | Notes |\\n  |---|-------|--------|--------|--------|-------|\\n  | 1 | fm-only-skill | — | out.md | — | — |"
+---
+
+## SOP
+
+\`\`\`
+/r-coo-sop1-process
+  SCOPE=p-bodysop-stub
+\`\`\`
+`);
+    const cfg = parseSkillFile(p);
+    expect(cfg.scope).toBe('p-bodysop-stub');
+    expect(cfg.preamble).toHaveLength(1);
+    expect(cfg.preamble[0].skill).toBe('fm-only-skill');
+  });
+
   it('handles stub ## SOP + inline phase sections outside any fence', () => {
     // Mirrors p-ceo2: /r-coo-sop1-process inside a short fenced block,
     // then phase sections as siblings OUTSIDE the fence.

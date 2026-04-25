@@ -624,30 +624,39 @@ export function parseSkillFile(
   //   2. frontmatter `sop:`  — PR #991 middle format, still in flight
   //   3. inline legacy       — unfenced /r-coo-sop1-process with sibling
   //                            ## Preamble / ## Generator / … headings
-  // Each extractor returns a block string; we accept the first one whose
-  // parsed config has any phases. A 0-phase result means we hit a stub
-  // (e.g. ## SOP with only SCOPE=…) and must fall through. If every
-  // strategy yields 0 phases, keep the first non-null candidate so
-  // callers still get scope/params back.
-  const extractors: Array<() => string | null> = [
-    () => extractBodySopBlock(resolved),
-    () => extractFrontmatterSop(resolved),
-    () => extractRcooBlock(resolved),
-    () => extractInlineLegacyBlock(resolved),
+  //
+  // Run every extractor and pick the config with the most phases. Tie goes to
+  // the earlier extractor (so ## SOP beats `sop:` at equal phase counts).
+  //
+  // "First non-zero wins" was the old rule and broke on half-migrated skills:
+  // observed on 2026-04-24 with a `## SOP` stub (SCOPE-only) alongside an
+  // older `sop:` frontmatter that still carried a one-row preamble. The stub
+  // parsed to 0 phases and was skipped, but the stale frontmatter parsed to
+  // 1 phase and won — running the workflow against the old illustrative SOP.
+  // Preferring the max-phase candidate would have picked the real `## SOP`
+  // block if it were populated, and still falls back to the frontmatter only
+  // when the body block is genuinely empty.
+  const extractors: Array<[label: string, fn: () => string | null]> = [
+    ['body-sop', () => extractBodySopBlock(resolved)],
+    ['frontmatter-sop', () => extractFrontmatterSop(resolved)],
+    ['fenced-rcoo', () => extractRcooBlock(resolved)],
+    ['inline-legacy', () => extractInlineLegacyBlock(resolved)],
   ];
 
-  let fallback: ProcessConfig | null = null;
-  for (const extract of extractors) {
+  let best: { cfg: ProcessConfig; phases: number; label: string } | null = null;
+  for (const [label, extract] of extractors) {
     const block = extract();
     if (!block) continue;
     const cfg = parseBlockText(block);
     const phases =
       cfg.preamble.length + cfg.generator.length + cfg.evaluator.length + cfg.postamble.length;
-    if (phases > 0) return cfg;
-    if (!fallback) fallback = cfg;
+    // Strict `>` preserves tiebreaker-by-order.
+    if (!best || phases > best.phases) {
+      best = { cfg, phases, label };
+    }
   }
 
-  if (fallback) return fallback;
+  if (best) return best.cfg;
   throw new Error(
     "No /r-coo-sop1-process config block found in SKILL.md. " +
     "Expected a fenced code block containing '/r-coo-sop1-process'."

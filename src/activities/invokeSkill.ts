@@ -10,7 +10,7 @@
 
 import { spawn } from 'child_process';
 import { existsSync, mkdirSync } from 'fs';
-import { join } from 'path';
+import { isAbsolute, join, relative } from 'path';
 import { heartbeat } from '@temporalio/activity';
 import {
   createClaudeSDKAgent,
@@ -43,6 +43,35 @@ function fileFromToolUse(toolName: string, input: any): string | null {
     return input.file_path || input.path || null;
   }
   return null;
+}
+
+/**
+ * Normalize an agent-emitted file path to be workspace-root-relative
+ * (i.e. include `workingDir` when the run is scoped to a subdir).
+ *
+ * The agent gets `cwd = workspaceRoot/workingDir`, so its tool inputs use
+ * paths relative to that cwd — e.g. `TNE-CONTEXT/foo.md` actually lives at
+ * `<workspaceRoot>/test1/TNE-CONTEXT/foo.md`. The frontend resolves
+ * file_change paths via `/api/filesystem/read` (workspace-root-relative)
+ * and `/api/s3/files/download` (S3-key-relative-to-user-prefix), both of
+ * which need the workingDir prefix included. Without this normalization
+ * the file viewer 404s on every artifact for any run with workingDir set.
+ */
+function normalizeFilePath(
+  agentPath: string,
+  workspaceRoot: string,
+  workingDir?: string,
+): string {
+  if (!agentPath) return agentPath;
+  // Absolute path from the agent — strip workspaceRoot if present.
+  if (isAbsolute(agentPath)) {
+    if (workspaceRoot && agentPath.startsWith(workspaceRoot)) {
+      return relative(workspaceRoot, agentPath);
+    }
+    return agentPath;
+  }
+  // Relative path — interpreted against cwd, which is workspaceRoot/workingDir.
+  return workingDir ? join(workingDir, agentPath) : agentPath;
 }
 
 /**
@@ -100,8 +129,10 @@ function startPeriodicS3Sync(
 /**
  * Build the full prompt for a skill invocation.
  *
- * Assembles the skill name, manifest reference, iteration context,
- * feedback from previous evaluators, and human notes.
+ * Assembles the skill name, user task context (templateVars.PROMPT),
+ * manifest of prior step outputs, iteration context, feedback, and notes.
+ * Without templateVars.PROMPT the agent has no idea what the user actually
+ * wants — every research skill just inventories whatever's in the workspace.
  */
 export function buildPrompt(
   step: Step,
@@ -110,6 +141,7 @@ export function buildPrompt(
   feedback?: string,
   humanNotes?: string,
   manifestPath?: string,
+  manifestContent?: string,
 ): string {
   const parts: string[] = [];
 
@@ -122,36 +154,59 @@ export function buildPrompt(
     parts.push(resolvedNotes);
   }
 
-  // Manifest reference
-  if (manifestPath && existsSync(manifestPath)) {
-    parts.push(`\nRead the input manifest at: ${manifestPath}`);
+  // User task context — the actual thing the user asked for. Goes high up
+  // so every subagent knows the target before seeing the skill's SOP detail.
+  const userPrompt = (templateVars.PROMPT || '').trim();
+  if (userPrompt) {
+    parts.push(`## Task Context\n\n${userPrompt}`);
+  }
+
+  // Non-PROMPT user-supplied variables as a structured reference. Skills
+  // often have domain-specific vars (BEST_PRACTICE_DOMAINS, ORG, TOPIC, …)
+  // that agents should honor even when not explicitly referenced by
+  // {{VAR}} inside the SOP's notes column.
+  const otherVars = Object.entries(templateVars).filter(([k, v]) =>
+    k !== 'PROMPT' && k !== 'ITER' && v && String(v).trim().length > 0,
+  );
+  if (otherVars.length > 0) {
+    const lines = otherVars.map(([k, v]) => `- **${k}**: ${v}`);
+    parts.push(`## Run Variables\n\n${lines.join('\n')}`);
+  }
+
+  // Inline manifest: lists prior-step outputs the agent can consult. Faster
+  // than asking the agent to read a separate manifest file and keeps the
+  // prompt self-contained.
+  if (manifestContent && manifestContent.trim()) {
+    parts.push(`## Available Inputs\n\n${manifestContent.trim()}`);
+  } else if (manifestPath && existsSync(manifestPath)) {
+    parts.push(`Read the input manifest at: ${manifestPath}`);
   }
 
   // Output target
   if (step.output) {
     const resolvedOutput = resolveTemplateVars(step.output, templateVars)
       .replace('{{ITER}}', String(iteration || 1));
-    parts.push(`\nWrite output to: ${resolvedOutput}`);
+    parts.push(`Write output to: ${resolvedOutput}`);
   }
 
   // Iteration context
   if (iteration > 1) {
-    parts.push(`\n[Iteration ${iteration}: Revising based on evaluator feedback]`);
+    parts.push(`[Iteration ${iteration}: Revising based on evaluator feedback]`);
   }
 
   // Evaluator feedback from previous iteration
   if (feedback) {
-    parts.push(`\n## Feedback from Previous Evaluation\n\n${feedback}`);
+    parts.push(`## Feedback from Previous Evaluation\n\n${feedback}`);
   }
 
   // Human review notes
   if (humanNotes) {
-    parts.push(`\n## Human Review Notes\n\n${humanNotes}`);
+    parts.push(`## Human Review Notes\n\n${humanNotes}`);
   }
 
   // Pass condition (for evaluators)
   if (step.passCondition) {
-    parts.push(`\n## Pass Condition\n\n${step.passCondition}`);
+    parts.push(`## Pass Condition\n\n${step.passCondition}`);
   }
 
   return parts.join('\n\n');
@@ -304,7 +359,10 @@ async function invokeViaHarness(
           } else if (block.type === 'tool_use') {
             emitEvent(runId, 'tool_use', { backend: 'harness', tool: block.name, input: block.input, stepNumber: context?.stepNumber, skill: context?.skill });
             const file = fileFromToolUse(block.name, block.input);
-            if (file) emitEvent(runId, 'file_change', { tool: block.name, path: file, stepNumber: context?.stepNumber, skill: context?.skill });
+            if (file) {
+              const normalized = normalizeFilePath(file, workspaceRoot, context?.workingDir);
+              emitEvent(runId, 'file_change', { tool: block.name, path: normalized, stepNumber: context?.stepNumber, skill: context?.skill });
+            }
           }
         }
       } else if (ev.type === 'result') {
@@ -521,7 +579,10 @@ async function invokeViaClaudeAgentSDK(
           } else if (block.type === 'tool_use') {
             emitEvent(runId, 'tool_use', { backend: 'claude-agent-sdk', tool: block.name, input: block.input, stepNumber: context?.stepNumber, skill: context?.skill });
             const file = fileFromToolUse(block.name, block.input);
-            if (file) emitEvent(runId, 'file_change', { tool: block.name, path: file, stepNumber: context?.stepNumber, skill: context?.skill });
+            if (file) {
+              const normalized = normalizeFilePath(file, workspaceRoot, context?.workingDir);
+              emitEvent(runId, 'file_change', { tool: block.name, path: normalized, stepNumber: context?.stepNumber, skill: context?.skill });
+            }
           }
         }
       }
