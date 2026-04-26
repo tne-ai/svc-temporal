@@ -61,7 +61,7 @@ function patternToRegex(pattern: string): RegExp {
   return new RegExp(`^${escaped}$`);
 }
 
-function shouldExclude(relativePath: string): boolean {
+export function shouldExclude(relativePath: string): boolean {
   const segments = relativePath.split('/');
   const fileName = segments[segments.length - 1];
 
@@ -69,8 +69,22 @@ function shouldExclude(relativePath: string): boolean {
     if (pattern.includes('*')) {
       // Glob — match against filename (e.g. '*.log', '.env.*.local', '*.temporal-*')
       if (patternToRegex(pattern).test(fileName)) return true;
+    } else if (pattern.includes('/')) {
+      // Multi-segment literal like '.claude/skills' — match a path-prefix.
+      // The previous `segments.includes(pattern)` could NEVER match these
+      // because the slash means it's not a single segment, so all of
+      // .claude/skills, .claude/projects, .claude/EBP, .claude/debug
+      // were silently un-excluded. Result: every periodic push uploaded
+      // ~2k skill files, and the resulting cross-worker races on those
+      // files were the source of the .temporal-<ts> backup proliferation.
+      const patternSegs = pattern.split('/');
+      let prefixMatch = patternSegs.length <= segments.length;
+      for (let i = 0; prefixMatch && i < patternSegs.length; i++) {
+        if (segments[i] !== patternSegs[i]) prefixMatch = false;
+      }
+      if (prefixMatch) return true;
     } else {
-      // Literal segment match — hits directory names like 'node_modules', '.git'
+      // Single-segment literal — hits directory names like 'node_modules', '.git'
       if (segments.includes(pattern)) return true;
     }
   }
