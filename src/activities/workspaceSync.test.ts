@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
-import { wipeWorkspace } from './workspaceSync.js';
+import { wipeWorkspace, shouldExclude } from './workspaceSync.js';
 
 let tmpRoot: string;
 beforeEach(() => { tmpRoot = mkdtempSync(join(tmpdir(), 'wipe-')); });
@@ -52,5 +52,43 @@ describe('wipeWorkspace', () => {
     await expect(
       wipeWorkspace({ localPath: tmpRoot, scopePath: '../foo' }),
     ).rejects.toThrow(/unsafe scopePath/);
+  });
+});
+
+describe('shouldExclude', () => {
+  // Locks in the multi-segment fix. Before, '.claude/skills' silently never
+  // matched because shouldExclude only did `segments.includes(pattern)` and
+  // a literal containing '/' is never a single segment — so all ~2k skill
+  // files were swept into every periodic push, and concurrent workers
+  // racing on those files were the real source of .temporal-<ts> backups.
+  it('excludes single-segment directory names', () => {
+    expect(shouldExclude('node_modules/lodash/index.js')).toBe(true);
+    expect(shouldExclude('foo/.git/config')).toBe(true);
+  });
+
+  it('excludes multi-segment path-prefix patterns', () => {
+    expect(shouldExclude('.claude/skills/p-debug1/SKILL.md')).toBe(true);
+    expect(shouldExclude('.claude/projects/-tmp-x/log.jsonl')).toBe(true);
+    expect(shouldExclude('.claude/EBP/.local/bin/fsm-start')).toBe(true);
+    expect(shouldExclude('.claude/debug/whatever.txt')).toBe(true);
+  });
+
+  it('excludes the multi-segment directory itself, not just descendants', () => {
+    expect(shouldExclude('.claude/skills')).toBe(true);
+  });
+
+  it('excludes glob patterns by filename', () => {
+    expect(shouldExclude('logs/server.log')).toBe(true);
+    expect(shouldExclude('foo/bar.txt.temporal-1234567890')).toBe(true);
+  });
+
+  it('does not exclude .claude itself or unrelated children', () => {
+    expect(shouldExclude('.claude/CLAUDE.md')).toBe(false);
+    expect(shouldExclude('.claude/settings.json')).toBe(false);
+  });
+
+  it('does not over-exclude paths that merely share a prefix', () => {
+    expect(shouldExclude('.claude/skills-archive/old.md')).toBe(false);
+    expect(shouldExclude('.claude/projectsx/file.md')).toBe(false);
   });
 });
