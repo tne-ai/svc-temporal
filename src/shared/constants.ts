@@ -169,5 +169,15 @@ export const SYNC_EXCLUDE_PATTERNS = [
   // project state, debug output. Syncing these re-uploads thousands of static
   // files per 30s tick and pollutes S3 with ephemeral debugger state.
   '.claude/skills', '.claude/projects', '.claude/EBP', '.claude/debug',
+  // Claude CLI + tooling state that has no business in a user-visible bucket.
+  // Without these, the user's filespace shows statsig telemetry caches and CLI
+  // todo lists alongside their actual work. NOTE: fsm-state-*.json /
+  // engine-state-*.json are NOT excluded — they're load-bearing checkpoints
+  // (see fsmService.ts:686, fsm-engine.py) that the engine reads to resume
+  // after pod restarts; excluding them from S3 sync would break resumption.
+  // The frontend file UI hides these by convention instead.
+  '.claude/statsig', '.claude/todos', '.claude/CLAUDE.md', '.claude/settings.json', '.claude/test.md',
+  '.claude.json', '.claude.json.backup',
+  '.local/bin',
   '*.lock', '*.tmp',
 ];
