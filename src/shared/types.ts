@@ -155,6 +155,15 @@ export interface FsmProcessInput {
   s3Prefix?: string;
   /** Agent backend override — if unset, falls back to AGENT_BACKEND env var */
   agentBackend?: AgentBackend;
+  /** Per-user delegate (worker) model override. When set, every step in
+   *  this run runs on this model regardless of the model the SKILL.md
+   *  specified. Lets the user say "all my workers run on X" without
+   *  having to edit per-skill defaults. Null/undefined → use step.model. */
+  delegateModel?: string;
+  /** Per-user delegate provider override (anthropic / openrouter). The
+   *  backend selection is decided by Horizon and surfaced via
+   *  `agentBackend`; this field is informational + future-proofing. */
+  delegateProvider?: string;
 }
 
 export interface FsmProcessResult {
