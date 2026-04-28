@@ -471,36 +471,26 @@ export async function pushWorkspaceToS3(
       }
 
       if (s3Exists && s3LastModified && s3LastModified > localStat.mtime) {
-        // Content differs AND S3 is newer — a real conflict: another writer
-        // updated S3 after our pull. Save local to a side path so we never
-        // lose work. Guard against chaining: if the key is already a backup,
-        // just overwrite rather than producing `foo.temporal-X.temporal-Y`.
-        if (/\.temporal-\d+/.test(s3Key)) {
-          await getS3().send(
-            new PutObjectCommand({ Bucket: bucket, Key: s3Key, Body: body }),
-          );
-          return { uploaded: true, bytes: body.length };
-        }
-        const timestamp = Date.now();
-        const sidePath = `${s3Key}.temporal-${timestamp}`;
-
-        await getS3().send(
-          new PutObjectCommand({
-            Bucket: bucket,
-            Key: sidePath,
-            Body: body,
-          }),
-        );
-
+        // Local is older than S3 AND content differs → we hold a stale copy.
+        // This happens routinely with multi-pod fanout: pod A pulled at T0,
+        // wrote locally at T1; pod B pulled, wrote, pushed at T2 > T1; pod A's
+        // periodic 30s push then sees S3 newer than its T1 local mtime. Pod A
+        // has nothing useful to contribute — the canonical S3 already reflects
+        // a later writer. Previously we wrote a `.temporal-${timestamp}` side
+        // file with our stale content. That was theatre: side files are
+        // excluded from re-pull/re-collect (see shouldExclude), so they were
+        // never visible to any agent and only ever scrubbed by
+        // cleanupTemporalBackups on next pull. Net effect: permanent S3 litter
+        // (one new file per stale pod per 30s tick) with zero recoverable
+        // data. Skip the upload entirely; record the skip in conflicts so the
+        // count is still surfaced.
         conflicts.push({
           path: s3RelPath,
-          resolution: 'renamed',
-          renamedTo: sidePath,
+          resolution: 'skipped',
           s3ETag,
           localModified: localStat.mtime.toISOString(),
         });
-
-        return { uploaded: true, bytes: body.length };
+        return { uploaded: false, bytes: 0 };
       }
 
       // Upload (new file or local is newer)
