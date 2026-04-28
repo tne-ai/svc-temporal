@@ -485,8 +485,16 @@ function buildStepParams(
   waveIdx?: number,
 ): StepExecutionParams {
   const phase = overridePhase || (stepPhase(step, config) as 'preamble' | 'generator' | 'evaluator' | 'postamble');
+  // Per-user delegate (worker) model override: when the user has configured
+  // a delegate model in Horizon's Settings → Delegate Model, that overrides
+  // the SKILL.md per-step model. Falls back to step.model when the user
+  // hasn't opted in. This is the entire point of delegation — "all my
+  // workers run on X" without editing each skill.
+  const effectiveStep: Step = input.delegateModel
+    ? { ...step, model: input.delegateModel }
+    : step;
   return {
-    step,
+    step: effectiveStep,
     iteration,
     templateVars: input.templateVars,
     feedback,
