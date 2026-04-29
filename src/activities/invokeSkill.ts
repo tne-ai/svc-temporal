@@ -331,16 +331,41 @@ async function invokeViaHarness(
     try { await ensureSkillsInWorkspace(cwd); } catch (err: any) {
       console.warn('[invokeViaHarness] ensureSkillsInWorkspace failed:', err?.message);
     }
-    // Only pass a real API key as apiKey; OAuth tokens flow via env var and
-    // must NOT be passed as ANTHROPIC_API_KEY (they're rejected as invalid).
-    const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
+    // Provider routing. The agent-harness defaults to Anthropic's API; without
+    // explicit apiType / baseURL it ignores OpenRouter slugs and silently
+    // returns 0 tokens (api.anthropic.com 404s on `moonshotai/kimi-k2.6`).
+    // Detect non-Anthropic models by their slug shape (`vendor/model`) and
+    // wire OpenRouter the same way orion's agentService does. This was the
+    // reason p-debug1-three-words via Kimi looked like it succeeded but
+    // wrote nothing: the LLM call never actually happened.
+    const isOpenRouterModel = !!resolvedModel && resolvedModel.includes('/');
+    let apiType: 'anthropic-messages' | 'openai-completions' = 'anthropic-messages';
+    let baseURL: string | undefined;
+    let apiKey: string | undefined;
+    if (isOpenRouterModel) {
+      apiType = 'openai-completions';
+      baseURL = 'https://openrouter.ai/api/v1';
+      apiKey = process.env.OPENROUTER_API_KEY?.trim();
+      if (!apiKey) {
+        console.warn(
+          '[invokeViaHarness] model looks like an OpenRouter slug but OPENROUTER_API_KEY is not set; the call will fail',
+          { model: resolvedModel },
+        );
+      }
+    } else {
+      // Only pass a real API key as apiKey; OAuth tokens flow via env var and
+      // must NOT be passed as ANTHROPIC_API_KEY (they're rejected as invalid).
+      apiKey = process.env.ANTHROPIC_API_KEY?.trim();
+    }
     const agent = createAgent({
+      apiType,
       model: resolvedModel,
       cwd,
       permissionMode: (permissionMode as any) || 'bypassPermissions',
       // FSM steps can legitimately need many tool rounds (read/grep/edit/write
       // across a big workspace, plus nested skill invocations). 30 was too tight.
       maxTurns: 200,
+      ...(baseURL ? { baseURL } : {}),
       ...(apiKey ? { apiKey } : {}),
     });
 
@@ -348,6 +373,14 @@ async function invokeViaHarness(
     let lastHeartbeat = Date.now();
     const runId = context?.parentRunId;
     const jobId = context?.jobId;
+    // Track whether the harness actually did any work. If the underlying
+    // API call fails (auth, model-not-found, etc.) the harness may emit a
+    // `result` event with is_error=true and 0 tokens but no thrown
+    // exception — silently green from invokeViaHarness's caller. Capture
+    // the failure reason so executeStep's step_failed surfaces *why*.
+    let harnessError: string | null = null;
+    let harnessSawAnyTokens = false;
+    let harnessSawAnyToolUse = false;
 
     for await (const event of agent.query(prompt)) {
       // Agent harness emits various event types — capture text content from assistant messages
@@ -393,17 +426,44 @@ async function invokeViaHarness(
         // forwards Anthropic's usage object straight through on the result event.
         const usage = ev.usage;
         if (usage && (typeof usage.input_tokens === 'number' || typeof usage.output_tokens === 'number')) {
+          const inTok = usage.input_tokens ?? 0;
+          const outTok = usage.output_tokens ?? 0;
+          if (inTok > 0 || outTok > 0) harnessSawAnyTokens = true;
           const tokenPayload = {
             backend: 'harness',
             model: resolvedModel,
-            inputTokens: usage.input_tokens ?? 0,
-            outputTokens: usage.output_tokens ?? 0,
+            inputTokens: inTok,
+            outputTokens: outTok,
             cacheCreationInputTokens: usage.cache_creation_input_tokens,
             cacheReadInputTokens: usage.cache_read_input_tokens,
             costUsd: typeof ev.total_cost_usd === 'number' ? ev.total_cost_usd : undefined,
           };
           emitEvent(runId, 'token_update', { ...tokenPayload, stepNumber: context?.stepNumber, skill: context?.skill });
           emitJobEvent(jobId, 'token_update', tokenPayload);
+        }
+        // Detect harness-reported errors. The harness emits is_error / an
+        // error subtype when the underlying API call fails (bad auth,
+        // model-not-found, rate-limit, etc.). Without this surface, the
+        // outer step_failed only says "no file was written" with no clue
+        // why — the actual reason was buried in a result event we
+        // ignored.
+        if ((ev as any).is_error === true || (typeof ev.subtype === 'string' && ev.subtype.includes('error'))) {
+          const detail =
+            (ev as any).error ||
+            (ev as any).message ||
+            (ev as any).subtype ||
+            'unknown harness error';
+          harnessError = `harness errored: ${detail}`;
+          console.warn('[invokeViaHarness] harness reported error in result event', {
+            model: resolvedModel,
+            subtype: (ev as any).subtype,
+            isError: (ev as any).is_error,
+            error: detail,
+          });
+        }
+      } else if (ev.type === 'assistant' && (ev as any).message?.content) {
+        for (const block of (ev as any).message.content) {
+          if (block.type === 'tool_use') harnessSawAnyToolUse = true;
         }
       }
       // Heartbeat every 5 seconds
@@ -413,6 +473,29 @@ async function invokeViaHarness(
       }
     }
 
+    // Surface harness-level failures up to executeStep so step_failed
+    // includes a useful diagnostic. Three escalating signals:
+    //   1. explicit harness `is_error` / error subtype  → propagate verbatim
+    //   2. zero tokens AND no tool uses                 → almost always a
+    //      silent provider failure (bad auth, missing OPENROUTER_API_KEY,
+    //      404 on a non-existent model slug). Hint at the most likely
+    //      cause based on the model shape.
+    //   3. otherwise: real success
+    if (harnessError) {
+      return { success: false, stdout, stderr: harnessError, exitCode: 1 };
+    }
+    if (!harnessSawAnyTokens && !harnessSawAnyToolUse) {
+      const isOR = !!resolvedModel && resolvedModel.includes('/');
+      const orHint = isOR
+        ? ` (OpenRouter slug — check OPENROUTER_API_KEY is set in svc-temporal's env and that "${resolvedModel}" is a valid OR model id)`
+        : ' (Anthropic backend — check ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN)';
+      const detail = `harness returned 0 tokens and made no tool calls — the LLM call almost certainly failed silently${orHint}`;
+      console.warn('[invokeViaHarness] suspected silent failure', {
+        model: resolvedModel,
+        isOpenRouterModel: isOR,
+      });
+      return { success: false, stdout, stderr: detail, exitCode: 1 };
+    }
     return { success: true, stdout, stderr: '', exitCode: 0 };
   } catch (err) {
     return {
@@ -446,8 +529,30 @@ function buildNestedFsmHooks(
         matcher: 'Bash',
         hooks: [
           async (input: any) => {
+            // The agent-harness passes hook inputs as { toolName, toolInput,
+            // … } in camelCase (see node_modules/@tne-ai/agent-harness/src/
+            // engine.ts:561). The SDK path uses snake_case tool_input.
+            // Read both shapes so this works in either runtime.
+            //
+            // Before this fix, the snake_case-only read meant this hook
+            // had been a silent no-op on the harness path: every fsm-start
+            // bash command from inside a skill ran as a plain subprocess
+            // instead of being redirected to /api/fsm-invoke/start with
+            // parentRunId — so nested orchestrator child runs were never
+            // linked to their parent in the Job Tree / App Events views.
+            const inputToolInput = input?.toolInput || input?.tool_input || {};
+            const buildOutput = (newCommand: string) => ({
+              hookSpecificOutput: {
+                ...input,
+                // Set both shapes so the harness (camelCase) and SDK
+                // (snake_case) both pick up the rewritten command.
+                toolInput: { ...inputToolInput, command: newCommand },
+                tool_input: { ...inputToolInput, command: newCommand },
+              },
+            });
+
             try {
-              const command: string | undefined = input?.tool_input?.command;
+              const command: string | undefined = inputToolInput?.command;
               if (!command || typeof command !== 'string') return {};
               const match = command.match(
                 /(?:^|\s|&&\s*|;\s*)(?:\.\/)?(?:\.local\/bin\/)?fsm-start\s+([\w-]+)(.*)$/,
@@ -476,15 +581,9 @@ function buildNestedFsmHooks(
 
               if (!response.ok) {
                 const text = await response.text().catch(() => '');
-                return {
-                  hookSpecificOutput: {
-                    ...input,
-                    tool_input: {
-                      ...input.tool_input,
-                      command: `echo 'fsm-start failed: HTTP ${response.status} — ${text.replace(/'/g, "'\\''")}'`,
-                    },
-                  },
-                };
+                return buildOutput(
+                  `echo 'fsm-start failed: HTTP ${response.status} — ${text.replace(/'/g, "'\\''")}'`,
+                );
               }
 
               const data: any = await response.json().catch(() => ({}));
@@ -498,25 +597,13 @@ function buildNestedFsmHooks(
                 resumed: resume,
               });
 
-              return {
-                hookSpecificOutput: {
-                  ...input,
-                  tool_input: {
-                    ...input.tool_input,
-                    command: `echo 'FSM child run started. Parent: ${context.parentRunId} Child: ${data.runId || 'unknown'} Skill: ${skillName}'`,
-                  },
-                },
-              };
+              return buildOutput(
+                `echo 'FSM child run started. Parent: ${context.parentRunId} Child: ${data.runId || 'unknown'} Skill: ${skillName}'`,
+              );
             } catch (err: any) {
-              return {
-                hookSpecificOutput: {
-                  ...input,
-                  tool_input: {
-                    ...input.tool_input,
-                    command: `echo 'fsm-start hook error: ${String(err?.message || err).replace(/'/g, "'\\''")}'`,
-                  },
-                },
-              };
+              return buildOutput(
+                `echo 'fsm-start hook error: ${String(err?.message || err).replace(/'/g, "'\\''")}'`,
+              );
             }
           },
         ],
@@ -582,6 +669,36 @@ async function invokeViaClaudeAgentSDK(
         if (oauth && (!apiKey || !apiKey.trim())) {
           delete out.ANTHROPIC_API_KEY;
           out.CLAUDE_CODE_OAUTH_TOKEN = oauth;
+        }
+        // OpenRouter routing: when the model is a vendor/slug (e.g.
+        // moonshotai/kimi-k2.6, google/gemini-2.5-flash) it can't be served
+        // by api.anthropic.com. Mirror orion's claudeAgentService.legacy.ts
+        // approach — point the Claude SDK at OpenRouter via env vars and
+        // set the non-Claude model as the alias so the SDK picks it up.
+        // Without this, the SDK silently 404s on the model and the skill
+        // run reports 0 tokens with no Write tool ever firing.
+        const isOpenRouterModel = !!resolvedModel && resolvedModel.includes('/');
+        const orKey = process.env.OPENROUTER_API_KEY?.trim();
+        if (isOpenRouterModel && orKey) {
+          out.ANTHROPIC_BASE_URL = 'https://openrouter.ai/api';
+          out.ANTHROPIC_AUTH_TOKEN = orKey;
+          out.ANTHROPIC_API_KEY = ''; // explicitly empty per OpenRouter docs
+          delete out.CLAUDE_CODE_OAUTH_TOKEN;
+          // Override whichever tier alias matches so the SDK picks the
+          // OR slug instead of a Claude default.
+          const lower = resolvedModel.toLowerCase();
+          if (lower.includes('opus') || lower.includes('pro')) {
+            out.ANTHROPIC_DEFAULT_OPUS_MODEL = resolvedModel;
+          } else if (lower.includes('haiku') || lower.includes('mini') || lower.includes('flash')) {
+            out.ANTHROPIC_DEFAULT_HAIKU_MODEL = resolvedModel;
+          } else {
+            out.ANTHROPIC_DEFAULT_SONNET_MODEL = resolvedModel;
+          }
+        } else if (isOpenRouterModel && !orKey) {
+          console.warn(
+            '[invokeViaClaudeAgentSDK] model looks like an OpenRouter slug but OPENROUTER_API_KEY is not set; the call will fail',
+            { model: resolvedModel },
+          );
         }
         return out;
       })(),

@@ -8,7 +8,7 @@
 
 import { heartbeat } from '@temporalio/activity';
 import { existsSync } from 'fs';
-import { join } from 'path';
+import { isAbsolute, join } from 'path';
 import type { StepExecutionParams, StepResult } from '../shared/types.js';
 import { invokeSkill, buildPrompt } from './invokeSkill.js';
 import { runGateCascade } from './runGateCascade.js';
@@ -89,17 +89,28 @@ export async function executeStep(params: StepExecutionParams): Promise<StepResu
       };
     }
 
-    // Resolve output path
+    // Resolve output path. step.output is declared in SKILL.md and is always
+    // relative to the agent's cwd, which is workspacePath/workingDir. The
+    // existsSync check below was previously interpreting that relative path
+    // against svc-temporal's process cwd — so even when the harness DID
+    // write the file at the right location, executeStep saw it as missing
+    // and silently fell through to "side-effect-only success". Resolve to
+    // an absolute path here so existsSync and the gate cascade both look
+    // in the right place.
+    const cwdRoot = workingDir ? join(workspacePath, workingDir) : workspacePath;
     const outputPath = step.output
       ? resolveTemplateVars(step.output, templateVars).replace('{{ITER}}', String(iteration || 1))
       : '';
+    const outputPathAbs = outputPath
+      ? (isAbsolute(outputPath) ? outputPath : join(cwdRoot, outputPath))
+      : '';
 
     // Run gate cascade if output file exists
-    if (outputPath && existsSync(outputPath)) {
+    if (outputPathAbs && existsSync(outputPathAbs)) {
       heartbeat({ step: step.number, skill: step.skill, status: 'gate_check', retry: retries });
       emitEvent(parentRunId, 'gate_start', { stepNumber: step.number, skill: step.skill, iteration, outputPath });
 
-      const cascadeResult = await runGateCascade(step, outputPath, iteration);
+      const cascadeResult = await runGateCascade(step, outputPathAbs, iteration);
 
       emitEvent(parentRunId, 'gate_result', {
         stepNumber: step.number, skill: step.skill, iteration, passed: cascadeResult.passed,
@@ -145,13 +156,46 @@ export async function executeStep(params: StepExecutionParams): Promise<StepResu
       };
     }
 
-    // No output path or output doesn't exist — treat as success
-    // (some steps are side-effect-only, e.g., git commit)
-    emitEvent(parentRunId, 'step_complete', { stepNumber: step.number, skill: step.skill, iteration, outputPath: outputPath || undefined, sideEffectOnly: true });
-    return {
-      success: true,
+    // We didn't take the gate-cascade branch above — either no output is
+    // declared (truly side-effect-only step like `git commit`), or output
+    // IS declared but the file isn't on disk. Distinguish:
+    //
+    //   step.output is empty       → side-effect-only success
+    //   step.output is declared but file missing → FAIL
+    //
+    // The previous "treat as success" path masked a real failure: when the
+    // harness silently no-ops (model returns 0 tokens, an auth/model-name
+    // error, or any other case where the Write tool never fires) the FSM
+    // saw `outputPath && !existsSync(...)` and reported success anyway.
+    // Result: green run, no output file, user sees nothing in the workspace
+    // and no clue what went wrong. Now this fails loudly.
+    if (step.output) {
+      const reason = `Skill declared output '${outputPath}' but no file was written at '${outputPathAbs}'`;
+      emitEvent(parentRunId, 'step_failed', {
+        stepNumber: step.number,
+        skill: step.skill,
+        iteration,
+        expectedOutput: outputPath,
+        expectedOutputAbs: outputPathAbs,
+        reason: 'output_file_missing',
+        error: reason,
+      });
+      return {
+        success: false,
+        outputPath: outputPath || undefined,
+        error: reason,
+      };
+    }
+
+    // Truly side-effect-only (no output declared in SKILL.md).
+    emitEvent(parentRunId, 'step_complete', {
+      stepNumber: step.number,
+      skill: step.skill,
+      iteration,
       outputPath: outputPath || undefined,
-    };
+      sideEffectOnly: true,
+    });
+    return { success: true, outputPath: outputPath || undefined };
   }
 }
 
