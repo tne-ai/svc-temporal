@@ -373,6 +373,14 @@ async function invokeViaHarness(
     let lastHeartbeat = Date.now();
     const runId = context?.parentRunId;
     const jobId = context?.jobId;
+    // Track whether the harness actually did any work. If the underlying
+    // API call fails (auth, model-not-found, etc.) the harness may emit a
+    // `result` event with is_error=true and 0 tokens but no thrown
+    // exception — silently green from invokeViaHarness's caller. Capture
+    // the failure reason so executeStep's step_failed surfaces *why*.
+    let harnessError: string | null = null;
+    let harnessSawAnyTokens = false;
+    let harnessSawAnyToolUse = false;
 
     for await (const event of agent.query(prompt)) {
       // Agent harness emits various event types — capture text content from assistant messages
@@ -418,17 +426,44 @@ async function invokeViaHarness(
         // forwards Anthropic's usage object straight through on the result event.
         const usage = ev.usage;
         if (usage && (typeof usage.input_tokens === 'number' || typeof usage.output_tokens === 'number')) {
+          const inTok = usage.input_tokens ?? 0;
+          const outTok = usage.output_tokens ?? 0;
+          if (inTok > 0 || outTok > 0) harnessSawAnyTokens = true;
           const tokenPayload = {
             backend: 'harness',
             model: resolvedModel,
-            inputTokens: usage.input_tokens ?? 0,
-            outputTokens: usage.output_tokens ?? 0,
+            inputTokens: inTok,
+            outputTokens: outTok,
             cacheCreationInputTokens: usage.cache_creation_input_tokens,
             cacheReadInputTokens: usage.cache_read_input_tokens,
             costUsd: typeof ev.total_cost_usd === 'number' ? ev.total_cost_usd : undefined,
           };
           emitEvent(runId, 'token_update', { ...tokenPayload, stepNumber: context?.stepNumber, skill: context?.skill });
           emitJobEvent(jobId, 'token_update', tokenPayload);
+        }
+        // Detect harness-reported errors. The harness emits is_error / an
+        // error subtype when the underlying API call fails (bad auth,
+        // model-not-found, rate-limit, etc.). Without this surface, the
+        // outer step_failed only says "no file was written" with no clue
+        // why — the actual reason was buried in a result event we
+        // ignored.
+        if ((ev as any).is_error === true || (typeof ev.subtype === 'string' && ev.subtype.includes('error'))) {
+          const detail =
+            (ev as any).error ||
+            (ev as any).message ||
+            (ev as any).subtype ||
+            'unknown harness error';
+          harnessError = `harness errored: ${detail}`;
+          console.warn('[invokeViaHarness] harness reported error in result event', {
+            model: resolvedModel,
+            subtype: (ev as any).subtype,
+            isError: (ev as any).is_error,
+            error: detail,
+          });
+        }
+      } else if (ev.type === 'assistant' && (ev as any).message?.content) {
+        for (const block of (ev as any).message.content) {
+          if (block.type === 'tool_use') harnessSawAnyToolUse = true;
         }
       }
       // Heartbeat every 5 seconds
@@ -438,6 +473,29 @@ async function invokeViaHarness(
       }
     }
 
+    // Surface harness-level failures up to executeStep so step_failed
+    // includes a useful diagnostic. Three escalating signals:
+    //   1. explicit harness `is_error` / error subtype  → propagate verbatim
+    //   2. zero tokens AND no tool uses                 → almost always a
+    //      silent provider failure (bad auth, missing OPENROUTER_API_KEY,
+    //      404 on a non-existent model slug). Hint at the most likely
+    //      cause based on the model shape.
+    //   3. otherwise: real success
+    if (harnessError) {
+      return { success: false, stdout, stderr: harnessError, exitCode: 1 };
+    }
+    if (!harnessSawAnyTokens && !harnessSawAnyToolUse) {
+      const isOR = !!resolvedModel && resolvedModel.includes('/');
+      const orHint = isOR
+        ? ` (OpenRouter slug — check OPENROUTER_API_KEY is set in svc-temporal's env and that "${resolvedModel}" is a valid OR model id)`
+        : ' (Anthropic backend — check ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN)';
+      const detail = `harness returned 0 tokens and made no tool calls — the LLM call almost certainly failed silently${orHint}`;
+      console.warn('[invokeViaHarness] suspected silent failure', {
+        model: resolvedModel,
+        isOpenRouterModel: isOR,
+      });
+      return { success: false, stdout, stderr: detail, exitCode: 1 };
+    }
     return { success: true, stdout, stderr: '', exitCode: 0 };
   } catch (err) {
     return {
