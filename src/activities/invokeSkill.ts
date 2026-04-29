@@ -446,8 +446,30 @@ function buildNestedFsmHooks(
         matcher: 'Bash',
         hooks: [
           async (input: any) => {
+            // The agent-harness passes hook inputs as { toolName, toolInput,
+            // … } in camelCase (see node_modules/@tne-ai/agent-harness/src/
+            // engine.ts:561). The SDK path uses snake_case tool_input.
+            // Read both shapes so this works in either runtime.
+            //
+            // Before this fix, the snake_case-only read meant this hook
+            // had been a silent no-op on the harness path: every fsm-start
+            // bash command from inside a skill ran as a plain subprocess
+            // instead of being redirected to /api/fsm-invoke/start with
+            // parentRunId — so nested orchestrator child runs were never
+            // linked to their parent in the Job Tree / App Events views.
+            const inputToolInput = input?.toolInput || input?.tool_input || {};
+            const buildOutput = (newCommand: string) => ({
+              hookSpecificOutput: {
+                ...input,
+                // Set both shapes so the harness (camelCase) and SDK
+                // (snake_case) both pick up the rewritten command.
+                toolInput: { ...inputToolInput, command: newCommand },
+                tool_input: { ...inputToolInput, command: newCommand },
+              },
+            });
+
             try {
-              const command: string | undefined = input?.tool_input?.command;
+              const command: string | undefined = inputToolInput?.command;
               if (!command || typeof command !== 'string') return {};
               const match = command.match(
                 /(?:^|\s|&&\s*|;\s*)(?:\.\/)?(?:\.local\/bin\/)?fsm-start\s+([\w-]+)(.*)$/,
@@ -476,15 +498,9 @@ function buildNestedFsmHooks(
 
               if (!response.ok) {
                 const text = await response.text().catch(() => '');
-                return {
-                  hookSpecificOutput: {
-                    ...input,
-                    tool_input: {
-                      ...input.tool_input,
-                      command: `echo 'fsm-start failed: HTTP ${response.status} — ${text.replace(/'/g, "'\\''")}'`,
-                    },
-                  },
-                };
+                return buildOutput(
+                  `echo 'fsm-start failed: HTTP ${response.status} — ${text.replace(/'/g, "'\\''")}'`,
+                );
               }
 
               const data: any = await response.json().catch(() => ({}));
@@ -498,25 +514,13 @@ function buildNestedFsmHooks(
                 resumed: resume,
               });
 
-              return {
-                hookSpecificOutput: {
-                  ...input,
-                  tool_input: {
-                    ...input.tool_input,
-                    command: `echo 'FSM child run started. Parent: ${context.parentRunId} Child: ${data.runId || 'unknown'} Skill: ${skillName}'`,
-                  },
-                },
-              };
+              return buildOutput(
+                `echo 'FSM child run started. Parent: ${context.parentRunId} Child: ${data.runId || 'unknown'} Skill: ${skillName}'`,
+              );
             } catch (err: any) {
-              return {
-                hookSpecificOutput: {
-                  ...input,
-                  tool_input: {
-                    ...input.tool_input,
-                    command: `echo 'fsm-start hook error: ${String(err?.message || err).replace(/'/g, "'\\''")}'`,
-                  },
-                },
-              };
+              return buildOutput(
+                `echo 'fsm-start hook error: ${String(err?.message || err).replace(/'/g, "'\\''")}'`,
+              );
             }
           },
         ],
