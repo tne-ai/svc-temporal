@@ -331,16 +331,41 @@ async function invokeViaHarness(
     try { await ensureSkillsInWorkspace(cwd); } catch (err: any) {
       console.warn('[invokeViaHarness] ensureSkillsInWorkspace failed:', err?.message);
     }
-    // Only pass a real API key as apiKey; OAuth tokens flow via env var and
-    // must NOT be passed as ANTHROPIC_API_KEY (they're rejected as invalid).
-    const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
+    // Provider routing. The agent-harness defaults to Anthropic's API; without
+    // explicit apiType / baseURL it ignores OpenRouter slugs and silently
+    // returns 0 tokens (api.anthropic.com 404s on `moonshotai/kimi-k2.6`).
+    // Detect non-Anthropic models by their slug shape (`vendor/model`) and
+    // wire OpenRouter the same way orion's agentService does. This was the
+    // reason p-debug1-three-words via Kimi looked like it succeeded but
+    // wrote nothing: the LLM call never actually happened.
+    const isOpenRouterModel = !!resolvedModel && resolvedModel.includes('/');
+    let apiType: 'anthropic-messages' | 'openai-completions' = 'anthropic-messages';
+    let baseURL: string | undefined;
+    let apiKey: string | undefined;
+    if (isOpenRouterModel) {
+      apiType = 'openai-completions';
+      baseURL = 'https://openrouter.ai/api/v1';
+      apiKey = process.env.OPENROUTER_API_KEY?.trim();
+      if (!apiKey) {
+        console.warn(
+          '[invokeViaHarness] model looks like an OpenRouter slug but OPENROUTER_API_KEY is not set; the call will fail',
+          { model: resolvedModel },
+        );
+      }
+    } else {
+      // Only pass a real API key as apiKey; OAuth tokens flow via env var and
+      // must NOT be passed as ANTHROPIC_API_KEY (they're rejected as invalid).
+      apiKey = process.env.ANTHROPIC_API_KEY?.trim();
+    }
     const agent = createAgent({
+      apiType,
       model: resolvedModel,
       cwd,
       permissionMode: (permissionMode as any) || 'bypassPermissions',
       // FSM steps can legitimately need many tool rounds (read/grep/edit/write
       // across a big workspace, plus nested skill invocations). 30 was too tight.
       maxTurns: 200,
+      ...(baseURL ? { baseURL } : {}),
       ...(apiKey ? { apiKey } : {}),
     });
 
@@ -586,6 +611,36 @@ async function invokeViaClaudeAgentSDK(
         if (oauth && (!apiKey || !apiKey.trim())) {
           delete out.ANTHROPIC_API_KEY;
           out.CLAUDE_CODE_OAUTH_TOKEN = oauth;
+        }
+        // OpenRouter routing: when the model is a vendor/slug (e.g.
+        // moonshotai/kimi-k2.6, google/gemini-2.5-flash) it can't be served
+        // by api.anthropic.com. Mirror orion's claudeAgentService.legacy.ts
+        // approach — point the Claude SDK at OpenRouter via env vars and
+        // set the non-Claude model as the alias so the SDK picks it up.
+        // Without this, the SDK silently 404s on the model and the skill
+        // run reports 0 tokens with no Write tool ever firing.
+        const isOpenRouterModel = !!resolvedModel && resolvedModel.includes('/');
+        const orKey = process.env.OPENROUTER_API_KEY?.trim();
+        if (isOpenRouterModel && orKey) {
+          out.ANTHROPIC_BASE_URL = 'https://openrouter.ai/api';
+          out.ANTHROPIC_AUTH_TOKEN = orKey;
+          out.ANTHROPIC_API_KEY = ''; // explicitly empty per OpenRouter docs
+          delete out.CLAUDE_CODE_OAUTH_TOKEN;
+          // Override whichever tier alias matches so the SDK picks the
+          // OR slug instead of a Claude default.
+          const lower = resolvedModel.toLowerCase();
+          if (lower.includes('opus') || lower.includes('pro')) {
+            out.ANTHROPIC_DEFAULT_OPUS_MODEL = resolvedModel;
+          } else if (lower.includes('haiku') || lower.includes('mini') || lower.includes('flash')) {
+            out.ANTHROPIC_DEFAULT_HAIKU_MODEL = resolvedModel;
+          } else {
+            out.ANTHROPIC_DEFAULT_SONNET_MODEL = resolvedModel;
+          }
+        } else if (isOpenRouterModel && !orKey) {
+          console.warn(
+            '[invokeViaClaudeAgentSDK] model looks like an OpenRouter slug but OPENROUTER_API_KEY is not set; the call will fail',
+            { model: resolvedModel },
+          );
         }
         return out;
       })(),
