@@ -649,18 +649,34 @@ async function invokeViaClaudeAgentSDK(
   const workspaceRoot = workspacePath || process.cwd();
   const cwd = context?.workingDir ? join(workspaceRoot, context.workingDir) : workspaceRoot;
 
-  // BYOK: look up the user's saved key for the relevant provider. SDK
-  // path uses ANTHROPIC_API_KEY for direct Anthropic, ANTHROPIC_AUTH_TOKEN
+  // BYOK: look up the user's saved credential for the relevant provider.
+  // SDK path uses ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN for
+  // Claude Max subscribers) for direct Anthropic, ANTHROPIC_AUTH_TOKEN
   // for OpenRouter via the Anthropic Skin. Workers fetch the plaintext
-  // from orion over an authenticated internal endpoint; the key is used
-  // for this invocation only and never persisted.
+  // from orion over an authenticated internal endpoint; the credential
+  // is used for this invocation only and never persisted.
+  // For Anthropic, OAuth (Claude Max) wins over an API key when both
+  // are saved — Max users almost always want subscription billing.
   const isOpenRouterModelForByok = !!resolvedModel && resolvedModel.includes('/');
-  const byokProvider = isOpenRouterModelForByok ? 'openrouter' : 'anthropic';
-  const byokKey = context?.userId
-    ? await fetchUserProviderKey(context.userId, byokProvider)
-    : null;
-  if (byokKey) {
-    console.log('[invokeViaClaudeAgentSDK] using BYOK key', { userId: context?.userId, provider: byokProvider });
+  let byokKey: string | null = null;
+  let byokOAuth: string | null = null;
+  if (context?.userId) {
+    if (isOpenRouterModelForByok) {
+      byokKey = await fetchUserProviderKey(context.userId, 'openrouter');
+    } else {
+      byokOAuth = await fetchUserProviderKey(context.userId, 'anthropic_oauth');
+      if (!byokOAuth) {
+        byokKey = await fetchUserProviderKey(context.userId, 'anthropic');
+      }
+    }
+  }
+  if (byokOAuth) {
+    console.log('[invokeViaClaudeAgentSDK] using BYOK Anthropic OAuth (Claude Max)', { userId: context?.userId });
+  } else if (byokKey) {
+    console.log('[invokeViaClaudeAgentSDK] using BYOK key', {
+      userId: context?.userId,
+      provider: isOpenRouterModelForByok ? 'openrouter' : 'anthropic',
+    });
   }
   // Ensure workspace directory exists before spawning Claude Code
   if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true });
@@ -717,6 +733,11 @@ async function invokeViaClaudeAgentSDK(
               { model: resolvedModel, userId: context?.userId },
             );
           }
+        } else if (byokOAuth) {
+          // Anthropic with BYOK Claude Max OAuth — auth via subscription.
+          // Clear API key so the SDK doesn't try to send both auth headers.
+          out.CLAUDE_CODE_OAUTH_TOKEN = byokOAuth;
+          out.ANTHROPIC_API_KEY = '';
         } else if (byokKey) {
           // Anthropic with BYOK: user's own ANTHROPIC_API_KEY. Clear the
           // OAuth token so the SDK prefers the API key.

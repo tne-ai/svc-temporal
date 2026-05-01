@@ -31,7 +31,7 @@ import { HORIZON_FSM_BASE, FSM_INVOKE_SECRET } from '../shared/constants.js';
  */
 export async function fetchUserProviderKey(
   userId: string,
-  provider: 'anthropic' | 'openai' | 'gemini' | 'openrouter',
+  provider: 'anthropic' | 'anthropic_oauth' | 'openai' | 'gemini' | 'openrouter',
 ): Promise<string | null> {
   if (!HORIZON_FSM_BASE || !FSM_INVOKE_SECRET) {
     // No backend wiring — workers running standalone (test envs etc.).
