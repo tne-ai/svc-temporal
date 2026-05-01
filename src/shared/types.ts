@@ -274,6 +274,11 @@ export interface CascadeResult {
   passed: boolean;
   gateResults: GateResult[];
   finalFeedback: string;
+  /** True when one of the gates couldn't reach its evaluator (harness init
+   *  failed, model unreachable, etc.) rather than judging the content
+   *  unfavorably. executeStep uses this to skip retries — retrying won't
+   *  fix infrastructure. */
+  infrastructureError?: boolean;
 }
 
 // ─── Ralph Loop Types ───────────────────────────────────────────────────────

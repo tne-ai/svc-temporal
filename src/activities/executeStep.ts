@@ -110,7 +110,7 @@ export async function executeStep(params: StepExecutionParams): Promise<StepResu
       heartbeat({ step: step.number, skill: step.skill, status: 'gate_check', retry: retries });
       emitEvent(parentRunId, 'gate_start', { stepNumber: step.number, skill: step.skill, iteration, outputPath });
 
-      const cascadeResult = await runGateCascade(step, outputPathAbs, iteration);
+      const cascadeResult = await runGateCascade(step, outputPathAbs, iteration, false, { workspacePath: cwdRoot });
 
       emitEvent(parentRunId, 'gate_result', {
         stepNumber: step.number, skill: step.skill, iteration, passed: cascadeResult.passed,
@@ -122,6 +122,28 @@ export async function executeStep(params: StepExecutionParams): Promise<StepResu
         return {
           success: true,
           outputPath,
+          gateResults: Object.fromEntries(
+            cascadeResult.gateResults.map(gr => [
+              gr.gateNumber,
+              gr.passed ? 'PASS' : `FAIL: ${gr.feedback.slice(0, 200)}`,
+            ])
+          ),
+        };
+      }
+
+      // Infrastructure error → don't retry. Retrying the step won't make
+      // the gate's evaluator reachable. Surface a distinct failure reason
+      // so it's clear in the run history this wasn't a content problem.
+      if (cascadeResult.infrastructureError) {
+        emitEvent(parentRunId, 'step_failed', {
+          stepNumber: step.number, skill: step.skill, iteration, retries,
+          reason: 'gate_infrastructure_unavailable',
+        });
+        return {
+          success: false,
+          outputPath,
+          error: 'Gate infrastructure unavailable — step output was written but could not be validated',
+          feedback: cascadeResult.finalFeedback,
           gateResults: Object.fromEntries(
             cascadeResult.gateResults.map(gr => [
               gr.gateNumber,
