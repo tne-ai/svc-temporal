@@ -5,26 +5,59 @@
  *
  * Gate cascade (all enabled by default):
  *   Step output → Gate 1 (type-specific) → PASS? done
- *                                         → FAIL? retry step
+ *                                         → FAIL? next gate
  *                → Gate 2 (self-eval)     → PASS? done
- *                                         → FAIL? retry step
+ *                                         → FAIL? next gate
  *                → Gate 3 (persona)       → PASS? done
- *                                         → FAIL? retry step
+ *                                         → FAIL? next gate
  *                → Gate 4 (counsel)       → PASS? done
- *                                         → FAIL? retry or abort
+ *                                         → FAIL? caller retries
+ *
+ * Implementation notes
+ * ────────────────────
+ * Gates 2-4 are LLM-driven evaluations. Originally they shelled out to
+ * `claude -p` via execFileSync, which:
+ *   - depended on the `claude` CLI being installed and authenticated in
+ *     the worker environment
+ *   - inherited whatever ANTHROPIC_BASE_URL / AUTH_TOKEN the worker
+ *     happened to have, so a step that ran on OpenRouter (Kimi etc.) and
+ *     mutated those vars could poison the gate's CLI
+ *   - bound the gate model to the user's chat/step model selection,
+ *     which made gates run on Kimi when the user picked Kimi
+ *
+ * We now invoke the agent-harness in-process for gates. The gate model
+ * is fixed (env GATE_MODEL, default `claude-haiku-4-5-20251001`) so the
+ * user's step model choice doesn't affect validation. The harness picks
+ * up auth from env (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY) the
+ * same way step invocations do — the worker is always running on
+ * Claude/our harness, OAuth-vs-API-key is handled there, no CLI
+ * dependency.
+ *
+ * Errors thrown by the harness (network, init, auth) are surfaced as
+ * `error: 'infrastructure'` results so the cascade can short-circuit
+ * remaining gates and tell executeStep to skip retries.
  */
 
-import { execFileSync } from 'child_process';
 import { readFileSync, existsSync } from 'fs';
 import { heartbeat } from '@temporalio/activity';
 import type { Step, GateResult, CascadeResult } from '../shared/types.js';
 import { StageType } from '../shared/types.js';
-import { GATE_ACTIVITY_TIMEOUT } from '../shared/constants.js';
-
-const GATE_TIMEOUT_MS = 300_000; // 5 minutes
 
 const JSON_SUFFIX = '\n\nReturn ONLY valid JSON (no markdown fencing):\n' +
   '{"passed": true/false, "feedback": "...", "score": <number>}';
+
+/** Gate model is fixed independent of the step model. Override via env. */
+const GATE_MODEL = process.env.GATE_MODEL?.trim() || 'claude-haiku-4-5-20251001';
+
+/** Per-gate maxTurns. Gates only need to read one file and emit JSON;
+ *  more than ~5 turns means the model is wandering. */
+const GATE_MAX_TURNS = 5;
+
+interface GateContext {
+  /** Workspace root passed through from executeStep so the harness has a
+   *  real cwd to resolve Read tool paths against. */
+  workspacePath?: string;
+}
 
 /**
  * Run the full gate cascade on a step's output.
@@ -35,7 +68,11 @@ export async function runGateCascade(
   outputPath: string,
   iteration = 0,
   dryRun = false,
+  ctx?: GateContext,
 ): Promise<CascadeResult> {
+  // iteration is part of the public API but not used here directly —
+  // emit-event callers thread it through for logging.
+  void iteration;
   const enabledGates = step.failFast.gates;
 
   if (!existsSync(outputPath)) {
@@ -63,11 +100,23 @@ export async function runGateCascade(
 
     heartbeat({ status: 'gate_check', gate: gateNum });
 
-    const result = runGate(gateNum, step, outputPath);
+    const result = await runGate(gateNum, step, outputPath, ctx);
     results.push(result);
 
     if (result.passed) {
       return { passed: true, gateResults: results, finalFeedback: '' };
+    }
+
+    // Short-circuit on infrastructure errors. If gate N couldn't reach
+    // its evaluator, gate N+1 won't either — and executeStep retrying
+    // the whole step won't fix the infra. Bail out and surface clearly.
+    if (result.error === 'infrastructure') {
+      return {
+        passed: false,
+        gateResults: results,
+        finalFeedback: `Gate infrastructure unavailable: ${result.feedback}. Skipping remaining gates.`,
+        infrastructureError: true,
+      };
     }
   }
 
@@ -79,28 +128,38 @@ export async function runGateCascade(
   return { passed: false, gateResults: results, finalFeedback: allFeedback };
 }
 
-function runGate(gateNum: number, step: Step, outputPath: string): GateResult {
+async function runGate(
+  gateNum: number,
+  step: Step,
+  outputPath: string,
+  ctx?: GateContext,
+): Promise<GateResult> {
   switch (gateNum) {
-    case 1: return runGate1(step, outputPath);
-    case 2: return runGate2(step, outputPath);
-    case 3: return runGate3(step, outputPath);
-    case 4: return runGate4(step, outputPath);
+    case 1: return runGate1(step, outputPath, ctx);
+    case 2: return runGate2(step, outputPath, ctx);
+    case 3: return runGate3(step, outputPath, ctx);
+    case 4: return runGate4(step, outputPath, ctx);
     default: return { gateNumber: gateNum, passed: true, feedback: 'Unknown gate — auto-pass' };
   }
 }
 
 // ─── Gate 1: Type-specific validation ───────────────────────────────────────
 
-function runGate1(step: Step, outputPath: string): GateResult {
+async function runGate1(
+  step: Step,
+  outputPath: string,
+  ctx?: GateContext,
+): Promise<GateResult> {
   if (step.stageType === StageType.CREATIVE) {
     return { gateNumber: 1, passed: true, feedback: 'Creative content — Gate 1 auto-pass' };
   }
 
   if (step.stageType === StageType.FACT_SEARCH) {
-    return invokeClaudeGate(
+    return invokeHarnessGate(
       `Execute /r-cao1-skeptics-and-citations on the file ${outputPath}. ` +
       'Verify all factual claims have citations.',
       1,
+      ctx,
     );
   }
 
@@ -123,19 +182,16 @@ function runGate1(step: Step, outputPath: string): GateResult {
 function gate1StructureCheck(outputPath: string): GateResult {
   try {
     const content = readFileSync(outputPath, 'utf-8');
-    const issues: string[] = [];
 
-    if (!content.includes('##') && !content.includes('# ')) {
-      issues.push('No section headers found');
-    }
-    if (content.split(/\s+/).length < 50) {
-      issues.push(`Very short output (${content.split(/\s+/).length} words)`);
+    // Just require non-empty content. The previous "≥ 50 words" heuristic
+    // wrongly failed legitimately-tiny skill outputs (e.g. p-debug2 emits
+    // a 3-item list intentionally). Gates 2-4 are the LLM-driven content
+    // judges; gate 1 is just a "did anything get written" guard.
+    if (!content.trim()) {
+      return { gateNumber: 1, passed: false, feedback: 'Output file is empty' };
     }
 
-    if (issues.length === 0) {
-      return { gateNumber: 1, passed: true, feedback: 'Structure check passed' };
-    }
-    return { gateNumber: 1, passed: false, feedback: 'Structure issues: ' + issues.join('; ') };
+    return { gateNumber: 1, passed: true, feedback: 'Structure check passed (non-empty)' };
   } catch {
     return { gateNumber: 1, passed: false, feedback: 'Could not read output file' };
   }
@@ -143,24 +199,33 @@ function gate1StructureCheck(outputPath: string): GateResult {
 
 // ─── Gates 2-4: LLM-based evaluation ───────────────────────────────────────
 
-function runGate2(step: Step, outputPath: string): GateResult {
+async function runGate2(
+  step: Step,
+  outputPath: string,
+  ctx?: GateContext,
+): Promise<GateResult> {
   const passCondition = step.passCondition ||
     'Output is complete, coherent, and addresses all requirements';
-  return invokeClaudeGate(
+  return invokeHarnessGate(
     `You are evaluating the output of skill '${step.skill}'.\n\n` +
     `Output file: ${outputPath}\n` +
     `Read the file and evaluate against this pass condition:\n` +
     passCondition,
     2,
+    ctx,
   );
 }
 
-function runGate3(step: Step, outputPath: string): GateResult {
+async function runGate3(
+  step: Step,
+  outputPath: string,
+  ctx?: GateContext,
+): Promise<GateResult> {
   const cfg = step.failFast.persona as Record<string, string> | undefined;
   const name = cfg?.['name'] || 'Senior Domain Expert';
   const dims = cfg?.['dimensions'] || 'quality, completeness, accuracy, clarity, actionability';
   const threshold = cfg?.['threshold'] || '7';
-  return invokeClaudeGate(
+  return invokeHarnessGate(
     `Execute /cko10-persona-evaluator with:\n` +
     `  CONTENT_FILE=${outputPath}\n` +
     `  PERSONA=${name}\n` +
@@ -168,15 +233,20 @@ function runGate3(step: Step, outputPath: string): GateResult {
     `  THRESHOLD=${threshold}\n` +
     `  SKILL=${step.skill}`,
     3,
+    ctx,
   );
 }
 
-function runGate4(step: Step, outputPath: string): GateResult {
+async function runGate4(
+  step: Step,
+  outputPath: string,
+  ctx?: GateContext,
+): Promise<GateResult> {
   const cfg = step.failFast.counselPersonas as Record<string, string> | undefined;
   const personas = cfg?.['members'] || '3 domain experts with diverse perspectives';
   const chairman = cfg?.['chairman'] || 'auto';
   const threshold = cfg?.['threshold'] || '7';
-  return invokeClaudeGate(
+  return invokeHarnessGate(
     `Execute /cai6-ai-counsel with:\n` +
     `  CONTENT_FILE=${outputPath}\n` +
     `  PERSONAS=${personas}\n` +
@@ -184,26 +254,52 @@ function runGate4(step: Step, outputPath: string): GateResult {
     `  THRESHOLD=${threshold}\n` +
     `  SKILL=${step.skill}`,
     4,
+    ctx,
   );
 }
 
 // ─── Shared invocation + JSON extraction ────────────────────────────────────
 
-function invokeClaudeGate(prompt: string, gateNumber: number): GateResult {
+/**
+ * Invoke a gate via the in-process agent-harness. Pinned to a fixed gate
+ * model so the user's step-model choice doesn't bleed into validation.
+ *
+ * Throws caught here become `error: 'infrastructure'` results — this
+ * signals to the cascade and to executeStep that the failure was not
+ * about content, so retrying won't help.
+ */
+async function invokeHarnessGate(
+  prompt: string,
+  gateNumber: number,
+  ctx?: GateContext,
+): Promise<GateResult> {
   try {
-    const result = execFileSync('claude', ['-p', '--output-format', 'text'], {
-      input: prompt + JSON_SUFFIX,
-      timeout: GATE_TIMEOUT_MS,
-      encoding: 'utf-8',
-      maxBuffer: 10 * 1024 * 1024,
+    const { createAgent } = await import('@tne-ai/agent-harness');
+    const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
+
+    const agent = createAgent({
+      apiType: 'anthropic-messages',
+      model: GATE_MODEL,
+      cwd: ctx?.workspacePath || process.cwd(),
+      permissionMode: 'bypassPermissions',
+      maxTurns: GATE_MAX_TURNS,
+      // Gates only need to read the output file. Restricting tools keeps
+      // a misbehaving model from doing anything unexpected.
+      allowedTools: ['Read'],
+      ...(apiKey ? { apiKey } : {}),
     });
 
-    const parsed = extractJson(result);
+    const result = await agent.prompt(prompt + JSON_SUFFIX);
+    const text = result.text || '';
+
+    const parsed = extractJson(text);
     if (!parsed) {
+      // Model produced something but it wasn't parsable JSON. Treat as
+      // a content failure (model didn't follow instructions), not infra.
       return {
         gateNumber,
         passed: false,
-        feedback: `Could not parse gate result as JSON: ${result.slice(0, 300)}`,
+        feedback: `Could not parse gate result as JSON: ${text.slice(0, 300)}`,
       };
     }
 
@@ -214,10 +310,17 @@ function invokeClaudeGate(prompt: string, gateNumber: number): GateResult {
       score: typeof parsed['score'] === 'number' ? parsed['score'] : undefined,
     };
   } catch (err: any) {
-    if (err.killed) {
-      return { gateNumber, passed: false, feedback: `Gate ${gateNumber} timed out`, error: 'timeout' };
-    }
-    return { gateNumber, passed: false, feedback: String(err), error: String(err) };
+    // Anything that throws from createAgent / agent.prompt is treated as
+    // an infrastructure problem: harness couldn't initialize, network
+    // error, auth rejection, model not reachable, etc. None of these
+    // get better by retrying the step.
+    const msg = err?.message || String(err);
+    return {
+      gateNumber,
+      passed: false,
+      feedback: `Gate ${gateNumber} infrastructure error: ${msg}`,
+      error: 'infrastructure',
+    };
   }
 }
 
