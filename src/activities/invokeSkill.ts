@@ -28,6 +28,7 @@ import type { AgentBackend, InvocationResult, Step } from '../shared/types.js';
 import { resolveTemplateVars } from '../config/templateResolver.js';
 import { emitEvent, emitJobEvent } from './emitEvent.js';
 import { pushWorkspaceToS3 } from './workspaceSync.js';
+import { fetchUserProviderKey } from '../lib/fetchUserProviderKey.js';
 import { ensureSkillsInWorkspace } from './setupSkills.js';
 
 /** Extract a short text preview for message events (strip surrounding whitespace). */
@@ -342,20 +343,35 @@ async function invokeViaHarness(
     let apiType: 'anthropic-messages' | 'openai-completions' = 'anthropic-messages';
     let baseURL: string | undefined;
     let apiKey: string | undefined;
+
+    // BYOK lookup: if the user has a saved key for the relevant provider,
+    // use it instead of the env-var fallback. SOC2-compliant: keys are
+    // fetched from orion's authenticated internal endpoint over HTTPS,
+    // used once for this activity, never persisted on the worker.
+    const byokProvider = isOpenRouterModel ? 'openrouter' : 'anthropic';
+    const byokKey = context?.userId
+      ? await fetchUserProviderKey(context.userId, byokProvider)
+      : null;
+
     if (isOpenRouterModel) {
       apiType = 'openai-completions';
       baseURL = 'https://openrouter.ai/api/v1';
-      apiKey = process.env.OPENROUTER_API_KEY?.trim();
+      apiKey = byokKey || process.env.OPENROUTER_API_KEY?.trim();
       if (!apiKey) {
         console.warn(
-          '[invokeViaHarness] model looks like an OpenRouter slug but OPENROUTER_API_KEY is not set; the call will fail',
-          { model: resolvedModel },
+          '[invokeViaHarness] model looks like an OpenRouter slug but no API key (BYOK or OPENROUTER_API_KEY) is available; the call will fail',
+          { model: resolvedModel, userId: context?.userId },
         );
+      } else if (byokKey) {
+        console.log('[invokeViaHarness] using BYOK OpenRouter key', { userId: context?.userId });
       }
     } else {
-      // Only pass a real API key as apiKey; OAuth tokens flow via env var and
-      // must NOT be passed as ANTHROPIC_API_KEY (they're rejected as invalid).
-      apiKey = process.env.ANTHROPIC_API_KEY?.trim();
+      // BYOK Anthropic key wins; otherwise the env API key; otherwise the
+      // OAuth token flows via env (CLAUDE_CODE_OAUTH_TOKEN).
+      apiKey = byokKey || process.env.ANTHROPIC_API_KEY?.trim();
+      if (byokKey) {
+        console.log('[invokeViaHarness] using BYOK Anthropic key', { userId: context?.userId });
+      }
     }
     const agent = createAgent({
       apiType,
@@ -632,6 +648,36 @@ async function invokeViaClaudeAgentSDK(
   const resolvedModel = resolveModelId(model, 'agent');
   const workspaceRoot = workspacePath || process.cwd();
   const cwd = context?.workingDir ? join(workspaceRoot, context.workingDir) : workspaceRoot;
+
+  // BYOK: look up the user's saved credential for the relevant provider.
+  // SDK path uses ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN for
+  // Claude Max subscribers) for direct Anthropic, ANTHROPIC_AUTH_TOKEN
+  // for OpenRouter via the Anthropic Skin. Workers fetch the plaintext
+  // from orion over an authenticated internal endpoint; the credential
+  // is used for this invocation only and never persisted.
+  // For Anthropic, OAuth (Claude Max) wins over an API key when both
+  // are saved — Max users almost always want subscription billing.
+  const isOpenRouterModelForByok = !!resolvedModel && resolvedModel.includes('/');
+  let byokKey: string | null = null;
+  let byokOAuth: string | null = null;
+  if (context?.userId) {
+    if (isOpenRouterModelForByok) {
+      byokKey = await fetchUserProviderKey(context.userId, 'openrouter');
+    } else {
+      byokOAuth = await fetchUserProviderKey(context.userId, 'anthropic_oauth');
+      if (!byokOAuth) {
+        byokKey = await fetchUserProviderKey(context.userId, 'anthropic');
+      }
+    }
+  }
+  if (byokOAuth) {
+    console.log('[invokeViaClaudeAgentSDK] using BYOK Anthropic OAuth (Claude Max)', { userId: context?.userId });
+  } else if (byokKey) {
+    console.log('[invokeViaClaudeAgentSDK] using BYOK key', {
+      userId: context?.userId,
+      provider: isOpenRouterModelForByok ? 'openrouter' : 'anthropic',
+    });
+  }
   // Ensure workspace directory exists before spawning Claude Code
   if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true });
   // Populate `.claude/skills/` with symlinks to tne-plugins so Skill() lookups
@@ -660,45 +706,53 @@ async function invokeViaClaudeAgentSDK(
       workspacePath,
       hooks: buildNestedFsmHooks(context),
       env: (() => {
-        // OAuth tokens (sk-ant-oat01-…) must stay in CLAUDE_CODE_OAUTH_TOKEN.
-        // They are NOT valid as ANTHROPIC_API_KEY and will be rejected with
-        // "Invalid API key" if sent via x-api-key.
+        // BYOK takes precedence over env-var defaults; see fetch above.
         const out: Record<string, string> = { ...(process.env as Record<string, string>) };
-        const oauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-        const apiKey = process.env.ANTHROPIC_API_KEY;
-        if (oauth && (!apiKey || !apiKey.trim())) {
-          delete out.ANTHROPIC_API_KEY;
-          out.CLAUDE_CODE_OAUTH_TOKEN = oauth;
-        }
-        // OpenRouter routing: when the model is a vendor/slug (e.g.
-        // moonshotai/kimi-k2.6, google/gemini-2.5-flash) it can't be served
-        // by api.anthropic.com. Mirror orion's claudeAgentService.legacy.ts
-        // approach — point the Claude SDK at OpenRouter via env vars and
-        // set the non-Claude model as the alias so the SDK picks it up.
-        // Without this, the SDK silently 404s on the model and the skill
-        // run reports 0 tokens with no Write tool ever firing.
         const isOpenRouterModel = !!resolvedModel && resolvedModel.includes('/');
-        const orKey = process.env.OPENROUTER_API_KEY?.trim();
-        if (isOpenRouterModel && orKey) {
-          out.ANTHROPIC_BASE_URL = 'https://openrouter.ai/api';
-          out.ANTHROPIC_AUTH_TOKEN = orKey;
-          out.ANTHROPIC_API_KEY = ''; // explicitly empty per OpenRouter docs
-          delete out.CLAUDE_CODE_OAUTH_TOKEN;
-          // Override whichever tier alias matches so the SDK picks the
-          // OR slug instead of a Claude default.
-          const lower = resolvedModel.toLowerCase();
-          if (lower.includes('opus') || lower.includes('pro')) {
-            out.ANTHROPIC_DEFAULT_OPUS_MODEL = resolvedModel;
-          } else if (lower.includes('haiku') || lower.includes('mini') || lower.includes('flash')) {
-            out.ANTHROPIC_DEFAULT_HAIKU_MODEL = resolvedModel;
+
+        if (isOpenRouterModel) {
+          // OpenRouter via the Anthropic Skin pattern. BYOK key (per-user
+          // OpenRouter key) wins; otherwise the deployment OPENROUTER_API_KEY.
+          const orKey = byokKey || process.env.OPENROUTER_API_KEY?.trim();
+          if (orKey) {
+            out.ANTHROPIC_BASE_URL = 'https://openrouter.ai/api';
+            out.ANTHROPIC_AUTH_TOKEN = orKey;
+            out.ANTHROPIC_API_KEY = ''; // explicitly empty per OpenRouter docs
+            delete out.CLAUDE_CODE_OAUTH_TOKEN;
+            const lower = resolvedModel.toLowerCase();
+            if (lower.includes('opus') || lower.includes('pro')) {
+              out.ANTHROPIC_DEFAULT_OPUS_MODEL = resolvedModel;
+            } else if (lower.includes('haiku') || lower.includes('mini') || lower.includes('flash')) {
+              out.ANTHROPIC_DEFAULT_HAIKU_MODEL = resolvedModel;
+            } else {
+              out.ANTHROPIC_DEFAULT_SONNET_MODEL = resolvedModel;
+            }
           } else {
-            out.ANTHROPIC_DEFAULT_SONNET_MODEL = resolvedModel;
+            console.warn(
+              '[invokeViaClaudeAgentSDK] OpenRouter slug requested but no API key (BYOK or OPENROUTER_API_KEY) available; the call will fail',
+              { model: resolvedModel, userId: context?.userId },
+            );
           }
-        } else if (isOpenRouterModel && !orKey) {
-          console.warn(
-            '[invokeViaClaudeAgentSDK] model looks like an OpenRouter slug but OPENROUTER_API_KEY is not set; the call will fail',
-            { model: resolvedModel },
-          );
+        } else if (byokOAuth) {
+          // Anthropic with BYOK Claude Max OAuth — auth via subscription.
+          // Clear API key so the SDK doesn't try to send both auth headers.
+          out.CLAUDE_CODE_OAUTH_TOKEN = byokOAuth;
+          out.ANTHROPIC_API_KEY = '';
+        } else if (byokKey) {
+          // Anthropic with BYOK: user's own ANTHROPIC_API_KEY. Clear the
+          // OAuth token so the SDK prefers the API key.
+          out.ANTHROPIC_API_KEY = byokKey;
+          delete out.CLAUDE_CODE_OAUTH_TOKEN;
+        } else {
+          // No BYOK; use env defaults. OAuth tokens must stay in
+          // CLAUDE_CODE_OAUTH_TOKEN — they're rejected as invalid if sent
+          // via x-api-key (ANTHROPIC_API_KEY).
+          const oauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+          const apiKey = process.env.ANTHROPIC_API_KEY;
+          if (oauth && (!apiKey || !apiKey.trim())) {
+            delete out.ANTHROPIC_API_KEY;
+            out.CLAUDE_CODE_OAUTH_TOKEN = oauth;
+          }
         }
         return out;
       })(),
