@@ -30,6 +30,8 @@ import { emitEvent, emitJobEvent } from './emitEvent.js';
 import { pushWorkspaceToS3 } from './workspaceSync.js';
 import { fetchUserProviderKey } from '../lib/fetchUserProviderKey.js';
 import { ensureSkillsInWorkspace } from './setupSkills.js';
+import { PiAgentSession, isPiAgentEnabled, normalizeModelForLitellm } from '../services/piAgentAdapter.js';
+import { buildPiTools } from '../services/piAgentTools.js';
 
 /** Extract a short text preview for message events (strip surrounding whitespace). */
 function previewText(text: string, max = 600): string {
@@ -323,6 +325,9 @@ async function invokeViaHarness(
   context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string },
 ): Promise<InvocationResult> {
   const stopSync = startPeriodicS3Sync(workspacePath || '', context?.s3Bucket, context?.s3Prefix, context?.parentRunId, context?.workingDir);
+  // Pi session captured in the outer scope so the finally block can
+  // dispose it even if the body throws partway through.
+  let piSession: PiAgentSession | null = null;
   try {
     const { createAgent } = await import('@tne-ai/agent-harness');
     const resolvedModel = resolveModelId(model, 'agent');
@@ -373,17 +378,51 @@ async function invokeViaHarness(
         console.log('[invokeViaHarness] using BYOK Anthropic key', { userId: context?.userId });
       }
     }
-    const agent = createAgent({
-      apiType,
-      model: resolvedModel,
-      cwd,
-      permissionMode: (permissionMode as any) || 'bypassPermissions',
-      // FSM steps can legitimately need many tool rounds (read/grep/edit/write
-      // across a big workspace, plus nested skill invocations). 30 was too tight.
-      maxTurns: 200,
-      ...(baseURL ? { baseURL } : {}),
-      ...(apiKey ? { apiKey } : {}),
-    });
+    // Pi agent path — gated by USE_PI_AGENT and only when we have an
+    // explicit apiKey. The harness has fallback paths for OAuth-via-env
+    // that Pi doesn't replicate, so without a key we stay on harness.
+    // Pi yields harness-shaped events through the adapter; the consumer
+    // loop below handles both shapes.
+    const usePi = isPiAgentEnabled() && !!apiKey;
+    let agent: { query: (prompt: string) => AsyncIterable<any> };
+    if (usePi) {
+      const piTools = buildPiTools(cwd, { sessionKey: context?.parentRunId || cwd });
+      const piModel = normalizeModelForLitellm(byokProvider, resolvedModel);
+      console.log('[invokeViaHarness] using Pi agent', {
+        model: piModel,
+        apiType,
+        provider: byokProvider,
+        toolCount: piTools.length,
+      });
+      piSession = new PiAgentSession({
+        apiType,
+        model: piModel,
+        apiKey: apiKey!,
+        baseURL,
+        cwd,
+        systemPrompt:
+          'You are a skill execution agent running inside a temporal worker. ' +
+          'Use the provided tools (Read/Write/Edit/Bash/Glob/Grep) to accomplish the task in the workspace. ' +
+          'Files written or edited will be synced to S3 after the run completes.',
+        tools: piTools,
+        maxTokens: 16384,
+        provider: byokProvider,
+      });
+      const session = piSession;
+      agent = { query: (p: string) => session.query(p) };
+    } else {
+      agent = createAgent({
+        apiType,
+        model: resolvedModel,
+        cwd,
+        permissionMode: (permissionMode as any) || 'bypassPermissions',
+        // FSM steps can legitimately need many tool rounds (read/grep/edit/write
+        // across a big workspace, plus nested skill invocations). 30 was too tight.
+        maxTurns: 200,
+        ...(baseURL ? { baseURL } : {}),
+        ...(apiKey ? { apiKey } : {}),
+      });
+    }
 
     let stdout = '';
     let lastHeartbeat = Date.now();
@@ -436,6 +475,28 @@ async function invokeViaHarness(
             });
           }
         }
+      } else if (ev.type === 'partial_message' && typeof ev.delta?.text === 'string') {
+        // Pi adapter path: assistant text arrives as partial_message events
+        // (the harness inlines text in `assistant` blocks instead). Append
+        // to stdout and emit a `message` event so the UI / FSM inspector
+        // sees streaming progress identically across backends.
+        stdout += ev.delta.text;
+        harnessSawAnyTokens = true;
+        const text = previewText(ev.delta.text);
+        if (text) {
+          emitEvent(runId, 'message', { backend: 'harness', text, stepNumber: context?.stepNumber, skill: context?.skill });
+          emitJobEvent(jobId, 'message', { backend: 'harness', text });
+        }
+      } else if (ev.type === 'tool_result' && ev.result) {
+        // Pi adapter path: tool results arrive as top-level events rather
+        // than nested in a `user` message. Mirror the same job-event emit.
+        const r = ev.result;
+        emitJobEvent(jobId, 'tool_result', {
+          backend: 'harness',
+          toolUseId: r.tool_use_id,
+          output: previewText(String(r.output || '')),
+          isError: !!r.is_error,
+        });
       } else if (ev.type === 'result') {
         if (typeof ev.text === 'string') stdout += ev.text;
         // Surface token usage so the UI can render per-step spend. The harness
@@ -505,10 +566,12 @@ async function invokeViaHarness(
       const orHint = isOR
         ? ` (OpenRouter slug — check OPENROUTER_API_KEY is set in svc-temporal's env and that "${resolvedModel}" is a valid OR model id)`
         : ' (Anthropic backend — check ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN)';
-      const detail = `harness returned 0 tokens and made no tool calls — the LLM call almost certainly failed silently${orHint}`;
+      const backendHint = usePi ? ' (Pi adapter)' : '';
+      const detail = `harness returned 0 tokens and made no tool calls${backendHint} — the LLM call almost certainly failed silently${orHint}`;
       console.warn('[invokeViaHarness] suspected silent failure', {
         model: resolvedModel,
         isOpenRouterModel: isOR,
+        backend: usePi ? 'pi' : 'harness',
       });
       return { success: false, stdout, stderr: detail, exitCode: 1 };
     }
@@ -521,6 +584,9 @@ async function invokeViaHarness(
       exitCode: 1,
     };
   } finally {
+    // Pi sessions hold a long-lived Agent instance; harness's createAgent
+    // doesn't need explicit teardown. Either way, drain the periodic sync.
+    if (piSession) { try { piSession.dispose(); } catch {/* idempotent */} }
     await stopSync().catch(() => {});
   }
 }
