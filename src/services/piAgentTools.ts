@@ -66,6 +66,67 @@ function resolveInsideWorkspace(workspaceRoot: string, requested: string): strin
   return normalized;
 }
 
+/**
+ * Sanity-check a Bash command for workspace escape attempts.
+ *
+ * Pi's Bash tool runs `bash -c <command>` with cwd=workspaceRoot but no
+ * sandbox, so without this check the model can `cat ../.claude/foo` or
+ * `find /` and exfiltrate / pollute paths the caller intended to be
+ * scoped to cwd. The other Pi tools (Read/Write/Edit/Glob/Grep) enforce
+ * scoping via resolveInsideWorkspace; Bash is the loophole.
+ *
+ * Heuristic — not a true sandbox, but catches the obvious misuse:
+ *   1. Reject any `..` reference. Path traversal is the primary escape
+ *      vector and there's no legitimate reason to need it inside cwd.
+ *   2. Reject absolute paths that don't start with workspaceRoot OR a
+ *      narrow allowlist of system tool dirs (/bin, /usr, /opt, /etc/...
+ *      for read-only system files like /etc/hostname). Catches absolute
+ *      escapes like `cat /var/folders/.../user-X/.claude/EBP/foo`.
+ *
+ * Doesn't try to handle: shell expansion that constructs paths
+ * dynamically (`cat $HOME/...`), encoded paths (`echo Li4= | base64 -d`),
+ * symlink trickery. Those are out of scope for a heuristic check; if
+ * tightening is needed later, the right answer is OS-level isolation
+ * (chroot / mount namespaces / containers).
+ */
+const ALLOWED_ABS_PREFIXES = [
+  '/bin/', '/usr/', '/opt/', '/sbin/',
+  '/etc/hostname', '/etc/os-release', '/etc/timezone',
+  '/dev/null', '/dev/stdin', '/dev/stdout', '/dev/stderr',
+];
+
+function checkBashCommandSafety(
+  command: string,
+  workspaceRoot: string,
+): { ok: true } | { ok: false; reason: string } {
+  // 1. Block `..` traversal in any token boundary. We don't try to
+  //    distinguish "harmless string `..`" from "path traversal" — the
+  //    cost of being wrong (workspace exfiltration) outweighs the cost
+  //    of the model rephrasing without `..`.
+  if (/(?:^|[\s/'"`(=:])\.\.(?:[\s/'"`)$]|$)/.test(command)) {
+    return { ok: false, reason: 'parent-dir traversal (..) blocked' };
+  }
+  // 2. Find absolute paths that escape the workspace. The regex matches
+  //    the longest run of /-leading path-shaped tokens; reject any that
+  //    don't start with the workspace root or an allowlisted system
+  //    prefix. We normalize workspaceRoot once for prefix comparison.
+  const wsAbs = path.normalize(workspaceRoot);
+  // Match /...word.like... — looks for absolute paths in the command.
+  // Excludes things like `2>/dev/null` (handled by allowlist) and
+  // mid-token slashes like `a/b/c` (no leading boundary char).
+  const absPathRe = /(?<![A-Za-z0-9_])(\/[A-Za-z0-9_./-]+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = absPathRe.exec(command)) !== null) {
+    const p = path.normalize(m[1]);
+    if (p.startsWith(wsAbs)) continue;
+    if (ALLOWED_ABS_PREFIXES.some((prefix) =>
+      p === prefix.replace(/\/$/, '') || p.startsWith(prefix),
+    )) continue;
+    return { ok: false, reason: `absolute path "${m[1]}" escapes workspace ${wsAbs}` };
+  }
+  return { ok: true };
+}
+
 const ReadParams = Type.Object({
   file_path: Type.String({ description: 'File path, absolute or relative to workspace root' }),
   offset: Type.Optional(Type.Number({ description: 'Line number to start reading from (1-based)' })),
@@ -217,10 +278,23 @@ export function buildPiTools(workspaceRoot: string, opts: BuildPiToolsOptions = 
   const Bash: AgentTool<typeof BashParams> = {
     name: 'Bash',
     label: 'Run shell command',
-    description: 'Run a shell command in the workspace root. Output is captured and returned. Default timeout 120s.',
+    description:
+      'Run a shell command in the workspace root. Output is captured and returned. ' +
+      'Default timeout 120s. Path traversal (..) and absolute paths outside the ' +
+      'workspace are rejected — use relative paths inside the working directory.',
     parameters: BashParams,
     execute: async (_toolCallId, params: Static<typeof BashParams>, signal) => {
       const timeoutMs = params.timeout ?? 120_000;
+      // Sandbox check: refuse commands that try to escape the workspace.
+      // The same scoping enforcement Read/Write/Edit/Glob/Grep apply,
+      // applied to Bash by static-analyzing the command string.
+      const safety = checkBashCommandSafety(params.command, workspaceRoot);
+      if (!safety.ok) {
+        return {
+          content: [{ type: 'text', text: `Bash command rejected: ${safety.reason}` }],
+          details: { exitCode: 1, command: params.command, rejected: true, reason: safety.reason },
+        };
+      }
       return await new Promise((resolve, reject) => {
         const child = spawn('/bin/bash', ['-c', params.command], {
           cwd: workspaceRoot,
