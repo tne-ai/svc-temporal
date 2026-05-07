@@ -500,17 +500,14 @@ async function invokeViaHarness(
           }
         }
       } else if (ev.type === 'partial_message' && typeof ev.delta?.text === 'string') {
-        // Pi adapter path: assistant text arrives as partial_message events
-        // (the harness inlines text in `assistant` blocks instead). Append
-        // to stdout and emit a `message` event so the UI / FSM inspector
-        // sees streaming progress identically across backends.
-        stdout += ev.delta.text;
+        // Pi adapter path: streaming token deltas. We *don't* emit a job
+        // event per delta (the activity log would fill with hundreds of
+        // one-word entries — see the user's screenshot). Just track the
+        // signal that the model produced output. The full text gets
+        // emitted as a single coalesced `assistant` event on
+        // message_end, which the existing assistant-text handler above
+        // turns into one job-event message per assistant turn.
         harnessSawAnyTokens = true;
-        const text = previewText(ev.delta.text);
-        if (text) {
-          emitEvent(runId, 'message', { backend: 'harness', text, stepNumber: context?.stepNumber, skill: context?.skill });
-          emitJobEvent(jobId, 'message', { backend: 'harness', text });
-        }
       } else if (ev.type === 'tool_result' && ev.result) {
         // Pi adapter path: tool results arrive as top-level events rather
         // than nested in a `user` message. Mirror the same job-event emit.

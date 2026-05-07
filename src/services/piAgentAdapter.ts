@@ -177,6 +177,26 @@ function translatePiEvent(event: AgentEvent): HarnessEvent[] {
       }
       return [];
     }
+    case 'message_end': {
+      // Coalesce all token deltas from this assistant message into a
+      // single harness-shaped `assistant` event with text blocks. The
+      // partial_message events above are only useful for token-level
+      // stdout streaming; without this consolidation the consumer
+      // emits one job-event per delta and the activity log fills up
+      // with hundreds of one-word "say" entries.
+      const msg: any = (event as any).message;
+      if (!msg || !Array.isArray(msg.content)) return [];
+      const harnessContent: Array<{ type: 'text'; text: string }> = [];
+      for (const block of msg.content) {
+        if (block?.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
+          harnessContent.push({ type: 'text', text: block.text });
+        }
+        // tool_use blocks already surfaced via tool_execution_start —
+        // don't re-emit them here or we'd double-count tool calls.
+      }
+      if (harnessContent.length === 0) return [];
+      return [{ type: 'assistant', message: { content: harnessContent } }];
+    }
     case 'tool_execution_start': {
       return [{
         type: 'assistant',
