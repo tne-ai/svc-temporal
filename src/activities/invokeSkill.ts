@@ -30,7 +30,7 @@ import { emitEvent, emitJobEvent } from './emitEvent.js';
 import { pushWorkspaceToS3 } from './workspaceSync.js';
 import { fetchUserProviderKey } from '../lib/fetchUserProviderKey.js';
 import { ensureSkillsInWorkspace } from './setupSkills.js';
-import { PiAgentSession, isPiAgentEnabled, normalizeModelForLitellm } from '../services/piAgentAdapter.js';
+import { PiAgentSession, isPiAgentEnabled, isLiteLLMProxyEnabled, getLiteLLMBaseURL, normalizeModelForLitellm } from '../services/piAgentAdapter.js';
 import { buildPiTools } from '../services/piAgentTools.js';
 
 /** Extract a short text preview for message events (strip surrounding whitespace). */
@@ -330,7 +330,7 @@ async function invokeViaHarness(
   let piSession: PiAgentSession | null = null;
   try {
     const { createAgent } = await import('@tne-ai/agent-harness');
-    const resolvedModel = resolveModelId(model, 'agent');
+    let resolvedModel = resolveModelId(model, 'agent');
     const workspaceRoot = workspacePath || process.cwd();
     const cwd = context?.workingDir ? join(workspaceRoot, context.workingDir) : workspaceRoot;
     if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true });
@@ -358,7 +358,31 @@ async function invokeViaHarness(
       ? await fetchUserProviderKey(context.userId, byokProvider)
       : null;
 
-    if (isOpenRouterModel) {
+    // LiteLLM proxy routing — same pattern as orion's agentService.ts.
+    // When USE_LITELLM_PROXY is on, every upstream goes through the proxy
+    // as openai-completions; the proxy handles per-provider translation +
+    // auth via LITELLM_MASTER_KEY. Bypasses the BYOK / OAuth paths below.
+    const useLiteLLM = isLiteLLMProxyEnabled();
+    if (useLiteLLM) {
+      apiType = 'openai-completions';
+      baseURL = getLiteLLMBaseURL();
+      apiKey = process.env.LITELLM_MASTER_KEY?.trim();
+      // Translate to the proxy's flat alias scheme (or-* for OpenRouter
+      // upstreams; bare ids for direct Anthropic / OpenAI / Gemini).
+      resolvedModel = normalizeModelForLitellm(byokProvider, resolvedModel);
+      if (!apiKey) {
+        console.warn(
+          '[invokeViaHarness] USE_LITELLM_PROXY=true but LITELLM_MASTER_KEY is unset — request will fail',
+          { baseURL, model: resolvedModel },
+        );
+      } else {
+        console.log('[invokeViaHarness] routing through LiteLLM proxy', {
+          baseURL,
+          model: resolvedModel,
+          upstream: byokProvider,
+        });
+      }
+    } else if (isOpenRouterModel) {
       apiType = 'openai-completions';
       baseURL = 'https://openrouter.ai/api/v1';
       apiKey = byokKey || process.env.OPENROUTER_API_KEY?.trim();

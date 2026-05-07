@@ -474,6 +474,18 @@ export function isPiAgentEnabled(): boolean {
   return v === 'true' || v === '1' || v === 'yes';
 }
 
+/** True when USE_LITELLM_PROXY env flag is on — same surface as orion. */
+export function isLiteLLMProxyEnabled(): boolean {
+  const v = (process.env.USE_LITELLM_PROXY || '').toLowerCase();
+  return v === 'true' || v === '1' || v === 'yes';
+}
+
+/** Build the LiteLLM v1 base URL from LITELLM_PROXY_URL with a sane default. */
+export function getLiteLLMBaseURL(): string {
+  const raw = process.env.LITELLM_PROXY_URL || 'http://litellm:4000';
+  return `${raw.replace(/\/+$/, '')}/v1`;
+}
+
 /**
  * Normalize a model id into the alias the LiteLLM proxy's model_list
  * recognises. Shared by every code path that targets LiteLLM (Pi adapter,
