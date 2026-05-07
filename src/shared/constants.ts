@@ -68,8 +68,13 @@ export const CONTINUE_AS_NEW_INTERVAL = 5;
 /** Default model for evaluator steps */
 export const DEFAULT_EVALUATOR_MODEL = 'claude-haiku-4-5-20251001';
 
-/** Default model for generator steps */
-export const DEFAULT_GENERATOR_MODEL = 'claude-sonnet-4-20250514';
+/** Default model for generator steps. Must be an alias the LiteLLM
+ *  proxy's model_list recognizes (see orion/litellm/config.template.yaml).
+ *  `claude-sonnet-4-20250514` is no longer in the catalog — that was
+ *  the source of every "Pi suspected silent failure" the temporal
+ *  worker hit on default-model jobs: the proxy 400'd "Invalid model
+ *  name" and Pi swallowed the error. */
+export const DEFAULT_GENERATOR_MODEL = 'claude-sonnet-4-5-20250929';
 
 /** Default model for preamble/postamble steps */
 export const DEFAULT_SUPPORT_MODEL = 'claude-haiku-4-5-20251001';

@@ -203,6 +203,31 @@ function translatePiEvent(event: AgentEvent): HarnessEvent[] {
       }];
     }
     case 'agent_end': {
+      // Pi swallows API failures internally — `handleRunFailure` pushes a
+      // synthesized assistant message with an `errorMessage` field and
+      // emits `agent_end` instead of throwing. So our .catch() on
+      // agent.prompt() never fires for upstream errors. Inspect the
+      // event's messages for that failure marker and surface it as a
+      // harness-style error result, with the error text also emitted as
+      // assistant content so the consumer's stdout / SSE stream gets
+      // the actual reason instead of zero tokens + "silent failure".
+      const messages: any[] = Array.isArray((event as any).messages) ? (event as any).messages : [];
+      const failureMsg = messages.find((m) => typeof m?.errorMessage === 'string' && m.errorMessage.length > 0);
+      if (failureMsg) {
+        const detail = String(failureMsg.errorMessage);
+        const summary = summariseUpstreamError({ message: detail });
+        return [
+          {
+            type: 'assistant',
+            message: { content: [{ type: 'text', text: summary }] },
+          },
+          // Stuff the raw detail onto the result so the consumer's
+          // `(ev as any).error || .message || .subtype` extraction
+          // surfaces the real cause in `harnessError` instead of just
+          // the literal string "error".
+          { type: 'result', subtype: 'error', is_error: true, error: detail } as any,
+        ];
+      }
       return [{ type: 'result' }];
     }
     default:
