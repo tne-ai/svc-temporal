@@ -380,4 +380,4 @@ export interface FileConflict {
   localModified?: string;
 }
 
-export type AgentBackend = 'harness' | 'claude-agent-sdk' | 'claude-cli' | 'http';
+export type AgentBackend = 'auto' | 'harness' | 'claude-agent-sdk' | 'claude-cli' | 'http';

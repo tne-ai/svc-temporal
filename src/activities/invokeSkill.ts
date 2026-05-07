@@ -944,11 +944,37 @@ async function invokeViaClaudeAgentSDK(
 }
 
 /**
+ * Decide whether a model id should route through Claude Agent SDK or
+ * the harness/Pi path. Mirrors orion's split: Anthropic models stay on
+ * the SDK (real OAuth + cache + workspace context), everything else
+ * goes through Pi/LiteLLM. The shape we look at is the model id —
+ * `claude-*` is Anthropic-direct; vendor/slug or non-claude bare ids
+ * are non-Anthropic.
+ *
+ * Used only when AGENT_BACKEND='auto'.
+ */
+function pickBackendByModel(model?: string): 'harness' | 'claude-agent-sdk' {
+  const id = (model || '').trim();
+  if (!id) return 'claude-agent-sdk';   // unspecified → default to SDK
+  // Vendor-prefixed slug → non-Anthropic upstream → harness/Pi.
+  if (id.includes('/')) return 'harness';
+  // Bare Anthropic id (claude-opus-4-7, claude-sonnet-4-5-20250929,
+  // claude-haiku-4-5, etc.) → SDK.
+  if (id.startsWith('claude-')) return 'claude-agent-sdk';
+  // Anything else (gpt-*, gemini-*, kimi-*, ...) → harness/Pi.
+  return 'harness';
+}
+
+/**
  * Invoke a skill using the specified or configured backend.
  *
  * Backend selection priority:
  * 1. Per-request agentBackend parameter (from workflow input)
- * 2. AGENT_BACKEND env var — 'harness' | 'claude-agent-sdk' | 'claude-cli'
+ * 2. AGENT_BACKEND env var — 'auto' | 'harness' | 'claude-agent-sdk' | 'claude-cli'
+ *
+ * `auto` is the orion-style split: Anthropic models go to the Claude
+ * Agent SDK, everything else goes to invokeViaHarness (which itself
+ * routes through Pi + LiteLLM when those flags are on).
  */
 export async function invokeSkill(
   step: Step,
@@ -957,8 +983,14 @@ export async function invokeSkill(
   agentBackend?: AgentBackend,
   context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; workingDir?: string },
 ): Promise<InvocationResult> {
-  const backend = agentBackend || AGENT_BACKEND;
-  console.log(`[invokeSkill] backend=${backend}, skill=${step.skill}, model=${step.model || 'default'}, parentRunId=${context?.parentRunId || ''}`);
+  const requestedBackend = agentBackend || AGENT_BACKEND;
+  const backend = requestedBackend === 'auto'
+    ? pickBackendByModel(step.model)
+    : requestedBackend;
+  console.log(
+    `[invokeSkill] backend=${backend}${requestedBackend === 'auto' ? ' (auto)' : ''}, ` +
+    `skill=${step.skill}, model=${step.model || 'default'}, parentRunId=${context?.parentRunId || ''}`,
+  );
 
   // Thread step identity into the inner invocation so the harness/SDK paths can
   // stamp `stepNumber` + `skill` onto the `token_update` event they emit from
