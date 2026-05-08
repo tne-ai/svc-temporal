@@ -387,10 +387,20 @@ async function invokeViaHarness(
       baseURL = 'https://openrouter.ai/api/v1';
       apiKey = byokKey || process.env.OPENROUTER_API_KEY?.trim();
       if (!apiKey) {
-        console.warn(
-          '[invokeViaHarness] model looks like an OpenRouter slug but no API key (BYOK or OPENROUTER_API_KEY) is available; the call will fail',
-          { model: resolvedModel, userId: context?.userId },
-        );
+        // Fail fast with a useful message instead of letting the harness
+        // call OpenRouter with no Authorization header. Without this, OR
+        // 401s and the harness emits a result event with subtype:'error'
+        // and no detail field — the user sees the opaque "harness errored:
+        // error" with nothing to act on.
+        return {
+          success: false,
+          stdout: '',
+          stderr:
+            `harness aborted: no OpenRouter credentials available for model "${resolvedModel}". ` +
+            `Either save a BYOK OpenRouter key on the user's profile, or set OPENROUTER_API_KEY ` +
+            `in svc-temporal's deployment env (envFrom: openrouter-secrets).`,
+          exitCode: 1,
+        };
       } else if (byokKey) {
         console.log('[invokeViaHarness] using BYOK OpenRouter key', { userId: context?.userId });
       }
@@ -546,17 +556,30 @@ async function invokeViaHarness(
         // why — the actual reason was buried in a result event we
         // ignored.
         if ((ev as any).is_error === true || (typeof ev.subtype === 'string' && ev.subtype.includes('error'))) {
-          const detail =
+          const rawDetail =
             (ev as any).error ||
             (ev as any).message ||
             (ev as any).subtype ||
             'unknown harness error';
-          harnessError = `harness errored: ${detail}`;
+          // The harness sometimes emits {subtype:'error'} with no error/
+          // message field — that produced the unhelpful "harness errored:
+          // error" message in production. Tack on enough context for the
+          // user to act on (model + provider + apiKey-presence), and a
+          // hint at the most likely cause when the detail is opaque.
+          const looksOpaque = rawDetail === 'error' || rawDetail === 'unknown harness error';
+          const ctx = ` (model=${resolvedModel}, provider=${byokProvider}, apiKey=${apiKey ? 'set' : 'missing'}${baseURL ? `, baseURL=${baseURL}` : ''})`;
+          const hint = looksOpaque
+            ? ' — likely an upstream auth failure (401), unknown model id (404), or rate limit. Check the worker logs for the underlying provider response.'
+            : '';
+          harnessError = `harness errored: ${rawDetail}${ctx}${hint}`;
           console.warn('[invokeViaHarness] harness reported error in result event', {
             model: resolvedModel,
+            provider: byokProvider,
+            baseURL,
+            apiKeyPresent: !!apiKey,
             subtype: (ev as any).subtype,
             isError: (ev as any).is_error,
-            error: detail,
+            error: rawDetail,
           });
         }
       } else if (ev.type === 'assistant' && (ev as any).message?.content) {
