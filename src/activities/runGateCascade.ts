@@ -25,15 +25,13 @@
  *   - bound the gate model to the user's chat/step model selection,
  *     which made gates run on Kimi when the user picked Kimi
  *
- * We now invoke the agent-harness in-process for gates. The gate model
- * is fixed (env GATE_MODEL, default `claude-haiku-4-5-20251001`) so the
- * user's step model choice doesn't affect validation. The harness picks
- * up auth from env (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY) the
- * same way step invocations do — the worker is always running on
- * Claude/our harness, OAuth-vs-API-key is handled there, no CLI
- * dependency.
+ * We now invoke the Claude Agent SDK in-process for gates. The gate
+ * model is fixed (env GATE_MODEL, default `claude-haiku-4-5-20251001`)
+ * so the user's step model choice doesn't affect validation. The SDK
+ * picks up auth from env (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY)
+ * the same way step invocations do — no CLI dependency.
  *
- * Errors thrown by the harness (network, init, auth) are surfaced as
+ * Errors thrown by the SDK (network, init, auth) are surfaced as
  * `error: 'infrastructure'` results so the cascade can short-circuit
  * remaining gates and tell executeStep to skip retries.
  */
@@ -274,23 +272,33 @@ async function invokeHarnessGate(
   ctx?: GateContext,
 ): Promise<GateResult> {
   try {
-    const { createAgent } = await import('@tne-ai/agent-harness');
-    const apiKey = process.env.ANTHROPIC_API_KEY?.trim();
-
-    const agent = createAgent({
-      apiType: 'anthropic-messages',
+    // Gate evaluation runs through the Claude Agent SDK directly — we
+    // only need a single-turn evaluation, with the Read tool available
+    // so the gate can inspect the step's output file. Auth comes from
+    // the worker env (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN), the
+    // same way step invocations resolve it.
+    const { createClaudeSDKAgent } = await import('../services/claudeSdkAgent.js');
+    const agent = createClaudeSDKAgent({
       model: GATE_MODEL,
       cwd: ctx?.workspacePath || process.cwd(),
       permissionMode: 'bypassPermissions',
       maxTurns: GATE_MAX_TURNS,
-      // Gates only need to read the output file. Restricting tools keeps
-      // a misbehaving model from doing anything unexpected.
       allowedTools: ['Read'],
-      ...(apiKey ? { apiKey } : {}),
     });
 
-    const result = await agent.prompt(prompt + JSON_SUFFIX);
-    const text = result.text || '';
+    let text = '';
+    for await (const event of agent.query(prompt + JSON_SUFFIX)) {
+      const ev = event as any;
+      if (ev?.type === 'assistant' && Array.isArray(ev.message?.content)) {
+        for (const block of ev.message.content) {
+          if (block?.type === 'text' && typeof block.text === 'string') text += block.text;
+        }
+      } else if (ev?.type === 'result' && typeof ev.result === 'string' && !text) {
+        // Some flows set the final text on the result event rather than
+        // an assistant block. Use it as a fallback.
+        text = ev.result;
+      }
+    }
 
     const parsed = extractJson(text);
     if (!parsed) {
@@ -310,8 +318,8 @@ async function invokeHarnessGate(
       score: typeof parsed['score'] === 'number' ? parsed['score'] : undefined,
     };
   } catch (err: any) {
-    // Anything that throws from createAgent / agent.prompt is treated as
-    // an infrastructure problem: harness couldn't initialize, network
+    // Anything thrown from createClaudeSDKAgent / query is treated as
+    // an infrastructure problem: SDK couldn't initialize, network
     // error, auth rejection, model not reachable, etc. None of these
     // get better by retrying the step.
     const msg = err?.message || String(err);
