@@ -3,9 +3,14 @@
  *
  * Ported from tne-plugins/plugins/tne/engine/invoker.py.
  *
- * - agent-harness (default): @tne-ai/agent-harness streaming agent
- * - claude-agent-sdk: @anthropic-ai/claude-agent-sdk via agent-harness wrapper
- * - claude-cli: `claude -p` subprocess
+ * - pi             (formerly 'harness'): non-Anthropic streaming via Pi
+ * - claude-agent-sdk: @anthropic-ai/claude-agent-sdk
+ * - claude-cli:     `claude -p` subprocess
+ *
+ * Note: the dispatcher still accepts `'harness'` as a backend name to
+ * avoid breaking workflows / env vars that pin it explicitly. After the
+ * agent-harness package was retired we routed that case through Pi
+ * instead — same external surface, no harness dependency.
  */
 
 import { spawn } from 'child_process';
@@ -15,7 +20,7 @@ import { heartbeat } from '@temporalio/activity';
 import {
   createClaudeSDKAgent,
   resolveModelId,
-} from '@tne-ai/agent-harness';
+} from '../services/claudeSdkAgent.js';
 import {
   FSM_INVOKE_SECRET,
   SKILL_INVOCATION_TIMEOUT_MS,
@@ -315,12 +320,21 @@ function isOnlySessionEndHookError(stderr: string): boolean {
 }
 
 /**
- * Invoke a skill via the @tne-ai/agent-harness streaming agent.
+ * Invoke a skill via Pi (@mariozechner/pi-agent-core) for non-Anthropic
+ * upstreams (OpenRouter, OpenAI, Gemini, anything via LiteLLM proxy).
+ *
+ * Anthropic-direct invocations don't go through here — they take the
+ * `claude-agent-sdk` path via invokeViaClaudeAgentSDK, which natively
+ * understands Claude Max OAuth (CLAUDE_CODE_OAUTH_TOKEN) and the
+ * Claude Code tool loop.
+ *
+ * Function name retained as `invokeViaHarness` only to keep the
+ * dispatcher contract stable — see comment on the top of file.
  */
 async function invokeViaHarness(
   prompt: string,
   model?: string,
-  permissionMode?: string,
+  _permissionMode?: string,
   workspacePath?: string,
   context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string },
 ): Promise<InvocationResult> {
@@ -329,21 +343,18 @@ async function invokeViaHarness(
   // dispose it even if the body throws partway through.
   let piSession: PiAgentSession | null = null;
   try {
-    const { createAgent } = await import('@tne-ai/agent-harness');
-    let resolvedModel = resolveModelId(model, 'agent');
+    let resolvedModel = resolveModelId(model);
     const workspaceRoot = workspacePath || process.cwd();
     const cwd = context?.workingDir ? join(workspaceRoot, context.workingDir) : workspaceRoot;
     if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true });
     try { await ensureSkillsInWorkspace(cwd); } catch (err: any) {
-      console.warn('[invokeViaHarness] ensureSkillsInWorkspace failed:', err?.message);
+      console.warn('[invokeViaPi] ensureSkillsInWorkspace failed:', err?.message);
     }
-    // Provider routing. The agent-harness defaults to Anthropic's API; without
-    // explicit apiType / baseURL it ignores OpenRouter slugs and silently
-    // returns 0 tokens (api.anthropic.com 404s on `moonshotai/kimi-k2.6`).
-    // Detect non-Anthropic models by their slug shape (`vendor/model`) and
-    // wire OpenRouter the same way orion's agentService does. This was the
-    // reason p-debug1-three-words via Kimi looked like it succeeded but
-    // wrote nothing: the LLM call never actually happened.
+    // Provider routing. Pi requires an explicit apiType / baseURL — by
+    // default it would treat the model as anthropic-messages and call
+    // api.anthropic.com, which 404s on `moonshotai/kimi-k2.6`. Detect
+    // non-Anthropic models by their slug shape (`vendor/model`) and
+    // wire OpenRouter the same way orion's agentService does.
     const isOpenRouterModel = !!resolvedModel && resolvedModel.includes('/');
     let apiType: 'anthropic-messages' | 'openai-completions' = 'anthropic-messages';
     let baseURL: string | undefined;
@@ -372,11 +383,11 @@ async function invokeViaHarness(
       resolvedModel = normalizeModelForLitellm(byokProvider, resolvedModel);
       if (!apiKey) {
         console.warn(
-          '[invokeViaHarness] USE_LITELLM_PROXY=true but LITELLM_MASTER_KEY is unset — request will fail',
+          '[invokeViaPi] USE_LITELLM_PROXY=true but LITELLM_MASTER_KEY is unset — request will fail',
           { baseURL, model: resolvedModel },
         );
       } else {
-        console.log('[invokeViaHarness] routing through LiteLLM proxy', {
+        console.log('[invokeViaPi] routing through LiteLLM proxy', {
           baseURL,
           model: resolvedModel,
           upstream: byokProvider,
@@ -387,76 +398,74 @@ async function invokeViaHarness(
       baseURL = 'https://openrouter.ai/api/v1';
       apiKey = byokKey || process.env.OPENROUTER_API_KEY?.trim();
       if (!apiKey) {
-        // Fail fast with a useful message instead of letting the harness
-        // call OpenRouter with no Authorization header. Without this, OR
-        // 401s and the harness emits a result event with subtype:'error'
-        // and no detail field — the user sees the opaque "harness errored:
-        // error" with nothing to act on.
         return {
           success: false,
           stdout: '',
           stderr:
-            `harness aborted: no OpenRouter credentials available for model "${resolvedModel}". ` +
+            `invokeViaPi aborted: no OpenRouter credentials available for model "${resolvedModel}". ` +
             `Either save a BYOK OpenRouter key on the user's profile, or set OPENROUTER_API_KEY ` +
             `in svc-temporal's deployment env (envFrom: openrouter-secrets).`,
           exitCode: 1,
         };
       } else if (byokKey) {
-        console.log('[invokeViaHarness] using BYOK OpenRouter key', { userId: context?.userId });
+        console.log('[invokeViaPi] using BYOK OpenRouter key', { userId: context?.userId });
       }
     } else {
-      // BYOK Anthropic key wins; otherwise the env API key; otherwise the
-      // OAuth token flows via env (CLAUDE_CODE_OAUTH_TOKEN).
+      // Anthropic via the Pi path — only used when AGENT_BACKEND is
+      // forced to 'harness' for an Anthropic model. Auto routing sends
+      // Anthropic to invokeViaClaudeAgentSDK, which is the path that
+      // understands Claude Max OAuth. Pi expects an apiKey, so without
+      // a BYOK / env API key we fail fast — OAuth-via-env was a
+      // harness-only fallback we no longer support on this path.
       apiKey = byokKey || process.env.ANTHROPIC_API_KEY?.trim();
       if (byokKey) {
-        console.log('[invokeViaHarness] using BYOK Anthropic key', { userId: context?.userId });
+        console.log('[invokeViaPi] using BYOK Anthropic key', { userId: context?.userId });
+      }
+      if (!apiKey) {
+        return {
+          success: false,
+          stdout: '',
+          stderr:
+            `invokeViaPi aborted: no Anthropic API key available for model "${resolvedModel}". ` +
+            `For Claude Max OAuth (CLAUDE_CODE_OAUTH_TOKEN), set AGENT_BACKEND=auto so the ` +
+            `claude-agent-sdk path handles the request, or save a BYOK Anthropic key.`,
+          exitCode: 1,
+        };
       }
     }
-    // Pi agent path — gated by USE_PI_AGENT and only when we have an
-    // explicit apiKey. The harness has fallback paths for OAuth-via-env
-    // that Pi doesn't replicate, so without a key we stay on harness.
-    // Pi yields harness-shaped events through the adapter; the consumer
-    // loop below handles both shapes.
-    const usePi = isPiAgentEnabled() && !!apiKey;
-    let agent: { query: (prompt: string) => AsyncIterable<any> };
-    if (usePi) {
-      const piTools = buildPiTools(cwd, { sessionKey: context?.parentRunId || cwd });
-      const piModel = normalizeModelForLitellm(byokProvider, resolvedModel);
-      console.log('[invokeViaHarness] using Pi agent', {
-        model: piModel,
-        apiType,
-        provider: byokProvider,
-        toolCount: piTools.length,
-      });
-      piSession = new PiAgentSession({
-        apiType,
-        model: piModel,
-        apiKey: apiKey!,
-        baseURL,
-        cwd,
-        systemPrompt:
-          'You are a skill execution agent running inside a temporal worker. ' +
-          'Use the provided tools (Read/Write/Edit/Bash/Glob/Grep) to accomplish the task in the workspace. ' +
-          'Files written or edited will be synced to S3 after the run completes.',
-        tools: piTools,
-        maxTokens: 16384,
-        provider: byokProvider,
-      });
-      const session = piSession;
-      agent = { query: (p: string) => session.query(p) };
-    } else {
-      agent = createAgent({
-        apiType,
-        model: resolvedModel,
-        cwd,
-        permissionMode: (permissionMode as any) || 'bypassPermissions',
-        // FSM steps can legitimately need many tool rounds (read/grep/edit/write
-        // across a big workspace, plus nested skill invocations). 30 was too tight.
-        maxTurns: 200,
-        ...(baseURL ? { baseURL } : {}),
-        ...(apiKey ? { apiKey } : {}),
-      });
+    // Pi requires explicit apiKey + tools. With the harness retired
+    // there is no longer a fallback path — every call goes through Pi
+    // here. The adapter emits harness-shaped events so the existing
+    // consumer loop below works unchanged.
+    if (!isPiAgentEnabled()) {
+      console.warn('[invokeViaPi] USE_PI_AGENT is unset — enabling implicitly (harness backend retired)');
     }
+    const piTools = buildPiTools(cwd, { sessionKey: context?.parentRunId || cwd });
+    const piModel = normalizeModelForLitellm(byokProvider, resolvedModel);
+    console.log('[invokeViaPi] using Pi agent', {
+      model: piModel,
+      apiType,
+      provider: byokProvider,
+      toolCount: piTools.length,
+    });
+    piSession = new PiAgentSession({
+      apiType,
+      model: piModel,
+      apiKey: apiKey!,
+      baseURL,
+      cwd,
+      systemPrompt:
+        'You are a skill execution agent running inside a temporal worker. ' +
+        'Use the provided tools (Read/Write/Edit/Bash/Glob/Grep) to accomplish the task in the workspace. ' +
+        'Files written or edited will be synced to S3 after the run completes.',
+      tools: piTools,
+      maxTokens: 16384,
+      provider: byokProvider,
+    });
+    const session = piSession;
+    const agent: { query: (prompt: string) => AsyncIterable<any> } = {
+      query: (p: string) => session.query(p),
+    };
 
     let stdout = '';
     let lastHeartbeat = Date.now();
@@ -571,8 +580,8 @@ async function invokeViaHarness(
           const hint = looksOpaque
             ? ' — likely an upstream auth failure (401), unknown model id (404), or rate limit. Check the worker logs for the underlying provider response.'
             : '';
-          harnessError = `harness errored: ${rawDetail}${ctx}${hint}`;
-          console.warn('[invokeViaHarness] harness reported error in result event', {
+          harnessError = `pi errored: ${rawDetail}${ctx}${hint}`;
+          console.warn('[invokeViaPi] Pi reported error in result event', {
             model: resolvedModel,
             provider: byokProvider,
             baseURL,
@@ -594,11 +603,11 @@ async function invokeViaHarness(
       }
     }
 
-    // Surface harness-level failures up to executeStep so step_failed
+    // Surface Pi-level failures up to executeStep so step_failed
     // includes a useful diagnostic. Three escalating signals:
-    //   1. explicit harness `is_error` / error subtype  → propagate verbatim
-    //   2. zero tokens AND no tool uses                 → almost always a
-    //      silent provider failure (bad auth, missing OPENROUTER_API_KEY,
+    //   1. explicit `is_error` / error subtype on a result event → propagate verbatim
+    //   2. zero tokens AND no tool uses → almost always a silent
+    //      provider failure (bad auth, missing OPENROUTER_API_KEY,
     //      404 on a non-existent model slug). Hint at the most likely
     //      cause based on the model shape.
     //   3. otherwise: real success
@@ -609,13 +618,11 @@ async function invokeViaHarness(
       const isOR = !!resolvedModel && resolvedModel.includes('/');
       const orHint = isOR
         ? ` (OpenRouter slug — check OPENROUTER_API_KEY is set in svc-temporal's env and that "${resolvedModel}" is a valid OR model id)`
-        : ' (Anthropic backend — check ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN)';
-      const backendHint = usePi ? ' (Pi adapter)' : '';
-      const detail = `harness returned 0 tokens and made no tool calls${backendHint} — the LLM call almost certainly failed silently${orHint}`;
-      console.warn('[invokeViaHarness] suspected silent failure', {
+        : ' (Anthropic via Pi — check ANTHROPIC_API_KEY)';
+      const detail = `pi returned 0 tokens and made no tool calls — the LLM call almost certainly failed silently${orHint}`;
+      console.warn('[invokeViaPi] suspected silent failure', {
         model: resolvedModel,
         isOpenRouterModel: isOR,
-        backend: usePi ? 'pi' : 'harness',
       });
       return { success: false, stdout, stderr: detail, exitCode: 1 };
     }
@@ -655,23 +662,24 @@ function buildNestedFsmHooks(
         matcher: 'Bash',
         hooks: [
           async (input: any) => {
-            // The agent-harness passes hook inputs as { toolName, toolInput,
-            // … } in camelCase (see node_modules/@tne-ai/agent-harness/src/
-            // engine.ts:561). The SDK path uses snake_case tool_input.
-            // Read both shapes so this works in either runtime.
+            // Hook input shape varies by runtime: the Claude Code SDK
+            // path uses snake_case tool_input, while Pi (and the
+            // retired harness) used camelCase toolInput. Read both
+            // shapes so this works in either runtime.
             //
-            // Before this fix, the snake_case-only read meant this hook
-            // had been a silent no-op on the harness path: every fsm-start
-            // bash command from inside a skill ran as a plain subprocess
-            // instead of being redirected to /api/fsm-invoke/start with
-            // parentRunId — so nested orchestrator child runs were never
-            // linked to their parent in the Job Tree / App Events views.
+            // Before the dual-shape read, the snake_case-only read
+            // meant this hook had been a silent no-op on the
+            // harness/Pi path: every fsm-start bash command from inside
+            // a skill ran as a plain subprocess instead of being
+            // redirected to /api/fsm-invoke/start with parentRunId —
+            // so nested orchestrator child runs were never linked to
+            // their parent in the Job Tree / App Events views.
             const inputToolInput = input?.toolInput || input?.tool_input || {};
             const buildOutput = (newCommand: string) => ({
               hookSpecificOutput: {
                 ...input,
-                // Set both shapes so the harness (camelCase) and SDK
-                // (snake_case) both pick up the rewritten command.
+                // Set both shapes so callers (camelCase or snake_case)
+                // both pick up the rewritten command.
                 toolInput: { ...inputToolInput, command: newCommand },
                 tool_input: { ...inputToolInput, command: newCommand },
               },
@@ -741,11 +749,11 @@ function buildNestedFsmHooks(
 /**
  * Invoke a skill via the official Claude Agent SDK.
  *
- * Uses @tne-ai/agent-harness's createClaudeSDKAgent() wrapper which provides:
+ * Uses our inline createClaudeSDKAgent() (services/claudeSdkAgent.ts)
+ * which is a thin wrapper over @anthropic-ai/claude-agent-sdk providing:
  * - Full tool support (Read, Write, Edit, Bash, Glob, Grep, WebSearch, etc.)
  * - System prompt from CLAUDE.md
  * - Extended thinking (16k budget)
- * - 1M context window
  * - bypassPermissions mode
  * - Model resolution (aliases → full IDs)
  */
@@ -755,7 +763,7 @@ async function invokeViaClaudeAgentSDK(
   workspacePath?: string,
   context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string },
 ): Promise<InvocationResult> {
-  const resolvedModel = resolveModelId(model, 'agent');
+  const resolvedModel = resolveModelId(model);
   const workspaceRoot = workspacePath || process.cwd();
   const cwd = context?.workingDir ? join(workspaceRoot, context.workingDir) : workspaceRoot;
 
