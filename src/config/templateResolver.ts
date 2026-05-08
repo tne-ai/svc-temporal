@@ -57,8 +57,15 @@ export function loadInputsVars(inputsFile: string): Record<string, string> {
 }
 
 /**
- * Replace `{{KEY}}` placeholders in text using vars.
+ * Replace `{{KEY}}` and `{KEY}` placeholders in text using vars.
  * `{{ITER}}` is intentionally left untouched for runtime substitution.
+ *
+ * Single-brace (`{KEY}`) is supported because skillParser.resolveVariables
+ * already substitutes both forms at parse time; executeStep needs to
+ * match for output-path resolution against runtime templateVars (e.g.
+ * the `{TNE-CONTEXT}` built-in stamped at workflow start). Without this
+ * symmetry the validator complains about a literal `{TNE-CONTEXT}`
+ * never being written to disk.
  */
 export function resolveTemplateVars(text: string, vars: Record<string, string>): string {
   if (!vars || !text) return text;
@@ -66,6 +73,7 @@ export function resolveTemplateVars(text: string, vars: Record<string, string>):
   for (const [key, value] of Object.entries(vars)) {
     if (key === 'ITER') continue;
     text = text.replaceAll(`{{${key}}}`, value);
+    text = text.replaceAll(`{${key}}`, value);
   }
 
   return text;

@@ -30,6 +30,8 @@ import { emitEvent, emitJobEvent } from './emitEvent.js';
 import { pushWorkspaceToS3 } from './workspaceSync.js';
 import { fetchUserProviderKey } from '../lib/fetchUserProviderKey.js';
 import { ensureSkillsInWorkspace } from './setupSkills.js';
+import { PiAgentSession, isPiAgentEnabled, isLiteLLMProxyEnabled, getLiteLLMBaseURL, normalizeModelForLitellm } from '../services/piAgentAdapter.js';
+import { buildPiTools } from '../services/piAgentTools.js';
 
 /** Extract a short text preview for message events (strip surrounding whitespace). */
 function previewText(text: string, max = 600): string {
@@ -323,9 +325,12 @@ async function invokeViaHarness(
   context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string },
 ): Promise<InvocationResult> {
   const stopSync = startPeriodicS3Sync(workspacePath || '', context?.s3Bucket, context?.s3Prefix, context?.parentRunId, context?.workingDir);
+  // Pi session captured in the outer scope so the finally block can
+  // dispose it even if the body throws partway through.
+  let piSession: PiAgentSession | null = null;
   try {
     const { createAgent } = await import('@tne-ai/agent-harness');
-    const resolvedModel = resolveModelId(model, 'agent');
+    let resolvedModel = resolveModelId(model, 'agent');
     const workspaceRoot = workspacePath || process.cwd();
     const cwd = context?.workingDir ? join(workspaceRoot, context.workingDir) : workspaceRoot;
     if (!existsSync(cwd)) mkdirSync(cwd, { recursive: true });
@@ -353,7 +358,31 @@ async function invokeViaHarness(
       ? await fetchUserProviderKey(context.userId, byokProvider)
       : null;
 
-    if (isOpenRouterModel) {
+    // LiteLLM proxy routing — same pattern as orion's agentService.ts.
+    // When USE_LITELLM_PROXY is on, every upstream goes through the proxy
+    // as openai-completions; the proxy handles per-provider translation +
+    // auth via LITELLM_MASTER_KEY. Bypasses the BYOK / OAuth paths below.
+    const useLiteLLM = isLiteLLMProxyEnabled();
+    if (useLiteLLM) {
+      apiType = 'openai-completions';
+      baseURL = getLiteLLMBaseURL();
+      apiKey = process.env.LITELLM_MASTER_KEY?.trim();
+      // Translate to the proxy's flat alias scheme (or-* for OpenRouter
+      // upstreams; bare ids for direct Anthropic / OpenAI / Gemini).
+      resolvedModel = normalizeModelForLitellm(byokProvider, resolvedModel);
+      if (!apiKey) {
+        console.warn(
+          '[invokeViaHarness] USE_LITELLM_PROXY=true but LITELLM_MASTER_KEY is unset — request will fail',
+          { baseURL, model: resolvedModel },
+        );
+      } else {
+        console.log('[invokeViaHarness] routing through LiteLLM proxy', {
+          baseURL,
+          model: resolvedModel,
+          upstream: byokProvider,
+        });
+      }
+    } else if (isOpenRouterModel) {
       apiType = 'openai-completions';
       baseURL = 'https://openrouter.ai/api/v1';
       apiKey = byokKey || process.env.OPENROUTER_API_KEY?.trim();
@@ -373,17 +402,51 @@ async function invokeViaHarness(
         console.log('[invokeViaHarness] using BYOK Anthropic key', { userId: context?.userId });
       }
     }
-    const agent = createAgent({
-      apiType,
-      model: resolvedModel,
-      cwd,
-      permissionMode: (permissionMode as any) || 'bypassPermissions',
-      // FSM steps can legitimately need many tool rounds (read/grep/edit/write
-      // across a big workspace, plus nested skill invocations). 30 was too tight.
-      maxTurns: 200,
-      ...(baseURL ? { baseURL } : {}),
-      ...(apiKey ? { apiKey } : {}),
-    });
+    // Pi agent path — gated by USE_PI_AGENT and only when we have an
+    // explicit apiKey. The harness has fallback paths for OAuth-via-env
+    // that Pi doesn't replicate, so without a key we stay on harness.
+    // Pi yields harness-shaped events through the adapter; the consumer
+    // loop below handles both shapes.
+    const usePi = isPiAgentEnabled() && !!apiKey;
+    let agent: { query: (prompt: string) => AsyncIterable<any> };
+    if (usePi) {
+      const piTools = buildPiTools(cwd, { sessionKey: context?.parentRunId || cwd });
+      const piModel = normalizeModelForLitellm(byokProvider, resolvedModel);
+      console.log('[invokeViaHarness] using Pi agent', {
+        model: piModel,
+        apiType,
+        provider: byokProvider,
+        toolCount: piTools.length,
+      });
+      piSession = new PiAgentSession({
+        apiType,
+        model: piModel,
+        apiKey: apiKey!,
+        baseURL,
+        cwd,
+        systemPrompt:
+          'You are a skill execution agent running inside a temporal worker. ' +
+          'Use the provided tools (Read/Write/Edit/Bash/Glob/Grep) to accomplish the task in the workspace. ' +
+          'Files written or edited will be synced to S3 after the run completes.',
+        tools: piTools,
+        maxTokens: 16384,
+        provider: byokProvider,
+      });
+      const session = piSession;
+      agent = { query: (p: string) => session.query(p) };
+    } else {
+      agent = createAgent({
+        apiType,
+        model: resolvedModel,
+        cwd,
+        permissionMode: (permissionMode as any) || 'bypassPermissions',
+        // FSM steps can legitimately need many tool rounds (read/grep/edit/write
+        // across a big workspace, plus nested skill invocations). 30 was too tight.
+        maxTurns: 200,
+        ...(baseURL ? { baseURL } : {}),
+        ...(apiKey ? { apiKey } : {}),
+      });
+    }
 
     let stdout = '';
     let lastHeartbeat = Date.now();
@@ -436,6 +499,25 @@ async function invokeViaHarness(
             });
           }
         }
+      } else if (ev.type === 'partial_message' && typeof ev.delta?.text === 'string') {
+        // Pi adapter path: streaming token deltas. We *don't* emit a job
+        // event per delta (the activity log would fill with hundreds of
+        // one-word entries — see the user's screenshot). Just track the
+        // signal that the model produced output. The full text gets
+        // emitted as a single coalesced `assistant` event on
+        // message_end, which the existing assistant-text handler above
+        // turns into one job-event message per assistant turn.
+        harnessSawAnyTokens = true;
+      } else if (ev.type === 'tool_result' && ev.result) {
+        // Pi adapter path: tool results arrive as top-level events rather
+        // than nested in a `user` message. Mirror the same job-event emit.
+        const r = ev.result;
+        emitJobEvent(jobId, 'tool_result', {
+          backend: 'harness',
+          toolUseId: r.tool_use_id,
+          output: previewText(String(r.output || '')),
+          isError: !!r.is_error,
+        });
       } else if (ev.type === 'result') {
         if (typeof ev.text === 'string') stdout += ev.text;
         // Surface token usage so the UI can render per-step spend. The harness
@@ -505,10 +587,12 @@ async function invokeViaHarness(
       const orHint = isOR
         ? ` (OpenRouter slug — check OPENROUTER_API_KEY is set in svc-temporal's env and that "${resolvedModel}" is a valid OR model id)`
         : ' (Anthropic backend — check ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN)';
-      const detail = `harness returned 0 tokens and made no tool calls — the LLM call almost certainly failed silently${orHint}`;
+      const backendHint = usePi ? ' (Pi adapter)' : '';
+      const detail = `harness returned 0 tokens and made no tool calls${backendHint} — the LLM call almost certainly failed silently${orHint}`;
       console.warn('[invokeViaHarness] suspected silent failure', {
         model: resolvedModel,
         isOpenRouterModel: isOR,
+        backend: usePi ? 'pi' : 'harness',
       });
       return { success: false, stdout, stderr: detail, exitCode: 1 };
     }
@@ -521,6 +605,9 @@ async function invokeViaHarness(
       exitCode: 1,
     };
   } finally {
+    // Pi sessions hold a long-lived Agent instance; harness's createAgent
+    // doesn't need explicit teardown. Either way, drain the periodic sync.
+    if (piSession) { try { piSession.dispose(); } catch {/* idempotent */} }
     await stopSync().catch(() => {});
   }
 }
@@ -854,11 +941,37 @@ async function invokeViaClaudeAgentSDK(
 }
 
 /**
+ * Decide whether a model id should route through Claude Agent SDK or
+ * the harness/Pi path. Mirrors orion's split: Anthropic models stay on
+ * the SDK (real OAuth + cache + workspace context), everything else
+ * goes through Pi/LiteLLM. The shape we look at is the model id —
+ * `claude-*` is Anthropic-direct; vendor/slug or non-claude bare ids
+ * are non-Anthropic.
+ *
+ * Used only when AGENT_BACKEND='auto'.
+ */
+function pickBackendByModel(model?: string): 'harness' | 'claude-agent-sdk' {
+  const id = (model || '').trim();
+  if (!id) return 'claude-agent-sdk';   // unspecified → default to SDK
+  // Vendor-prefixed slug → non-Anthropic upstream → harness/Pi.
+  if (id.includes('/')) return 'harness';
+  // Bare Anthropic id (claude-opus-4-7, claude-sonnet-4-5-20250929,
+  // claude-haiku-4-5, etc.) → SDK.
+  if (id.startsWith('claude-')) return 'claude-agent-sdk';
+  // Anything else (gpt-*, gemini-*, kimi-*, ...) → harness/Pi.
+  return 'harness';
+}
+
+/**
  * Invoke a skill using the specified or configured backend.
  *
  * Backend selection priority:
  * 1. Per-request agentBackend parameter (from workflow input)
- * 2. AGENT_BACKEND env var — 'harness' | 'claude-agent-sdk' | 'claude-cli'
+ * 2. AGENT_BACKEND env var — 'auto' | 'harness' | 'claude-agent-sdk' | 'claude-cli'
+ *
+ * `auto` is the orion-style split: Anthropic models go to the Claude
+ * Agent SDK, everything else goes to invokeViaHarness (which itself
+ * routes through Pi + LiteLLM when those flags are on).
  */
 export async function invokeSkill(
   step: Step,
@@ -867,8 +980,14 @@ export async function invokeSkill(
   agentBackend?: AgentBackend,
   context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; workingDir?: string },
 ): Promise<InvocationResult> {
-  const backend = agentBackend || AGENT_BACKEND;
-  console.log(`[invokeSkill] backend=${backend}, skill=${step.skill}, model=${step.model || 'default'}, parentRunId=${context?.parentRunId || ''}`);
+  const requestedBackend = agentBackend || AGENT_BACKEND;
+  const backend = requestedBackend === 'auto'
+    ? pickBackendByModel(step.model)
+    : requestedBackend;
+  console.log(
+    `[invokeSkill] backend=${backend}${requestedBackend === 'auto' ? ' (auto)' : ''}, ` +
+    `skill=${step.skill}, model=${step.model || 'default'}, parentRunId=${context?.parentRunId || ''}`,
+  );
 
   // Thread step identity into the inner invocation so the harness/SDK paths can
   // stamp `stepNumber` + `skill` onto the `token_update` event they emit from

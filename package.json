@@ -18,8 +18,12 @@
     "@temporalio/client": "^1.16.0",
     "@temporalio/worker": "^1.16.0",
     "@temporalio/workflow": "^1.16.0",
+    "@mariozechner/pi-agent-core": "^0.73.0",
+    "@mariozechner/pi-ai": "^0.73.0",
     "@tne-ai/agent-harness": "git+https://github.com/tne-ai/agent-harness.git#6e50ef40df7b1b7e616eadfbcf7e2348a1daca6f",
     "dotenv": "^17.4.2",
+    "glob": "^10.5.0",
+    "typebox": "^1.1.38",
     "yaml": "^2.8.3"
   },
   "devDependencies": {
