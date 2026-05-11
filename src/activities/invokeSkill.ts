@@ -441,12 +441,22 @@ async function invokeViaHarness(
       console.warn('[invokeViaPi] USE_PI_AGENT is unset — enabling implicitly (harness backend retired)');
     }
     const piTools = buildPiTools(cwd, { sessionKey: context?.parentRunId || cwd });
-    const piModel = normalizeModelForLitellm(byokProvider, resolvedModel);
+    // `resolvedModel` was already normalized for the LiteLLM branch
+    // above (line ~383) if proxy mode is on. For direct upstreams
+    // (OpenRouter / Anthropic) we need to pass the model id the
+    // upstream expects — e.g. `moonshotai/kimi-k2.6` for OpenRouter,
+    // not LiteLLM's `or-kimi-k2.6` alias. Previously we were calling
+    // `normalizeModelForLitellm` here unconditionally, which broke
+    // direct-to-OpenRouter calls with "400 or-kimi-k2.6 is not a
+    // valid model id".
+    const piModel = resolvedModel;
     console.log('[invokeViaPi] using Pi agent', {
       model: piModel,
       apiType,
       provider: byokProvider,
       toolCount: piTools.length,
+      baseURL,
+      useLiteLLM,
     });
     piSession = new PiAgentSession({
       apiType,
