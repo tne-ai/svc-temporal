@@ -1027,6 +1027,27 @@ function pickBackendByModel(model?: string): 'harness' | 'claude-agent-sdk' {
 }
 
 /**
+ * Extract the `mode` value from a Step's Inputs or Notes column.
+ *
+ * Inputs convention (e.g. p-jpm-retry-lens): a token "mode=<value>" in step.inputs[].
+ * Notes convention (used by p-jpm-eval/feedback/revise/chair): a substring "mode=<value>"
+ *   inside step.notes, separated by whitespace/comma/semicolon (or at string start).
+ *
+ * Inputs wins on tie. Returns undefined when neither is present, or when the value
+ * uses unresolved template-var syntax like `mode={{MODE}}` (the character class
+ * [A-Za-z0-9_]+ matches literal mode tokens only). The {{MODE}}-style retry path
+ * is fixed via PR B SOP cleanup (standardize to literal mode tokens).
+ *
+ * Exported for unit testing — production callers should use it via the inline
+ * call in invokeSkill().
+ */
+export function extractStepMode(step: { inputs?: string[]; notes?: string }): string | undefined {
+  const modeFromInputs = step.inputs?.find(i => i.startsWith('mode='))?.split('=')[1];
+  const modeFromNotes = step.notes?.match(/(?:^|[\s,;])mode=([A-Za-z0-9_]+)/)?.[1];
+  return modeFromInputs || modeFromNotes || undefined;
+}
+
+/**
  * Invoke a skill using the specified or configured backend.
  *
  * Backend selection priority:
@@ -1068,14 +1089,9 @@ export async function invokeSkill(
   // it). For Pi/subprocess paths we log loudly so silent enforcement loss is
   // visible — the most common cause is a user-level delegate model override
   // pointing schema-bearing skills at a non-Anthropic upstream.
-  // Pass mode (when present) so the loader can dispatch on output_schemas (plural)
-  // for mode-dispatched skills like jpm-lens-* and jpm-chair. Mode can arrive
-  // either in step.inputs as a token "mode=evaluate" (SOP-Inputs convention,
-  // e.g. p-jpm-retry-lens) OR in step.notes as a free-text fragment "mode=evaluate"
-  // (SOP-Notes convention, used by p-jpm-eval/feedback/revise/chair).
-  const modeFromInputs = step.inputs?.find(i => i.startsWith('mode='))?.split('=')[1];
-  const modeFromNotes = step.notes?.match(/(?:^|[\s,;])mode=([A-Za-z0-9_]+)/)?.[1];
-  const mode = modeFromInputs || modeFromNotes || undefined;
+  // Pass mode (when present) so the loader can dispatch on output_schemas (plural).
+  // See extractStepMode() above for the Inputs vs Notes conventions.
+  const mode = extractStepMode(step);
   const leafSchema = loadLeafSkillSchema(step.skill, mode);
   if (leafSchema && backend === 'claude-agent-sdk') {
     console.log(`[invokeSkill] schema loaded for skill='${step.skill}' from ${leafSchema.schemaPath}`);
