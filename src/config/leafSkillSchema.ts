@@ -79,14 +79,33 @@ export interface LoadedLeafSchema {
 /**
  * Look up a leaf skill by name and load its output JSON Schema if declared.
  *
+ * Frontmatter shapes supported:
+ *   - `output_schema_path: ./output.schema.json`        — singular, mode-agnostic
+ *   - `output_schemas:`                                  — plural, mode-keyed
+ *       evaluate: ../jpm-shared/schemas/lensEvaluate.json
+ *       feedback: ../jpm-shared/schemas/lensFeedback.json
+ *       revise:   ../jpm-shared/schemas/lensRevise.json
+ *
+ * When the plural shape is declared, the caller must pass `mode` (matching one
+ * of the map keys) to disambiguate which schema to load. Mode is typically the
+ * skill's `mode` input variable, plumbed by invokeSkill.ts.
+ *
  * Returns null when:
- *   - The leaf skill isn't found in any plugin (caller should not error;
- *     not every step has a schema-bearing leaf — many are write-a-file
- *     style and run fine without one)
- *   - The skill has no `output_schema_path` frontmatter field
- *   - The schema file is missing or unparseable (logs a warning)
+ *   - The leaf skill isn't found in any plugin (not every step has a
+ *     schema-bearing leaf — many are write-a-file style and run fine
+ *     without one)
+ *   - The skill has neither `output_schema_path` nor `output_schemas`
+ *   - The skill has plural-only and `mode` is undefined or not in the map
+ *     (warns; caller should pass mode for mode-dispatched skills)
+ *   - The resolved schema file is missing or unparseable (warns)
+ *
+ * Edge case: if BOTH `output_schema_path` and `output_schemas` are declared,
+ * the singular wins and a warning is logged about the ambiguity.
  */
-export function loadLeafSkillSchema(skillName: string): LoadedLeafSchema | null {
+export function loadLeafSkillSchema(
+  skillName: string,
+  mode?: string,
+): LoadedLeafSchema | null {
   if (!skillName) return null;
   const pluginsRoot = findTnePluginsRoot();
   if (!pluginsRoot) return null;
@@ -98,14 +117,43 @@ export function loadLeafSkillSchema(skillName: string): LoadedLeafSchema | null 
   try { content = readFileSync(skillPath, 'utf-8'); } catch { return null; }
 
   const fm = extractFrontmatter(content);
-  const rawPath = fm?.output_schema_path;
-  if (typeof rawPath !== 'string' || !rawPath.trim()) return null;
+  if (!fm) return null;
+
+  const singularRaw = fm.output_schema_path;
+  const pluralRaw = fm.output_schemas;
+  const hasSingular = typeof singularRaw === 'string' && singularRaw.trim().length > 0;
+  const hasPlural = typeof pluralRaw === 'object' && pluralRaw !== null && !Array.isArray(pluralRaw);
+
+  if (!hasSingular && !hasPlural) return null;
+
+  // Both declared → prefer singular, warn about the ambiguity.
+  if (hasSingular && hasPlural) {
+    console.warn(`[loadLeafSkillSchema] skill='${skillName}' declares BOTH output_schema_path and output_schemas — preferring singular. Pick one shape in SKILL.md frontmatter.`);
+  }
+
+  let rawPath: string;
+  if (hasSingular) {
+    rawPath = singularRaw as string;
+  } else {
+    // Plural-only: need mode to dispatch.
+    if (!mode) {
+      console.warn(`[loadLeafSkillSchema] skill='${skillName}' uses plural output_schemas but caller did not pass mode — cannot dispatch. Caller (invokeSkill.ts) should pass the skill's mode input variable.`);
+      return null;
+    }
+    const schemasMap = pluralRaw as Record<string, unknown>;
+    const modeEntry = schemasMap[mode];
+    if (typeof modeEntry !== 'string' || !modeEntry.trim()) {
+      console.warn(`[loadLeafSkillSchema] skill='${skillName}' output_schemas has no entry for mode='${mode}'. Available modes: ${Object.keys(schemasMap).join(', ')}`);
+      return null;
+    }
+    rawPath = modeEntry;
+  }
 
   const skillDir = dirname(skillPath);
   const schemaPath = isAbsolute(rawPath) ? rawPath : resolve(skillDir, rawPath);
 
   if (!existsSync(schemaPath)) {
-    console.warn(`[loadLeafSkillSchema] skill='${skillName}' declared output_schema_path='${rawPath}' but file not found at ${schemaPath}`);
+    console.warn(`[loadLeafSkillSchema] skill='${skillName}' declared schema path='${rawPath}' but file not found at ${schemaPath}`);
     return null;
   }
 
