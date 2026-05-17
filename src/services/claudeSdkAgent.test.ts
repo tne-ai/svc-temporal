@@ -71,4 +71,28 @@ describe('createClaudeSDKAgent — stream-catch (Option A persist-fail handling)
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('swallowed post-emit SDK error'));
     warnSpy.mockRestore();
   });
+
+  it('re-throws when error occurs BEFORE structured_output (even if message matches pattern)', async () => {
+    mockSdkQuery.mockReturnValue(streamOfThenThrow(
+      [{ type: 'message_start' }],  // no structured_output yet
+      new Error('persist-failed: messageText is not valid JSON'),
+    ));
+
+    const agent = createClaudeSDKAgent();
+    await expect(async () => {
+      for await (const _ev of agent.query('hello')) { /* drain */ }
+    }).rejects.toThrow(/persist-failed/);
+  });
+
+  it('re-throws when error matches no persist-fail pattern (even after structured_output)', async () => {
+    mockSdkQuery.mockReturnValue(streamOfThenThrow(
+      [{ type: 'result', structured_output: { score: 3 } }],
+      new Error('Network error: ECONNRESET'),
+    ));
+
+    const agent = createClaudeSDKAgent();
+    await expect(async () => {
+      for await (const _ev of agent.query('hello')) { /* drain */ }
+    }).rejects.toThrow(/ECONNRESET/);
+  });
 });
