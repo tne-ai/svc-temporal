@@ -22,7 +22,7 @@
  * and executed the wrong SOP.
  */
 
-import { existsSync, mkdirSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { parseSkillFile } from '../config/skillParser.js';
@@ -44,7 +44,7 @@ function getTnePluginsRoot(): string | null {
   ].filter(Boolean) as string[];
 
   for (const p of candidates) {
-    if (existsSync(join(p, 'plugins', 'tne', 'skills'))) return p;
+    if (existsSync(join(p, 'plugins'))) return p;
   }
   return null;
 }
@@ -65,11 +65,23 @@ function resolveSkillPathLocal(skillName: string, workspacePath: string): string
     check = parent;
   }
 
-  // 2. tne-plugins repository
+  // 2. tne-plugins repository — search across all plugin namespaces.
+  //    Originally hardcoded to plugins/tne/skills/; broken for plugins like
+  //    jpm/ that live in their own namespace. Now iterates over all plugins.
   const root = getTnePluginsRoot();
   if (root) {
-    const pluginSkill = join(root, 'plugins', 'tne', 'skills', skillName, 'SKILL.md');
-    if (existsSync(pluginSkill)) return pluginSkill;
+    const pluginsDir = join(root, 'plugins');
+    try {
+      const plugins = readdirSync(pluginsDir, { withFileTypes: true })
+        .filter(e => e.isDirectory())
+        .map(e => e.name);
+      for (const plugin of plugins) {
+        const pluginSkill = join(pluginsDir, plugin, 'skills', skillName, 'SKILL.md');
+        if (existsSync(pluginSkill)) return pluginSkill;
+      }
+    } catch {
+      // pluginsDir unreadable — fall through to null
+    }
   }
 
   return null;
