@@ -1069,9 +1069,13 @@ export async function invokeSkill(
   // visible — the most common cause is a user-level delegate model override
   // pointing schema-bearing skills at a non-Anthropic upstream.
   // Pass mode (when present) so the loader can dispatch on output_schemas (plural)
-  // for mode-dispatched skills like jpm-lens-* and jpm-chair. Mode arrives via
-  // step.inputs as a string like `mode=evaluate` (SOP-Inputs-column case).
-  const mode = step.inputs?.find(i => i.startsWith('mode='))?.split('=')[1] || undefined;
+  // for mode-dispatched skills like jpm-lens-* and jpm-chair. Mode can arrive
+  // either in step.inputs as a token "mode=evaluate" (SOP-Inputs convention,
+  // e.g. p-jpm-retry-lens) OR in step.notes as a free-text fragment "mode=evaluate"
+  // (SOP-Notes convention, used by p-jpm-eval/feedback/revise/chair).
+  const modeFromInputs = step.inputs?.find(i => i.startsWith('mode='))?.split('=')[1];
+  const modeFromNotes = step.notes?.match(/(?:^|[\s,;])mode=([A-Za-z0-9_]+)/)?.[1];
+  const mode = modeFromInputs || modeFromNotes || undefined;
   const leafSchema = loadLeafSkillSchema(step.skill, mode);
   if (leafSchema && backend === 'claude-agent-sdk') {
     console.log(`[invokeSkill] schema loaded for skill='${step.skill}' from ${leafSchema.schemaPath}`);
