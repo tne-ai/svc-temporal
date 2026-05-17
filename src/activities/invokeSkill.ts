@@ -1068,7 +1068,11 @@ export async function invokeSkill(
   // it). For Pi/subprocess paths we log loudly so silent enforcement loss is
   // visible — the most common cause is a user-level delegate model override
   // pointing schema-bearing skills at a non-Anthropic upstream.
-  const leafSchema = loadLeafSkillSchema(step.skill);
+  // Pass mode (when present) so the loader can dispatch on output_schemas (plural)
+  // for mode-dispatched skills like jpm-lens-* and jpm-chair. Mode arrives via
+  // step.inputs as a string like `mode=evaluate` (SOP-Inputs-column case).
+  const mode = step.inputs?.find(i => i.startsWith('mode='))?.split('=')[1] || undefined;
+  const leafSchema = loadLeafSkillSchema(step.skill, mode);
   if (leafSchema && backend === 'claude-agent-sdk') {
     console.log(`[invokeSkill] schema loaded for skill='${step.skill}' from ${leafSchema.schemaPath}`);
   } else if (leafSchema) {
