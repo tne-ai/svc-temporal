@@ -86,3 +86,36 @@ describe('loadLeafSkillSchema — plural output_schemas with mode', () => {
     warnSpy.mockRestore();
   });
 });
+
+describe('loadLeafSkillSchema — singular output_schema_path (regression)', () => {
+  it('loads the schema when only singular is declared (mode arg ignored)', () => {
+    writeSkill(
+      'leaf-test-singular',
+      `name: leaf-test-singular\noutput_schema_path: ../shared-schemas/intakeOutput.json`,
+      { intakeOutput: { type: 'object', properties: { company_name: { type: 'string' } }, required: ['company_name'], additionalProperties: false } },
+    );
+
+    // mode is irrelevant for singular shape — passing it should not cause an error
+    const result = loadLeafSkillSchema('leaf-test-singular', 'evaluate');
+
+    expect(result).not.toBeNull();
+    expect(result!.schema).toEqual({
+      type: 'object',
+      properties: { company_name: { type: 'string' } },
+      required: ['company_name'],
+      additionalProperties: false,
+    });
+  });
+
+  it('loads the schema when only singular is declared and no mode arg passed', () => {
+    writeSkill(
+      'leaf-test-singular-no-mode',
+      `name: leaf-test-singular-no-mode\noutput_schema_path: ../shared-schemas/intakeOutput.json`,
+      { intakeOutput: { type: 'object', properties: {}, additionalProperties: false } },
+    );
+
+    const result = loadLeafSkillSchema('leaf-test-singular-no-mode');
+
+    expect(result).not.toBeNull();
+  });
+});
