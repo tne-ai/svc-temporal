@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -54,5 +54,35 @@ describe('loadLeafSkillSchema — plural output_schemas with mode', () => {
       additionalProperties: false,
     });
     expect(result!.schemaPath).toContain('lensEvaluate.json');
+  });
+
+  it('returns null and warns when plural shape is declared but mode arg is missing', () => {
+    writeSkill(
+      'lens-test-no-mode',
+      `name: lens-test-no-mode\noutput_schemas:\n  evaluate: ../shared-schemas/lensEvaluate.json`,
+      { lensEvaluate: { type: 'object', properties: {}, additionalProperties: false } },
+    );
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = loadLeafSkillSchema('lens-test-no-mode');  // no mode arg
+
+    expect(result).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('plural output_schemas but caller did not pass mode'));
+    warnSpy.mockRestore();
+  });
+
+  it('returns null and warns when mode is not in the output_schemas map', () => {
+    writeSkill(
+      'lens-test-bad-mode',
+      `name: lens-test-bad-mode\noutput_schemas:\n  evaluate: ../shared-schemas/lensEvaluate.json`,
+      { lensEvaluate: { type: 'object', properties: {}, additionalProperties: false } },
+    );
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = loadLeafSkillSchema('lens-test-bad-mode', 'unknown_mode');
+
+    expect(result).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("no entry for mode='unknown_mode'"));
+    warnSpy.mockRestore();
   });
 });
