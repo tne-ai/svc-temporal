@@ -50,3 +50,25 @@ describe('createClaudeSDKAgent — stream loop (regression)', () => {
     ]);
   });
 });
+
+describe('createClaudeSDKAgent — stream-catch (Option A persist-fail handling)', () => {
+  it('swallows SDK throws after structured_output when error matches persist-fail pattern', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    mockSdkQuery.mockReturnValue(streamOfThenThrow(
+      [
+        { type: 'message_start' },
+        { type: 'result', structured_output: { score: 4 } },  // captured
+      ],
+      new Error('persist-failed: messageText is not valid JSON (constrained-decode may have failed)'),
+    ));
+
+    const agent = createClaudeSDKAgent();
+    const received: unknown[] = [];
+    // Should NOT throw — error is swallowed because structured_output was captured
+    for await (const ev of agent.query('hello')) received.push(ev);
+
+    expect(received).toHaveLength(2);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('swallowed post-emit SDK error'));
+    warnSpy.mockRestore();
+  });
+});

@@ -205,9 +205,31 @@ export function createClaudeSDKAgent(options: ClaudeSDKAgentOptions = {}): Claud
       const execPath = options.pathToClaudeCodeExecutable || findClaudeExecutable();
       if (execPath) sdkOptions.pathToClaudeCodeExecutable = execPath;
 
-      const stream = query({ prompt: finalPrompt, options: sdkOptions });
-      for await (const event of stream) {
-        yield event;
+      // Option A persist-fail handling: the Claude Agent SDK can throw
+      // "persist-failed: messageText is not valid JSON (constrained-decode may
+      // have failed)" when the model emits trailing natural-language prose
+      // AFTER a structured_output event. The JSON artifact is already correct
+      // at that point — the throw is from a downstream persist step trying to
+      // JSON-parse the trailing prose. Swallow if we've seen structured_output;
+      // otherwise propagate so real failures aren't masked. See spec
+      // 2026-05-17-jpm-orion-orchestrator-design.md §3 error handling.
+      const PERSIST_FAIL_PATTERN = /persist-failed|messageText is not valid JSON|constrained-decode/i;
+      let sawStructuredOutput = false;
+      try {
+        const stream = query({ prompt: finalPrompt, options: sdkOptions });
+        for await (const event of stream) {
+          if ((event as any)?.structured_output !== undefined) {
+            sawStructuredOutput = true;
+          }
+          yield event;
+        }
+      } catch (err: any) {
+        const msg = err?.message ?? String(err);
+        if (sawStructuredOutput && PERSIST_FAIL_PATTERN.test(msg)) {
+          console.warn(`[claudeSdkAgent] swallowed post-emit SDK error: ${msg}`);
+          return;  // graceful end — generator completes successfully
+        }
+        throw err;
       }
     },
   };
