@@ -7,8 +7,8 @@
  */
 
 import { heartbeat } from '@temporalio/activity';
-import { existsSync } from 'fs';
-import { isAbsolute, join } from 'path';
+import { existsSync, mkdirSync, writeFileSync } from 'fs';
+import { dirname, isAbsolute, join } from 'path';
 import type { StepExecutionParams, StepResult } from '../shared/types.js';
 import { invokeSkill, buildPrompt } from './invokeSkill.js';
 import { runGateCascade } from './runGateCascade.js';
@@ -104,6 +104,25 @@ export async function executeStep(params: StepExecutionParams): Promise<StepResu
     const outputPathAbs = outputPath
       ? (isAbsolute(outputPath) ? outputPath : join(cwdRoot, outputPath))
       : '';
+
+    // Structured Outputs: when the leaf skill declared output_schema_path,
+    // invokeSkill returns the constrained-decoded JSON payload directly.
+    // Write it as the step's output file ourselves — the agent may also have
+    // written something there, but the structured output is the source of
+    // truth and overwrites it. This guarantees the file matches the schema
+    // even if the agent's Write tool produced something slightly different.
+    if (invResult.structuredOutput !== undefined && outputPathAbs) {
+      try {
+        mkdirSync(dirname(outputPathAbs), { recursive: true });
+        writeFileSync(outputPathAbs, JSON.stringify(invResult.structuredOutput, null, 2), 'utf-8');
+      } catch (err: any) {
+        emitEvent(parentRunId, 'step_failed', {
+          stepNumber: step.number, skill: step.skill, iteration,
+          reason: 'structured_output_write_failed', error: err?.message,
+        });
+        return { success: false, error: `Failed to write structured output: ${err?.message}` };
+      }
+    }
 
     // Run gate cascade if output file exists
     if (outputPathAbs && existsSync(outputPathAbs)) {
