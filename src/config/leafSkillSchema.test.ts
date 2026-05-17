@@ -119,3 +119,24 @@ describe('loadLeafSkillSchema — singular output_schema_path (regression)', () 
     expect(result).not.toBeNull();
   });
 });
+
+describe('loadLeafSkillSchema — both shapes declared (edge case)', () => {
+  it('prefers singular and warns when both output_schema_path and output_schemas are present', () => {
+    writeSkill(
+      'leaf-test-both',
+      `name: leaf-test-both\noutput_schema_path: ../shared-schemas/singular.json\noutput_schemas:\n  evaluate: ../shared-schemas/plural-eval.json`,
+      {
+        singular:      { type: 'object', properties: { from: { const: 'singular' } }, required: ['from'], additionalProperties: false },
+        'plural-eval': { type: 'object', properties: { from: { const: 'plural'   } }, required: ['from'], additionalProperties: false },
+      },
+    );
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = loadLeafSkillSchema('leaf-test-both', 'evaluate');
+
+    expect(result).not.toBeNull();
+    expect((result!.schema as any).properties.from.const).toBe('singular');
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('declares BOTH output_schema_path and output_schemas'));
+    warnSpy.mockRestore();
+  });
+});
