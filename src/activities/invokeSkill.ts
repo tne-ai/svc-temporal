@@ -37,6 +37,7 @@ import { fetchUserProviderKey } from '../lib/fetchUserProviderKey.js';
 import { ensureSkillsInWorkspace } from './setupSkills.js';
 import { PiAgentSession, isPiAgentEnabled, isLiteLLMProxyEnabled, getLiteLLMBaseURL, normalizeModelForLitellm } from '../services/piAgentAdapter.js';
 import { buildPiTools } from '../services/piAgentTools.js';
+import { loadLeafSkillSchema } from '../config/leafSkillSchema.js';
 
 /** Extract a short text preview for message events (strip surrounding whitespace). */
 function previewText(text: string, max = 600): string {
@@ -771,7 +772,7 @@ async function invokeViaClaudeAgentSDK(
   prompt: string,
   model?: string,
   workspacePath?: string,
-  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string },
+  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string; outputSchema?: Record<string, unknown> },
 ): Promise<InvocationResult> {
   const resolvedModel = resolveModelId(model);
   const workspaceRoot = workspacePath || process.cwd();
@@ -833,6 +834,9 @@ async function invokeViaClaudeAgentSDK(
       wrapPrompt: true,
       workspacePath,
       hooks: buildNestedFsmHooks(context),
+      outputFormat: context?.outputSchema
+        ? { type: 'json_schema', schema: context.outputSchema }
+        : undefined,
       env: (() => {
         // BYOK takes precedence over env-var defaults; see fetch above.
         const out: Record<string, string> = { ...(process.env as Record<string, string>) };
@@ -887,6 +891,7 @@ async function invokeViaClaudeAgentSDK(
     });
 
     let stdout = '';
+    let structuredOutput: unknown = undefined;
     let lastHeartbeat = Date.now();
     const runId = context?.parentRunId;
     const jobId = context?.jobId;
@@ -931,6 +936,9 @@ async function invokeViaClaudeAgentSDK(
       // Capture final result
       if (event.type === 'result') {
         if (event.result) stdout = event.result;
+        if (event.subtype === 'success' && (event as any).structured_output !== undefined) {
+          structuredOutput = (event as any).structured_output;
+        }
 
         const usage = (event as any).usage;
         if (usage && (typeof usage.input_tokens === 'number' || typeof usage.output_tokens === 'number')) {
@@ -958,6 +966,21 @@ async function invokeViaClaudeAgentSDK(
             exitCode: 1,
           };
         }
+        // Safety refusal: the API returns 200 with stop_reason='refusal' when
+        // Claude declines for safety reasons. Per the Structured Outputs docs,
+        // refusals override the schema constraint, so structured_output may be
+        // missing or non-conformant. Surface as a distinct error rather than
+        // letting an empty/garbage payload pass through to executeStep.
+        if (event.stop_reason === 'refusal') {
+          const msg = 'Model refused the request for safety reasons (stop_reason=refusal). Schema enforcement is bypassed in this case; output may not match the declared schema.';
+          console.error('[invokeViaClaudeAgentSDK] refusal:', msg);
+          return {
+            success: false,
+            stdout,
+            stderr: msg,
+            exitCode: 1,
+          };
+        }
       }
 
       // Heartbeat
@@ -967,7 +990,7 @@ async function invokeViaClaudeAgentSDK(
       }
     }
 
-    return { success: true, stdout, stderr: '', exitCode: 0 };
+    return { success: true, stdout, stderr: '', exitCode: 0, structuredOutput };
   } catch (err) {
     console.error('[invokeViaClaudeAgentSDK] Error:', err);
     return {
@@ -1004,6 +1027,27 @@ function pickBackendByModel(model?: string): 'harness' | 'claude-agent-sdk' {
 }
 
 /**
+ * Extract the `mode` value from a Step's Inputs or Notes column.
+ *
+ * Inputs convention (e.g. p-jpm-retry-lens): a token "mode=<value>" in step.inputs[].
+ * Notes convention (used by p-jpm-eval/feedback/revise/chair): a substring "mode=<value>"
+ *   inside step.notes, separated by whitespace/comma/semicolon (or at string start).
+ *
+ * Inputs wins on tie. Returns undefined when neither is present, or when the value
+ * uses unresolved template-var syntax like `mode={{MODE}}` (the character class
+ * [A-Za-z0-9_]+ matches literal mode tokens only). The {{MODE}}-style retry path
+ * is fixed via PR B SOP cleanup (standardize to literal mode tokens).
+ *
+ * Exported for unit testing — production callers should use it via the inline
+ * call in invokeSkill().
+ */
+export function extractStepMode(step: { inputs?: string[]; notes?: string }): string | undefined {
+  const modeFromInputs = step.inputs?.find(i => i.startsWith('mode='))?.split('=')[1];
+  const modeFromNotes = step.notes?.match(/(?:^|[\s,;])mode=([A-Za-z0-9_]+)/)?.[1];
+  return modeFromInputs || modeFromNotes || undefined;
+}
+
+/**
  * Invoke a skill using the specified or configured backend.
  *
  * Backend selection priority:
@@ -1034,7 +1078,33 @@ export async function invokeSkill(
   // stamp `stepNumber` + `skill` onto the `token_update` event they emit from
   // the final `result`. Without this, per-step spend can't be attributed on
   // the UI side.
-  const innerContext = { ...(context || {}), stepNumber: step.number, skill: step.skill };
+  //
+  // For SDK-backed Anthropic invocations only, also look up the leaf skill's
+  // output_schema_path frontmatter and thread it through as `outputSchema`.
+  // When present, the SDK enforces it via Structured Outputs (constrained
+  // decoding) and returns the validated payload in InvocationResult.
+  // Other backends (Pi, subprocess) silently ignore it for now.
+  // Schema load happens regardless of backend so we can detect mis-routing.
+  // We only THREAD the schema into the SDK path (the only path that can enforce
+  // it). For Pi/subprocess paths we log loudly so silent enforcement loss is
+  // visible — the most common cause is a user-level delegate model override
+  // pointing schema-bearing skills at a non-Anthropic upstream.
+  // Pass mode (when present) so the loader can dispatch on output_schemas (plural).
+  // See extractStepMode() above for the Inputs vs Notes conventions.
+  const mode = extractStepMode(step);
+  const leafSchema = loadLeafSkillSchema(step.skill, mode);
+  if (leafSchema && backend === 'claude-agent-sdk') {
+    console.log(`[invokeSkill] schema loaded for skill='${step.skill}' from ${leafSchema.schemaPath}`);
+  } else if (leafSchema) {
+    console.warn(
+      `[invokeSkill] WARNING: skill='${step.skill}' declares output_schema_path ` +
+      `(${leafSchema.schemaPath}) but is dispatched on backend='${backend}' which ` +
+      `does NOT support Anthropic Structured Outputs. Schema will NOT be enforced — ` +
+      `model output may drift. Re-route to a claude-* model to enable enforcement.`,
+    );
+  }
+  const innerContext: any = { ...(context || {}), stepNumber: step.number, skill: step.skill };
+  if (leafSchema && backend === 'claude-agent-sdk') innerContext.outputSchema = leafSchema.schema;
 
   switch (backend) {
     case 'harness':

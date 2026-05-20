@@ -135,6 +135,11 @@ function findClaudeExecutable(): string | undefined {
 
 // ── Agent factory ─────────────────────────────────────────────────────────
 
+export interface JsonSchemaOutputFormat {
+  type: 'json_schema';
+  schema: Record<string, unknown>;
+}
+
 export interface ClaudeSDKAgentOptions {
   model?: string;
   cwd?: string;
@@ -150,6 +155,14 @@ export interface ClaudeSDKAgentOptions {
   persistSession?: boolean;
   pathToClaudeCodeExecutable?: string;
   allowedTools?: readonly string[];
+  /**
+   * Constrain the agent's final response to match a JSON Schema. The SDK
+   * forwards this to Anthropic's Structured Outputs feature, which uses
+   * grammar-constrained sampling — the final response is guaranteed to
+   * be valid JSON matching the schema. Surfaces on the SDK's result event
+   * as `structured_output`. Anthropic-direct only; ignored on non-SDK paths.
+   */
+  outputFormat?: JsonSchemaOutputFormat;
 }
 
 export interface ClaudeSDKAgent {
@@ -187,13 +200,36 @@ export function createClaudeSDKAgent(options: ClaudeSDKAgentOptions = {}): Claud
       if (options.hooks) sdkOptions.hooks = options.hooks;
       if (options.abortController) sdkOptions.abortController = options.abortController;
       if (options.env) sdkOptions.env = options.env;
+      if (options.outputFormat) sdkOptions.outputFormat = options.outputFormat;
 
       const execPath = options.pathToClaudeCodeExecutable || findClaudeExecutable();
       if (execPath) sdkOptions.pathToClaudeCodeExecutable = execPath;
 
-      const stream = query({ prompt: finalPrompt, options: sdkOptions });
-      for await (const event of stream) {
-        yield event;
+      // Option A persist-fail handling: the Claude Agent SDK can throw
+      // "persist-failed: messageText is not valid JSON (constrained-decode may
+      // have failed)" when the model emits trailing natural-language prose
+      // AFTER a structured_output event. The JSON artifact is already correct
+      // at that point — the throw is from a downstream persist step trying to
+      // JSON-parse the trailing prose. Swallow if we've seen structured_output;
+      // otherwise propagate so real failures aren't masked. See spec
+      // 2026-05-17-jpm-orion-orchestrator-design.md §3 error handling.
+      const PERSIST_FAIL_PATTERN = /persist-failed|messageText is not valid JSON|constrained-decode/i;
+      let sawStructuredOutput = false;
+      try {
+        const stream = query({ prompt: finalPrompt, options: sdkOptions });
+        for await (const event of stream) {
+          if ((event as any)?.structured_output !== undefined) {
+            sawStructuredOutput = true;
+          }
+          yield event;
+        }
+      } catch (err: any) {
+        const msg = err?.message ?? String(err);
+        if (sawStructuredOutput && PERSIST_FAIL_PATTERN.test(msg)) {
+          console.warn(`[claudeSdkAgent] swallowed post-emit SDK error: ${msg}`);
+          return;  // graceful end — generator completes successfully
+        }
+        throw err;
       }
     },
   };

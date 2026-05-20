@@ -260,6 +260,13 @@ export interface InvocationResult {
   outputPath?: string;
   exitCode: number;
   stageReviewPause?: boolean;
+  /**
+   * Constrained-decoded JSON produced via Anthropic Structured Outputs,
+   * present when the leaf skill declared `output_schema_path` in its
+   * frontmatter. The caller (executeStep) writes this to the step's
+   * output file as JSON, guaranteeing zero structural drift.
+   */
+  structuredOutput?: unknown;
 }
 
 export interface GateResult {
