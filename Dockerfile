@@ -66,10 +66,17 @@ RUN npm ci --omit=dev && \
 
 COPY --from=builder /app/dist ./dist
 
-# Bundle the tne-plugins submodule so parseConfig can resolve p-* SKILL.md
-# files. Mirrors the layout orion-backend uses (/app/tne-plugins/plugins/tne).
-# Fetched via troopship's recursive submodule checkout at build time.
-COPY tne-plugins/plugins/tne ./tne-plugins/plugins/tne
+# Bundle the FULL tne-plugins submodule so both parseConfig (orchestrator
+# p-* skill resolution) and loadLeafSkillSchema (leaf skill output_schema_path
+# resolution for Anthropic Structured Outputs) can find every plugin's
+# SKILL.md + sidecar JSON schemas. Fetched via troopship's recursive
+# submodule checkout at build time.
+#
+# Was previously narrowed to plugins/tne only — that broke structured outputs
+# for any non-tne plugin (jpm, oli, navigator, ...) because loadLeafSkillSchema
+# silently returns null when the skill file isn't found on disk. Symptom: model
+# freeforms, downstream Zod rejects, no diagnostic log fires.
+COPY tne-plugins/plugins ./tne-plugins/plugins
 
 # Run as the built-in `node` user (UID 1000) rather than root. The Claude
 # Agent SDK invokes `claude --allow-dangerously-skip-permissions`, which
