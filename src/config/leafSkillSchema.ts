@@ -111,7 +111,21 @@ export function loadLeafSkillSchema(
   if (!pluginsRoot) return null;
 
   const skillPath = findLeafSkillFile(skillName, pluginsRoot);
-  if (!skillPath) return null;
+  if (!skillPath) {
+    // Was silently returning null here. Many call-sites pass skills that
+    // legitimately have no schema (write-a-file style), so we can't make this
+    // an error. But when a schema-bearing skill is missing from the image's
+    // bundled plugins (e.g. Dockerfile narrowed the COPY to a subset), the
+    // model freeforms and downstream Zod rejection looks unrelated. This log
+    // makes that case loud — operators grep on it after seeing schema mismatches.
+    console.warn(
+      `[loadLeafSkillSchema] skill='${skillName}' not found under ${pluginsRoot}/plugins/*/skills/. ` +
+      `If this skill declares output_schema_path in its SKILL.md, structured outputs WILL NOT be enforced. ` +
+      `Most likely cause: the plugin containing '${skillName}' isn't bundled into the deployed image — ` +
+      `check the Dockerfile's COPY of tne-plugins/plugins.`,
+    );
+    return null;
+  }
 
   let content: string;
   try { content = readFileSync(skillPath, 'utf-8'); } catch { return null; }
