@@ -205,6 +205,144 @@ function extractFrontmatterSop(content: string): string | null {
   return typeof sop === 'string' ? sop : null;
 }
 
+/**
+ * Structured frontmatter SOP — `process_type: r-coo-sop91-process` + a
+ * YAML-mapping `sop:` declaring `phases.{preamble,generator,evaluator,
+ * postamble}.steps`. The body of these skills only carries a marker comment
+ * (`<!-- config in sop: frontmatter -->`) so every other extractor returns
+ * null. Mirrors the Python parser's `_parse_sop_dict` in tne-plugins/engine.
+ *
+ * Returns a fully-populated ProcessConfig (with defaults for fields the dict
+ * form does not declare) or null when no usable `sop:` mapping is present.
+ */
+function parseFrontmatterDictSop(
+  content: string,
+  fallbackScope: string,
+): ProcessConfig | null {
+  if (!content.startsWith('---')) return null;
+  const end = content.indexOf('\n---', 3);
+  if (end === -1) return null;
+  const fmText = content.slice(3, end);
+  let fm: any;
+  try {
+    fm = parseYaml(fmText);
+  } catch {
+    return null;
+  }
+  const sop = fm?.sop;
+  if (!sop || typeof sop !== 'object' || Array.isArray(sop)) return null;
+
+  // Scope: sop.scope > frontmatter name > caller-derived fallback.
+  let scope = typeof sop.scope === 'string' ? sop.scope.trim() : '';
+  if (!scope && typeof fm.name === 'string') scope = fm.name.trim();
+  if (!scope) scope = fallbackScope;
+
+  const maxIterations =
+    typeof sop.max_iterations === 'number'
+      ? sop.max_iterations
+      : parseInt(String(sop.max_iterations ?? '50'), 10) || 50;
+
+  const evalStr = String(sop.evaluator_mode ?? 'fail-fast');
+  const evaluatorMode: EvaluatorMode = Object.values(EvaluatorMode).includes(
+    evalStr as EvaluatorMode,
+  )
+    ? (evalStr as EvaluatorMode)
+    : EvaluatorMode.FAIL_FAST;
+
+  const phases = sop.phases ?? {};
+  const preambleDict = phases.preamble ?? {};
+  const generatorDict = phases.generator ?? {};
+  const evaluatorDict = phases.evaluator ?? {};
+  const postambleDict = phases.postamble ?? {};
+
+  const stepsFromPhase = (phaseDict: any): Step[] => {
+    if (!phaseDict || typeof phaseDict !== 'object') return [];
+    const rawSteps = phaseDict.steps;
+    if (!Array.isArray(rawSteps) || rawSteps.length === 0) return [];
+
+    // Map declared step ids to the sequential integers the wave scheduler
+    // expects, so `depends_on: [my-id]` resolves to `dependsOn: ['2']`.
+    const idToNum: Record<string, string> = {};
+    rawSteps.forEach((s: any, i: number) => {
+      const sid = typeof s?.id === 'string' && s.id ? s.id : String(i + 1);
+      idToNum[sid] = String(i + 1);
+    });
+
+    return rawSteps.map((s: any, i: number) => {
+      const rawDeps: unknown = s?.depends_on ?? [];
+      const depsList = Array.isArray(rawDeps) ? rawDeps : [];
+      const dependsOn = depsList
+        .filter((d): d is string => typeof d === 'string' && d in idToNum)
+        .map(d => idToNum[d]);
+
+      const rawInputs: unknown = s?.inputs ?? [];
+      const inputs: string[] = Array.isArray(rawInputs)
+        ? rawInputs.map(v => String(v))
+        : typeof rawInputs === 'string'
+          ? [rawInputs]
+          : [];
+
+      return {
+        number: String(i + 1),
+        skill: typeof s?.skill === 'string' && s.skill ? s.skill : 'inline',
+        inputs,
+        output: typeof s?.output === 'string' ? s.output : '',
+        verify: '',
+        run: '',
+        notes:
+          typeof s?.description === 'string'
+            ? s.description
+            : typeof s?.id === 'string'
+              ? s.id
+              : '',
+        passCondition:
+          typeof s?.pass_condition === 'string' ? s.pass_condition : '',
+        stageType: StageType.DEFAULT,
+        dependsOn,
+        backpropSkill: '',
+        failFast: { maxRetries: 3, gates: [1, 2, 3, 4] },
+        permissionMode: 'acceptEdits',
+        model: '',
+      };
+    });
+  };
+
+  const preamble = stepsFromPhase(preambleDict);
+  const generator = stepsFromPhase(generatorDict);
+  const evaluator = stepsFromPhase(evaluatorDict);
+  const postamble = stepsFromPhase(postambleDict);
+
+  if (
+    preamble.length + generator.length + evaluator.length + postamble.length ===
+    0
+  ) {
+    // Empty mapping — let the rest of the ladder try its luck instead.
+    return null;
+  }
+
+  return {
+    scope,
+    maxIterations,
+    evaluatorMode,
+    completionThreshold: '',
+    parentScope: '',
+    approvalGate: Boolean(preambleDict?.human_gate),
+    userCheckpoint: false,
+    stageReview: true,
+    preFlightInputs: [],
+    inputsFile: '',
+    inputsBackprop: true,
+    inputsBackpropGate: 'after_evaluator',
+    parallelGenerator: false,
+    preamble,
+    generator,
+    evaluator,
+    postamble,
+    finalization: [],
+    council: [],
+  };
+}
+
 function hasStepTables(block: string): boolean {
   return /^\s*\|---/m.test(block);
 }
@@ -619,11 +757,17 @@ export function parseSkillFile(
     ? resolveVariables(content, merged)
     : content;
 
-  // Strategy ladder. tne-plugins has three SOP formats in the wild:
-  //   1. ## SOP body block   — current primary (PR #1061)
-  //   2. frontmatter `sop:`  — PR #991 middle format, still in flight
-  //   3. inline legacy       — unfenced /r-coo-sop1-process with sibling
-  //                            ## Preamble / ## Generator / … headings
+  // Strategy ladder. tne-plugins has four SOP formats in the wild:
+  //   1. ## SOP body block          — current primary (PR #1061)
+  //   2. frontmatter `sop:` string  — PR #991 middle format, still in flight
+  //   3. inline legacy              — unfenced /r-coo-sop1-process with sibling
+  //                                   ## Preamble / ## Generator / … headings
+  //   4. frontmatter `sop:` dict    — `process_type: r-coo-sop91-process`,
+  //                                   `sop: phases: …`. Body carries only a
+  //                                   `<!-- config in sop: frontmatter -->`
+  //                                   marker, so the string extractors return
+  //                                   null. The dict extractor produces a
+  //                                   ProcessConfig directly.
   //
   // Run every extractor and pick the config with the most phases. Tie goes to
   // the earlier extractor (so ## SOP beats `sop:` at equal phase counts).
@@ -636,24 +780,50 @@ export function parseSkillFile(
   // Preferring the max-phase candidate would have picked the real `## SOP`
   // block if it were populated, and still falls back to the frontmatter only
   // when the body block is genuinely empty.
-  const extractors: Array<[label: string, fn: () => string | null]> = [
+  const stringExtractors: Array<[label: string, fn: () => string | null]> = [
     ['body-sop', () => extractBodySopBlock(resolved)],
     ['frontmatter-sop', () => extractFrontmatterSop(resolved)],
     ['fenced-rcoo', () => extractRcooBlock(resolved)],
     ['inline-legacy', () => extractInlineLegacyBlock(resolved)],
   ];
 
-  let best: { cfg: ProcessConfig; phases: number; label: string } | null = null;
-  for (const [label, extract] of extractors) {
+  const candidates: Array<{ cfg: ProcessConfig; phases: number; label: string }> = [];
+  for (const [label, extract] of stringExtractors) {
     const block = extract();
     if (!block) continue;
     const cfg = parseBlockText(block);
-    const phases =
-      cfg.preamble.length + cfg.generator.length + cfg.evaluator.length + cfg.postamble.length;
-    // Strict `>` preserves tiebreaker-by-order.
-    if (!best || phases > best.phases) {
-      best = { cfg, phases, label };
-    }
+    candidates.push({
+      cfg,
+      phases:
+        cfg.preamble.length +
+        cfg.generator.length +
+        cfg.evaluator.length +
+        cfg.postamble.length,
+      label,
+    });
+  }
+
+  const dictCfg = parseFrontmatterDictSop(
+    resolved,
+    filenameDefaults['CALLER_AGENT'] || '',
+  );
+  if (dictCfg) {
+    candidates.push({
+      cfg: dictCfg,
+      phases:
+        dictCfg.preamble.length +
+        dictCfg.generator.length +
+        dictCfg.evaluator.length +
+        dictCfg.postamble.length,
+      label: 'frontmatter-dict',
+    });
+  }
+
+  let best: { cfg: ProcessConfig; phases: number; label: string } | null = null;
+  for (const c of candidates) {
+    // Strict `>` preserves tiebreaker-by-order (string extractors first, then
+    // the dict candidate as the final fallback).
+    if (!best || c.phases > best.phases) best = c;
   }
 
   if (best) return best.cfg;
