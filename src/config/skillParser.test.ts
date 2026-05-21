@@ -261,6 +261,188 @@ sop: "/r-coo-sop1-process\\n  SCOPE=p-bodysop-stub\\n\\n  ## Preamble\\n  | # | 
     expect(cfg.preamble[0].skill).toBe('fm-only-skill');
   });
 
+  it('parses structured frontmatter dict sop: (p-debug2-fanout shape)', () => {
+    // p-debug2-fanout in tne-plugins declares the SOP entirely in YAML
+    // frontmatter (process_type + sop: phases: …) and leaves the body
+    // with only a `<!-- config in sop: frontmatter -->` marker. Every
+    // string extractor returns null; the dict extractor must succeed.
+    const p = writeSkill('p-debug2-fanout', `---
+name: p-debug2-fanout
+process_type: r-coo-sop91-process
+scope: internal
+sop:
+  max_iterations: 1
+  evaluator_mode: sequential-only
+  delta_prop: true
+  eval_class: content
+  phases:
+    postamble:
+      human_gate: false
+      steps:
+      - id: debug2-write-color
+        skill: debug2-write-color
+        description: Theme = warm. Pick three warm colours.
+      - id: debug2-write-color-1
+        skill: debug2-write-color
+        description: Theme = cool. Pick three cool colours.
+      - id: debug2-write-color-2
+        skill: debug2-write-color
+        description: Theme = earthy. Pick three earthy words.
+sop_migration: auto
+---
+
+# P-DEBUG2. Multi-Step Fanout
+
+## SOP
+
+<!-- config in sop: frontmatter -->
+`);
+    const cfg = parseSkillFile(p);
+    expect(cfg.scope).toBe('p-debug2-fanout'); // filename fallback
+    expect(cfg.maxIterations).toBe(1);
+    expect(cfg.evaluatorMode).toBe('sequential-only');
+    expect(cfg.approvalGate).toBe(false);
+    expect(cfg.postamble).toHaveLength(3);
+    expect(cfg.preamble).toHaveLength(0);
+    expect(cfg.postamble.map(s => s.skill)).toEqual([
+      'debug2-write-color',
+      'debug2-write-color',
+      'debug2-write-color',
+    ]);
+    expect(cfg.postamble[0].number).toBe('1');
+    expect(cfg.postamble[2].number).toBe('3');
+    // No depends_on declared, so the parallel-fanout DAG resolves to a
+    // single wave: every step has an empty dependsOn.
+    expect(cfg.postamble.every(s => s.dependsOn.length === 0)).toBe(true);
+  });
+
+  it('dict sop: maps `depends_on: [step-id]` to sequential dependsOn numbers', () => {
+    const p = writeSkill('p-dict-deps', `---
+name: p-dict-deps
+process_type: r-coo-sop91-process
+sop:
+  scope: p-dict-deps
+  max_iterations: 2
+  phases:
+    generator:
+      steps:
+      - id: a
+        skill: skill-a
+      - id: b
+        skill: skill-b
+        depends_on: [a]
+      - id: c
+        skill: skill-c
+        depends_on: [a, b]
+sop_migration: auto
+---
+
+## SOP
+
+<!-- config in sop: frontmatter -->
+`);
+    const cfg = parseSkillFile(p);
+    expect(cfg.scope).toBe('p-dict-deps');
+    expect(cfg.generator).toHaveLength(3);
+    expect(cfg.generator[0].dependsOn).toEqual([]);
+    expect(cfg.generator[1].dependsOn).toEqual(['1']);
+    expect(cfg.generator[2].dependsOn).toEqual(['1', '2']);
+  });
+
+  it('dict sop: respects `human_gate: true` on preamble', () => {
+    // p-debug1-three-words style — single preamble step with a human gate.
+    const p = writeSkill('p-debug1-three-words', `---
+name: p-debug1-three-words
+process_type: r-coo-sop91-process
+sop:
+  max_iterations: 1
+  evaluator_mode: sequential-only
+  delta_prop: true
+  phases:
+    preamble:
+      human_gate: true
+      steps:
+      - id: debug1-write-words
+        skill: debug1-write-words
+        description: Worker writes three colour words via the Write tool.
+sop_migration: auto
+---
+
+## SOP
+
+<!-- config in sop: frontmatter -->
+`);
+    const cfg = parseSkillFile(p);
+    expect(cfg.scope).toBe('p-debug1-three-words');
+    expect(cfg.approvalGate).toBe(true);
+    expect(cfg.preamble).toHaveLength(1);
+    expect(cfg.preamble[0].skill).toBe('debug1-write-words');
+    expect(cfg.preamble[0].notes).toContain('Write tool');
+  });
+
+  it('prefers a populated body-sop over a dict frontmatter sop:', () => {
+    // Tie-breaker check: if both forms have phases, the body-sop wins
+    // because string extractors run before the dict candidate.
+    const p = writeSkill('p-mixed', `---
+name: p-mixed
+process_type: r-coo-sop91-process
+sop:
+  scope: p-mixed
+  phases:
+    preamble:
+      steps:
+      - id: stale-fm
+        skill: stale-fm
+sop_migration: auto
+---
+
+## SOP
+
+\`\`\`
+/r-coo-sop1-process
+  SCOPE=p-mixed
+  MAX_ITERATIONS=1
+
+  ## Preamble
+  ${PHASE_TABLE}
+\`\`\`
+`);
+    const cfg = parseSkillFile(p);
+    expect(cfg.scope).toBe('p-mixed');
+    // Body-sop has 1 row (step-one); dict frontmatter has 1 row too.
+    // Tie → string extractor (body-sop) wins by ladder order.
+    expect(cfg.preamble).toHaveLength(1);
+    expect(cfg.preamble[0].skill).toBe('step-one');
+  });
+
+  it('ignores frontmatter sop: dict with no usable phases', () => {
+    // A `sop: {}` or `sop: { phases: {} }` mapping must not shadow a real
+    // legacy fenced block elsewhere in the file.
+    const p = writeSkill('p-empty-dict-sop', `---
+name: p-empty-dict-sop
+process_type: r-coo-sop91-process
+sop:
+  max_iterations: 1
+  phases: {}
+sop_migration: auto
+---
+
+## r-coo-sop1-process Config
+
+\`\`\`
+/r-coo-sop1-process
+  SCOPE=p-empty-dict-sop
+
+  ## Preamble
+  ${PHASE_TABLE}
+\`\`\`
+`);
+    const cfg = parseSkillFile(p);
+    expect(cfg.scope).toBe('p-empty-dict-sop');
+    expect(cfg.preamble).toHaveLength(1);
+    expect(cfg.preamble[0].skill).toBe('step-one');
+  });
+
   it('handles stub ## SOP + inline phase sections outside any fence', () => {
     // Mirrors p-ceo2: /r-coo-sop1-process inside a short fenced block,
     // then phase sections as siblings OUTSIDE the fence.
