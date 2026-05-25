@@ -24,6 +24,13 @@ import type {
 } from '../shared/types.js';
 
 import type * as activities from '../activities/index.js';
+import {
+  STEP_ACTIVITY_TIMEOUT,
+  STEP_HEARTBEAT_TIMEOUT,
+  STEP_RETRY_POLICY,
+  TRANSIENT_RETRY_POLICY,
+  WORKSPACE_SYNC_TIMEOUT,
+} from '../shared/constants.js';
 
 // Signals
 export const approveJobSignal = defineSignal<[ApprovalSignalPayload]>('approveJob');
@@ -38,20 +45,16 @@ export const getJobStatusQuery = defineQuery<{
 
 export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult> {
   const { invokeSkill } = proxyActivities<typeof activities>({
-    startToCloseTimeout: '8h',
-    heartbeatTimeout: '120s',
-    retry: {
-      maximumAttempts: 3,
-      initialInterval: '10s',
-      backoffCoefficient: 2,
-    },
+    startToCloseTimeout: STEP_ACTIVITY_TIMEOUT,
+    heartbeatTimeout: STEP_HEARTBEAT_TIMEOUT,
+    retry: STEP_RETRY_POLICY,
   });
 
-  // Separate proxy for sync activities with shorter timeout
+  // Separate proxy for sync activities (unbounded retry via TRANSIENT_RETRY_POLICY).
   const syncActivities = proxyActivities<typeof activities>({
-    startToCloseTimeout: '15m',
-    heartbeatTimeout: '60s',
-    retry: { maximumAttempts: 2, initialInterval: '5s', backoffCoefficient: 2 },
+    startToCloseTimeout: WORKSPACE_SYNC_TIMEOUT,
+    heartbeatTimeout: '5m',
+    retry: TRANSIENT_RETRY_POLICY,
   });
 
   let status = 'running';

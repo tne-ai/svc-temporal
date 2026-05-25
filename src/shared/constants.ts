@@ -20,41 +20,68 @@ export const TEMPORAL_NAMESPACE = typeof process !== 'undefined' ? (process.env.
 export const TEMPORAL_ADDRESS = typeof process !== 'undefined' ? (process.env.TEMPORAL_ADDRESS || 'localhost:7233') : 'localhost:7233';
 
 // ─── Timeouts ───────────────────────────────────────────────────────────────
+//
+// Policy: long-running orchestration steps (LLM calls, gate cascades, S3
+// sync, subprocess invocations) should NEVER fail-permanently due to a
+// timeout. Per-attempt timeouts stay generous (single LLM turn shouldn't
+// hit a multi-day ceiling), retry policy is unbounded so transient
+// infrastructure failures roll into another attempt instead of bubbling
+// up. Heartbeat timeouts are the only "fast" timer left — they exist to
+// detect *dead* workers (now safe to keep tight because executeStep +
+// runGateCascade are wrapped in a wall-clock heartbeat ticker, see
+// activities/heartbeatTicker.ts, so a healthy activity can't miss them).
 
-/** Default timeout for a single step activity (skill invocation + gate cascade) */
-export const STEP_ACTIVITY_TIMEOUT = '4h';
+/** Per-attempt timeout for a single step activity (skill invocation + gate
+ *  cascade). Generous — a single attempt won't realistically exceed a
+ *  week. Retry policy below is unbounded so this isn't a fail-final cap. */
+export const STEP_ACTIVITY_TIMEOUT = '7d';
 
-/** Heartbeat timeout for step activities — detects stuck processes */
-export const STEP_HEARTBEAT_TIMEOUT = '60s';
+/** Heartbeat timeout for step activities — detects dead workers. Safe to
+ *  keep tight because the wall-clock heartbeat ticker fires every 5s
+ *  regardless of inner-loop state (see activities/heartbeatTicker.ts). */
+export const STEP_HEARTBEAT_TIMEOUT = '5m';
 
-/** Timeout for gate evaluation activities (LLM calls) */
-export const GATE_ACTIVITY_TIMEOUT = '5m';
+/** Per-attempt timeout for a gate evaluation activity (a single Haiku
+ *  LLM call). Long enough to survive provider slowness or a retry storm
+ *  upstream; the per-gate retry policy still loops on failures. */
+export const GATE_ACTIVITY_TIMEOUT = '30m';
 
-/** Timeout for S3 sync activities */
-export const S3_SYNC_TIMEOUT = '10m';
+/** Per-attempt timeout for an S3 sync activity. */
+export const S3_SYNC_TIMEOUT = '1h';
 
-/** Timeout for waiting on human approval signals */
+/** Timeout for waiting on human approval signals (unchanged — a human
+ *  signal that takes more than a week is effectively abandoned). */
 export const APPROVAL_SIGNAL_TIMEOUT = '7d';
 
-/** Default timeout per skill invocation (claude -p subprocess) */
-export const SKILL_INVOCATION_TIMEOUT_MS = 3_600_000; // 60 minutes
+/** Default timeout per skill invocation (claude -p subprocess). Set high
+ *  so any reasonable skill turn finishes. */
+export const SKILL_INVOCATION_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 /** Heartbeat interval for long-running subprocess activities */
 export const HEARTBEAT_INTERVAL_MS = 5_000; // 5 seconds
 
 // ─── Retry Policies ─────────────────────────────────────────────────────────
+//
+// Both step and infra retry policies use `maximumAttempts: 0`, which is
+// the Temporal SDK convention for "retry indefinitely". This is
+// intentional: by-design we never fail a workflow because an activity
+// hit a transient infra problem (heartbeat timeout, worker rollover,
+// upstream provider 5xx, S3 hiccup, etc.). The trade-off is that a
+// permanently broken skill (e.g. mis-typed model id, schema mismatch
+// the model can't satisfy) will loop forever accruing LLM cost — kill
+// such runs via the FE's Cancel button.
 
-/** Default retry policy for step activities */
+/** Default retry policy for step activities (unbounded). */
 export const STEP_RETRY_POLICY = {
-  maximumAttempts: 3,
+  maximumAttempts: 0,
   initialInterval: '10s',
   backoffCoefficient: 2,
   maximumInterval: '5m',
 } as const;
 
-/** Retry policy for transient infrastructure failures */
+/** Retry policy for transient infrastructure failures (unbounded). */
 export const TRANSIENT_RETRY_POLICY = {
-  maximumAttempts: 5,
+  maximumAttempts: 0,
   initialInterval: '5s',
   backoffCoefficient: 2,
   maximumInterval: '2m',
@@ -151,8 +178,10 @@ export const S3_BUCKET = typeof process !== 'undefined' ? (process.env.AWS_BUCKE
 /** AWS region (defaults to us-west-2) */
 export const AWS_REGION = typeof process !== 'undefined' ? (process.env.AWS_REGION || 'us-west-2') : 'us-west-2';
 
-/** Timeout for workspace sync activities */
-export const WORKSPACE_SYNC_TIMEOUT = '15m';
+/** Per-attempt timeout for workspace sync activities. Bumped from 15m
+ *  so a heavy initial pull (multi-GB workspace, slow network) can fit
+ *  in a single attempt; retry policy still loops on failure. */
+export const WORKSPACE_SYNC_TIMEOUT = '1h';
 
 /** Max concurrent S3 operations during sync */
 export const S3_SYNC_CONCURRENCY = 20;
