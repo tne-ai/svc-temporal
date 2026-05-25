@@ -54,11 +54,32 @@ async function run() {
 
   console.log(`Workers started on queues: ${FSM_TASK_QUEUE}, ${JOBS_TASK_QUEUE}`);
 
+  // Graceful shutdown on K8s SIGTERM. Without this the process dies
+  // abruptly when the pod is rolled and any in-flight activities are
+  // orphaned — they keep running on the dying pod for a few seconds then
+  // get killed, and Temporal only learns about it via the next heartbeat
+  // timeout (60s+ later). `worker.shutdown()` stops polling new tasks
+  // and resolves the run() promise after `shutdownGraceTime` (default
+  // ~5s) so in-flight activities have a window to complete cleanly. Pair
+  // with terminationGracePeriodSeconds: 300 on the Deployment so K8s
+  // doesn't SIGKILL us before drain completes.
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`Received ${signal}, draining workers…`);
+    try { fsmWorker.shutdown(); } catch (e) { console.error('fsmWorker.shutdown failed', e); }
+    try { jobsWorker.shutdown(); } catch (e) { console.error('jobsWorker.shutdown failed', e); }
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+
   // Run both workers concurrently
   await Promise.all([
     fsmWorker.run(),
     jobsWorker.run(),
   ]);
+  console.log('Workers drained, exiting.');
 }
 
 run().catch((err) => {
