@@ -40,6 +40,7 @@ import { readFileSync, existsSync } from 'fs';
 import { heartbeat } from '@temporalio/activity';
 import type { Step, GateResult, CascadeResult } from '../shared/types.js';
 import { StageType } from '../shared/types.js';
+import { withWallClockHeartbeat } from './heartbeatTicker.js';
 
 const JSON_SUFFIX = '\n\nReturn ONLY valid JSON (no markdown fencing):\n' +
   '{"passed": true/false, "feedback": "...", "score": <number>}';
@@ -62,6 +63,21 @@ interface GateContext {
  * Runs gates sequentially; passes at any gate → skip remaining.
  */
 export async function runGateCascade(
+  step: Step,
+  outputPath: string,
+  iteration = 0,
+  dryRun = false,
+  ctx?: GateContext,
+): Promise<CascadeResult> {
+  // Wall-clock heartbeat: each gate is an LLM call (~10-60s on Haiku) and
+  // a stall there used to be enough to blow past heartbeatTimeout.
+  return withWallClockHeartbeat(
+    () => ({ status: 'gate_cascade_tick', step: step.number }),
+    () => runGateCascadeInner(step, outputPath, iteration, dryRun, ctx),
+  );
+}
+
+async function runGateCascadeInner(
   step: Step,
   outputPath: string,
   iteration = 0,

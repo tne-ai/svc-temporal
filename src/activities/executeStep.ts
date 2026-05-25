@@ -15,6 +15,7 @@ import { runGateCascade } from './runGateCascade.js';
 import { resolveTemplateVars } from '../config/templateResolver.js';
 import { buildManifestContent } from '../config/manifestGenerator.js';
 import { emitEvent } from './emitEvent.js';
+import { withWallClockHeartbeat } from './heartbeatTicker.js';
 
 /** Regex matching inline/manual step names: "(gather inputs)" or "APPROVAL_GATE" */
 const INLINE_STEP_RE = /^\(.*\)$|^[A-Z][A-Z0-9_]+$/;
@@ -25,6 +26,19 @@ const INLINE_STEP_RE = /^\(.*\)$|^[A-Z][A-Z0-9_]+$/;
  * This activity heartbeats throughout to keep Temporal informed of progress.
  */
 export async function executeStep(params: StepExecutionParams): Promise<StepResult> {
+  const { step, iteration, templateVars, feedback, humanNotes, workspacePath, workingDir, manifestPath, manifestContent, config, state, currentStepKey, agentBackend, parentRunId, userId, s3Bucket, s3Prefix, phase, parallel, waveIdx } = params;
+
+  // Wall-clock heartbeat ticker for the entire step. Without this, a stall
+  // anywhere inside invokeSkill / runGateCascade (cold worker pod, mid-LLM
+  // hang, slow tool call, init-time S3 sync) that exceeds the activity's
+  // heartbeatTimeout will kill the step even though it's still healthy.
+  return withWallClockHeartbeat(
+    () => ({ step: step.number, skill: step.skill, status: 'tick' }),
+    () => executeStepInner(params),
+  );
+}
+
+async function executeStepInner(params: StepExecutionParams): Promise<StepResult> {
   const { step, iteration, templateVars, feedback, humanNotes, workspacePath, workingDir, manifestPath, manifestContent, config, state, currentStepKey, agentBackend, parentRunId, userId, s3Bucket, s3Prefix, phase, parallel, waveIdx } = params;
 
   heartbeat({ step: step.number, skill: step.skill, status: 'starting' });
