@@ -46,6 +46,7 @@ import {
   STEP_ACTIVITY_TIMEOUT,
   STEP_HEARTBEAT_TIMEOUT,
   STEP_RETRY_POLICY,
+  TRANSIENT_RETRY_POLICY,
   WORKSPACE_SYNC_TIMEOUT,
   CONTINUE_AS_NEW_INTERVAL,
 } from '../shared/constants.js';
@@ -94,21 +95,27 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
     retry: STEP_RETRY_POLICY,
   });
 
-  // Separate proxy for sync activities with shorter timeout
+  // Separate proxy for sync activities. Bumped to TRANSIENT_RETRY_POLICY
+  // (unbounded) — a flaky S3 / network hiccup shouldn't bubble up and
+  // kill a multi-hour FSM run. Heartbeat timeout still catches truly
+  // dead workers.
   const syncActivities = proxyActivities<typeof activities>({
     startToCloseTimeout: WORKSPACE_SYNC_TIMEOUT,
-    heartbeatTimeout: '60s',
-    retry: { maximumAttempts: 2, initialInterval: '5s', backoffCoefficient: 2 },
+    heartbeatTimeout: '5m',
+    retry: TRANSIENT_RETRY_POLICY,
   });
 
-  // Config activity proxy (short timeout — just file reads)
+  // Config activity proxy (short timeout — just file reads). Unbounded
+  // retry so a transient FS hiccup during plugin sync doesn't kill the
+  // run before it even starts.
   const configActivities = proxyActivities<typeof activities>({
     startToCloseTimeout: '30s',
-    retry: { maximumAttempts: 2, initialInterval: '2s', backoffCoefficient: 2 },
+    retry: TRANSIENT_RETRY_POLICY,
   });
 
-  // Fire-and-forget event emission proxy. Used by the workflow itself to emit
-  // cancellation events (the activity-side executeStep handles its own events).
+  // Fire-and-forget event emission. Kept at a single attempt on purpose
+  // — these are best-effort telemetry; an emit failure shouldn't loop
+  // forever or hold up the workflow.
   const eventActivities = proxyActivities<typeof activities>({
     startToCloseTimeout: '15s',
     retry: { maximumAttempts: 1 },

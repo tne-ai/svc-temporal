@@ -21,7 +21,7 @@ import {
 } from '@temporalio/workflow';
 
 import type { RalphInput, RalphResult } from '../shared/types.js';
-import { CONTINUE_AS_NEW_INTERVAL } from '../shared/constants.js';
+import { CONTINUE_AS_NEW_INTERVAL, STEP_RETRY_POLICY, STEP_ACTIVITY_TIMEOUT, STEP_HEARTBEAT_TIMEOUT } from '../shared/constants.js';
 
 import type * as activities from '../activities/index.js';
 
@@ -34,13 +34,9 @@ export const getRalphStatusQuery = defineQuery<{
 
 export async function RalphLoopWorkflow(input: RalphInput): Promise<RalphResult> {
   const { invokeSkill } = proxyActivities<typeof activities>({
-    startToCloseTimeout: '1h',
-    heartbeatTimeout: '60s',
-    retry: {
-      maximumAttempts: 3,
-      initialInterval: '10s',
-      backoffCoefficient: 2,
-    },
+    startToCloseTimeout: STEP_ACTIVITY_TIMEOUT,
+    heartbeatTimeout: STEP_HEARTBEAT_TIMEOUT,
+    retry: STEP_RETRY_POLICY,
   });
 
   let iteration = input.resumeIteration || 0;
