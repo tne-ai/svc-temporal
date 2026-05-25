@@ -62,18 +62,25 @@ export const HEARTBEAT_INTERVAL_MS = 5_000; // 5 seconds
 
 // ─── Retry Policies ─────────────────────────────────────────────────────────
 //
-// Both step and infra retry policies use `maximumAttempts: 0`, which is
-// the Temporal SDK convention for "retry indefinitely". This is
-// intentional: by-design we never fail a workflow because an activity
-// hit a transient infra problem (heartbeat timeout, worker rollover,
-// upstream provider 5xx, S3 hiccup, etc.). The trade-off is that a
-// permanently broken skill (e.g. mis-typed model id, schema mismatch
-// the model can't satisfy) will loop forever accruing LLM cost — kill
-// such runs via the FE's Cancel button.
+// Both step and infra retry policies are UNBOUNDED — we never fail a
+// workflow because an activity hit a transient infra problem (heartbeat
+// timeout, worker rollover, upstream provider 5xx, S3 hiccup, etc.).
+// The trade-off is that a permanently broken skill (mis-typed model id,
+// schema mismatch the model can't satisfy) will loop forever accruing
+// LLM cost — kill such runs via the FE's Cancel button.
+//
+// Temporal SDK convention for "unbounded" used to be maximumAttempts: 0.
+// @temporalio/common ≥ 1.16's compileRetryPolicy validator now throws
+// ValueError: "RetryPolicy.maximumAttempts must be a positive integer"
+// on 0, hard-failing every activity scheduling and looping the workflow
+// task. The current convention is to OMIT the field entirely — the SDK
+// then leaves it unset on the proto, which Temporal interprets as
+// unlimited retries.
+//
+// See: https://github.com/temporalio/sdk-typescript/blob/main/packages/common/src/retry-policy.ts
 
 /** Default retry policy for step activities (unbounded). */
 export const STEP_RETRY_POLICY = {
-  maximumAttempts: 0,
   initialInterval: '10s',
   backoffCoefficient: 2,
   maximumInterval: '5m',
@@ -81,7 +88,6 @@ export const STEP_RETRY_POLICY = {
 
 /** Retry policy for transient infrastructure failures (unbounded). */
 export const TRANSIENT_RETRY_POLICY = {
-  maximumAttempts: 0,
   initialInterval: '5s',
   backoffCoefficient: 2,
   maximumInterval: '2m',
