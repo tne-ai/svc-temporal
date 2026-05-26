@@ -77,7 +77,11 @@ export const cancelSignal = defineSignal('cancel');
  * second click doesn't accidentally upgrade a one-off approval to
  * whole-run auto-approve.
  */
-export const autoApproveSignal = defineSignal('autoApprove');
+// Payload is optional for backward compat — callers that pre-date the
+// bidirectional toggle invoke this signal with no arguments, and the
+// handler treats the empty payload as "enable" (the only thing the
+// original signal could do).
+export const autoApproveSignal = defineSignal<[{ enabled?: boolean }?]>('autoApprove');
 
 // ─── Queries ────────────────────────────────────────────────────────────────
 
@@ -86,6 +90,10 @@ export const getStateQuery = defineQuery<FsmWorkflowState>('getState');
 
 /** Query the current phase */
 export const getPhaseQuery = defineQuery<string>('getPhase');
+
+/** Query the current auto-approve flag so the FE can render the toggle's
+ *  initial state without persisting it in the orion DB. */
+export const getAutoApproveQuery = defineQuery<boolean>('getAutoApprove');
 
 // ─── Workflow Implementation ────────────────────────────────────────────────
 
@@ -241,16 +249,22 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
     cancelled = true;
   });
 
-  // User hit "skip remaining approvals" — release the current gate (if any)
-  // and short-circuit every future one.
-  setHandler(autoApproveSignal, () => {
-    autoApprove = true;
-    approvalReceived = true;
+  // User flipped the auto-approve toggle. With no payload (legacy callers
+  // and the original UI) we enable, which both releases any in-flight
+  // gate and skips every future one. With `{ enabled: false }` we flip
+  // back to manual — but we deliberately do NOT synthesize an approval
+  // here. The intent of disabling is "ask me again", so a gate currently
+  // blocked stays blocked until the user explicitly approves or rejects.
+  setHandler(autoApproveSignal, (payload) => {
+    const enabled = payload?.enabled ?? true;
+    autoApprove = enabled;
+    if (enabled) approvalReceived = true;
   });
 
   // Register query handlers
   setHandler(getStateQuery, () => state);
   setHandler(getPhaseQuery, () => state.phase);
+  setHandler(getAutoApproveQuery, () => autoApprove);
 
   // ─── PREAMBLE ──────────────────────────────────────────────────────────
 
