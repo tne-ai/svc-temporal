@@ -164,6 +164,11 @@ export interface FsmProcessInput {
    *  backend selection is decided by Horizon and surfaced via
    *  `agentBackend`; this field is informational + future-proofing. */
   delegateProvider?: string;
+  /** Optional cap on the generator↔evaluator iteration count. Acts as a
+   *  ceiling against `config.maxIterations` (never raises it). Set to 1
+   *  for one-shot semantics (watchdogs); leave undefined to honor the
+   *  skill's own cap. */
+  maxIterations?: number;
 }
 
 export interface FsmProcessResult {
@@ -343,6 +348,38 @@ export interface JobResult {
   status: 'completed' | 'failed';
   output: string;
   outputFiles?: string[];
+}
+
+// ─── Watchdog Types ─────────────────────────────────────────────────────────
+
+/**
+ * Input for WatchdogWorkflow — a thin wrapper that runs a single w-* skill
+ * unattended on a Temporal schedule. Mirrors tne-plugins' WatchdogWorkflow
+ * (engine/temporal_workflow.py) so a w-* skill defined for one engine runs
+ * identically here.
+ */
+export interface WatchdogInput {
+  /** Name of the w-* skill to run (e.g. "w-cai-ethos4-watch-rules"). */
+  skill: string;
+  /** User id for audit / S3-scope; mirrors FsmProcessInput.userId. */
+  userId: string;
+  /** Optional workspace root. Defaults to /tmp/temporal-watchdog/<runId>. */
+  workspacePath?: string;
+  /** Optional working subdir (forwarded to the child FSM). */
+  workingDir?: string;
+  /** Optional S3 bucket / prefix for workspace sync. */
+  s3Bucket?: string;
+  s3Prefix?: string;
+  /** Agent backend override (forwarded to the child FSM). */
+  agentBackend?: AgentBackend;
+  /** Parse + validate but skip side-effects (forwarded as templateVar). */
+  dryRun?: boolean;
+}
+
+export interface WatchdogResult {
+  skill: string;
+  status: 'completed' | 'failed' | 'cancelled';
+  state: FsmWorkflowState;
 }
 
 // ─── Signal Payloads ────────────────────────────────────────────────────────

@@ -7,6 +7,8 @@
     "build": "tsc",
     "dev": "ts-node --esm src/worker.ts",
     "start": "node dist/worker.js",
+    "submit": "ts-node --esm src/cli/submit.ts",
+    "schedule": "ts-node --esm src/cli/schedule.ts",
     "lint": "eslint src/",
     "test": "vitest"
   },

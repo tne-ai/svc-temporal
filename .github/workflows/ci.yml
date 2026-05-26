@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Typecheck + tests ───────────────────────────────────────────────────
+  # Runs on the repository alone — no tne-plugins submodule checkout, no
+  # cluster access. Validates the TS source compiles and the unit tests
+  # (vitest, src/**) pass. Anything that needs the vendored skills lives
+  # under tne-plugins/** and is excluded by vitest.config.ts.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'yarn'
+
+      - run: yarn install --frozen-lockfile
+
+      - name: Typecheck (tsc)
+        run: yarn build
+
+      - name: Unit tests (vitest)
+        run: yarn test --run
