@@ -808,7 +808,7 @@ async function invokeViaClaudeAgentSDK(
   prompt: string,
   model?: string,
   workspacePath?: string,
-  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string; outputSchema?: Record<string, unknown> },
+  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string; outputSchema?: Record<string, unknown>; agentBackendVia?: 'direct' | 'litellm' },
 ): Promise<InvocationResult> {
   const resolvedModel = resolveModelId(model);
   const workspaceRoot = workspacePath || process.cwd();
@@ -900,6 +900,34 @@ async function invokeViaClaudeAgentSDK(
               '[invokeViaClaudeAgentSDK] OpenRouter slug requested but no API key (BYOK or OPENROUTER_API_KEY) available; the call will fail',
               { model: resolvedModel, userId: context?.userId },
             );
+          }
+        } else if (context?.agentBackendVia === 'litellm') {
+          // Per-user "Route through LiteLLM" preference (Settings → Models).
+          // Point the Agent SDK at the LiteLLM proxy instead of
+          // api.anthropic.com so the SAME request can be fanned out by
+          // the proxy to whatever the model_list resolves to — Claude
+          // Max OAuth, OpenRouter, DeepSeek, Kimi-direct, etc. LiteLLM
+          // authenticates the caller via its master key (the upstream
+          // provider keys are env-substituted into each model entry's
+          // api_key field on its side).
+          const proxyUrl = (process.env.LITELLM_PROXY_URL || '').replace(/\/+$/, '');
+          const masterKey = process.env.LITELLM_MASTER_KEY || '';
+          if (proxyUrl && masterKey) {
+            out.ANTHROPIC_BASE_URL = proxyUrl;
+            out.ANTHROPIC_AUTH_TOKEN = masterKey;
+            out.ANTHROPIC_API_KEY = '';
+            delete out.CLAUDE_CODE_OAUTH_TOKEN;
+            console.log('[invokeViaClaudeAgentSDK] routing via LiteLLM proxy', { proxyUrl, model: resolvedModel, userId: context?.userId });
+          } else {
+            // Misconfigured deploy — fall through to the existing BYOK /
+            // env defaults so we don't break the run. Loud warn so it's
+            // visible in pod logs.
+            console.warn(
+              '[invokeViaClaudeAgentSDK] agentBackendVia=litellm but LITELLM_PROXY_URL/LITELLM_MASTER_KEY missing; falling back to direct',
+              { proxyUrlSet: !!proxyUrl, masterKeySet: !!masterKey, userId: context?.userId },
+            );
+            if (byokOAuth) { out.CLAUDE_CODE_OAUTH_TOKEN = byokOAuth; out.ANTHROPIC_API_KEY = ''; }
+            else if (byokKey) { out.ANTHROPIC_API_KEY = byokKey; delete out.CLAUDE_CODE_OAUTH_TOKEN; }
           }
         } else if (byokOAuth) {
           // Anthropic with BYOK Claude Max OAuth — auth via subscription.
@@ -1096,7 +1124,7 @@ export async function invokeSkill(
   prompt: string,
   workspacePath?: string,
   agentBackend?: AgentBackend,
-  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; workingDir?: string },
+  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; workingDir?: string; agentBackendVia?: 'direct' | 'litellm' },
 ): Promise<InvocationResult> {
   const requestedBackend = agentBackend || AGENT_BACKEND;
   const backend = requestedBackend === 'auto'
