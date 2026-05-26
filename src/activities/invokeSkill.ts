@@ -13,6 +13,43 @@
  * instead — same external surface, no harness dependency.
  */
 
+/**
+ * Pull token counts out of a usage object regardless of shape. Anthropic
+ * emits `input_tokens` / `output_tokens` + cache-aware fields; OpenAI-
+ * compatible providers (OpenRouter, DeepSeek, Kimi, etc.) emit
+ * `prompt_tokens` / `completion_tokens` with no cache breakdown.
+ *
+ * Returns the same shape orion's jobService.applyTokenUpdate /
+ * fsmService.applyTokenUpdate expect (camelCase). When the input usage
+ * has neither key, returns null — the caller skips the emit.
+ */
+function normalizeUsage(usage: any): {
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationInputTokens?: number;
+  cacheReadInputTokens?: number;
+} | null {
+  if (!usage || typeof usage !== 'object') return null;
+  // Anthropic shape first — when both shapes are present (some routers
+  // pass through both) we prefer Anthropic because it carries cache info.
+  if (typeof usage.input_tokens === 'number' || typeof usage.output_tokens === 'number') {
+    return {
+      inputTokens: usage.input_tokens ?? 0,
+      outputTokens: usage.output_tokens ?? 0,
+      cacheCreationInputTokens: usage.cache_creation_input_tokens,
+      cacheReadInputTokens: usage.cache_read_input_tokens,
+    };
+  }
+  // OpenAI / OpenRouter shape.
+  if (typeof usage.prompt_tokens === 'number' || typeof usage.completion_tokens === 'number') {
+    return {
+      inputTokens: usage.prompt_tokens ?? 0,
+      outputTokens: usage.completion_tokens ?? 0,
+    };
+  }
+  return null;
+}
+
 import { spawn } from 'child_process';
 import { existsSync, mkdirSync } from 'fs';
 import { isAbsolute, join, relative } from 'path';
@@ -550,20 +587,19 @@ async function invokeViaHarness(
         });
       } else if (ev.type === 'result') {
         if (typeof ev.text === 'string') stdout += ev.text;
-        // Surface token usage so the UI can render per-step spend. The harness
-        // forwards Anthropic's usage object straight through on the result event.
-        const usage = ev.usage;
-        if (usage && (typeof usage.input_tokens === 'number' || typeof usage.output_tokens === 'number')) {
-          const inTok = usage.input_tokens ?? 0;
-          const outTok = usage.output_tokens ?? 0;
-          if (inTok > 0 || outTok > 0) harnessSawAnyTokens = true;
+        // Surface token usage so the UI can render per-step spend. The
+        // harness path runs against many backends — Anthropic Claude
+        // (input_tokens / output_tokens) and OpenAI-compatible providers
+        // (prompt_tokens / completion_tokens via OpenRouter, DeepSeek,
+        // Kimi, …). Normalize both into the canonical camelCase payload
+        // orion's applyTokenUpdate expects.
+        const norm = normalizeUsage(ev.usage);
+        if (norm) {
+          if (norm.inputTokens > 0 || norm.outputTokens > 0) harnessSawAnyTokens = true;
           const tokenPayload = {
             backend: 'harness',
             model: resolvedModel,
-            inputTokens: inTok,
-            outputTokens: outTok,
-            cacheCreationInputTokens: usage.cache_creation_input_tokens,
-            cacheReadInputTokens: usage.cache_read_input_tokens,
+            ...norm,
             costUsd: typeof ev.total_cost_usd === 'number' ? ev.total_cost_usd : undefined,
           };
           emitEvent(runId, 'token_update', { ...tokenPayload, stepNumber: context?.stepNumber, skill: context?.skill });
@@ -940,15 +976,12 @@ async function invokeViaClaudeAgentSDK(
           structuredOutput = (event as any).structured_output;
         }
 
-        const usage = (event as any).usage;
-        if (usage && (typeof usage.input_tokens === 'number' || typeof usage.output_tokens === 'number')) {
+        const norm = normalizeUsage((event as any).usage);
+        if (norm) {
           const tokenPayload = {
             backend: 'claude-agent-sdk',
             model: resolvedModel,
-            inputTokens: usage.input_tokens ?? 0,
-            outputTokens: usage.output_tokens ?? 0,
-            cacheCreationInputTokens: usage.cache_creation_input_tokens,
-            cacheReadInputTokens: usage.cache_read_input_tokens,
+            ...norm,
             costUsd: typeof (event as any).total_cost_usd === 'number' ? (event as any).total_cost_usd : undefined,
           };
           emitEvent(runId, 'token_update', { ...tokenPayload, stepNumber: context?.stepNumber, skill: context?.skill });
