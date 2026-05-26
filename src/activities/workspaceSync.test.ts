@@ -83,8 +83,12 @@ describe('shouldExclude', () => {
   });
 
   it('does not exclude .claude itself or unrelated children', () => {
-    expect(shouldExclude('.claude/CLAUDE.md')).toBe(false);
-    expect(shouldExclude('.claude/settings.json')).toBe(false);
+    // Pick names that aren't on the explicit deny-list in SYNC_EXCLUDE_PATTERNS
+    // (which includes .claude/CLAUDE.md, .claude/settings.json, etc.) so this
+    // test stays focused on path-prefix over-match behavior rather than
+    // double-counting the literal-match coverage above.
+    expect(shouldExclude('.claude/notes.md')).toBe(false);
+    expect(shouldExclude('.claude/state.json')).toBe(false);
   });
 
   it('does not over-exclude paths that merely share a prefix', () => {
