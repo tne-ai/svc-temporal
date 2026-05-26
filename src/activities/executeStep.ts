@@ -7,7 +7,7 @@
  */
 
 import { heartbeat } from '@temporalio/activity';
-import { existsSync, mkdirSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, statSync, writeFileSync } from 'fs';
 import { dirname, isAbsolute, join } from 'path';
 import type { StepExecutionParams, StepResult } from '../shared/types.js';
 import { invokeSkill, buildPrompt } from './invokeSkill.js';
@@ -19,6 +19,42 @@ import { withWallClockHeartbeat } from './heartbeatTicker.js';
 
 /** Regex matching inline/manual step names: "(gather inputs)" or "APPROVAL_GATE" */
 const INLINE_STEP_RE = /^\(.*\)$|^[A-Z][A-Z0-9_]+$/;
+
+/**
+ * Snapshot mtimes of a step's output + declared inputs at "step complete"
+ * time. Recorded values flow back into `StepState.outputMtime` /
+ * `StepState.inputMtimes` and feed `checkFreshness` on workflow resume.
+ *
+ * Conservatively returns whatever files actually exist on disk — missing
+ * inputs are simply omitted so a step that didn't read every declared
+ * input doesn't accidentally invalidate itself forever.
+ */
+function snapshotMtimes(
+  inputs: string[],
+  cwdRoot: string,
+  outputPathAbs: string | undefined,
+): { outputMtime?: number; inputMtimes: Record<string, number> } {
+  let outputMtime: number | undefined;
+  if (outputPathAbs && existsSync(outputPathAbs)) {
+    try {
+      outputMtime = statSync(outputPathAbs).mtimeMs;
+    } catch {
+      // ignore — missing/unreadable just means we don't track it
+    }
+  }
+  const inputMtimes: Record<string, number> = {};
+  for (const inp of inputs || []) {
+    if (!inp) continue;
+    const inpAbs = isAbsolute(inp) ? inp : join(cwdRoot, inp);
+    if (!existsSync(inpAbs)) continue;
+    try {
+      inputMtimes[inp] = statSync(inpAbs).mtimeMs;
+    } catch {
+      // ignore
+    }
+  }
+  return { outputMtime, inputMtimes };
+}
 
 /**
  * Execute a single step: invoke skill, run gate cascade, retry on failure.
@@ -152,9 +188,12 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
 
       if (cascadeResult.passed) {
         emitEvent(parentRunId, 'step_complete', { stepNumber: step.number, skill: step.skill, iteration, outputPath });
+        const mt = snapshotMtimes(step.inputs, cwdRoot, outputPathAbs);
         return {
           success: true,
           outputPath,
+          outputMtime: mt.outputMtime,
+          inputMtimes: mt.inputMtimes,
           gateResults: Object.fromEntries(
             cascadeResult.gateResults.map(gr => [
               gr.gateNumber,
@@ -250,7 +289,12 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
       outputPath: outputPath || undefined,
       sideEffectOnly: true,
     });
-    return { success: true, outputPath: outputPath || undefined };
+    const mt = snapshotMtimes(step.inputs, cwdRoot, undefined);
+    return {
+      success: true,
+      outputPath: outputPath || undefined,
+      inputMtimes: mt.inputMtimes,
+    };
   }
 }
 
@@ -268,7 +312,13 @@ function handleInlineStep(
     : '';
 
   if (outputPath && existsSync(outputPath)) {
-    return { success: true, outputPath };
+    let outputMtime: number | undefined;
+    try {
+      outputMtime = statSync(outputPath).mtimeMs;
+    } catch {
+      // ignore
+    }
+    return { success: true, outputPath, outputMtime };
   }
 
   return {

@@ -29,6 +29,7 @@ import type {
   FsmProcessInput,
   FsmProcessResult,
   FsmWorkflowState,
+  FreshnessCheckParams,
   ProcessConfig,
   StepState,
   Step,
@@ -37,6 +38,7 @@ import type {
   StepExecutionParams,
   ApprovalSignalPayload,
 } from '../shared/types.js';
+import { handleBackprop, propagateForward } from './propagation.js';
 import {
   Phase,
   StepStatus,
@@ -113,6 +115,15 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
     retry: TRANSIENT_RETRY_POLICY,
   });
 
+  // Freshness-check proxy — checkFreshness only stats a few files but it
+  // can target a workspace that's slow to mount immediately post-resume.
+  // 2-min ceiling matches the activity heartbeat budget; transient retry
+  // because we'd rather wait than skip the backprop scan.
+  const freshnessActivities = proxyActivities<typeof activities>({
+    startToCloseTimeout: '2m',
+    retry: TRANSIENT_RETRY_POLICY,
+  });
+
   // Fire-and-forget event emission. Kept at a single attempt on purpose
   // — these are best-effort telemetry; an emit failure shouldn't loop
   // forever or hold up the workflow.
@@ -141,6 +152,42 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
 
   // Initialize or resume state
   const state: FsmWorkflowState = input.resumeState || initializeState(config);
+
+  // ── Backprop · freshness check on resume ────────────────────────────────
+  // Mirrors tne-engine's `propagation.check_freshness` (Python). When the
+  // workflow resumes (continueAsNew tick OR external resume after a pod
+  // restart), walk every previously-COMPLETE step's recorded mtimes.
+  // External edits to outputs OR inputs newer than the recorded output
+  // mark the owning step STALE; `propagateForward` then cascades to every
+  // transitive dependent so we don't compute downstream artifacts off
+  // outdated inputs. First-run state has nothing to check — skip.
+  if (input.resumeState) {
+    const recorded: FreshnessCheckParams['recorded'] = {};
+    for (const [k, ss] of Object.entries(state.steps)) {
+      if (ss.status !== StepStatus.COMPLETE) continue;
+      if (!ss.outputMtime && !ss.inputMtimes) continue;
+      recorded[k] = { outputPath: ss.outputPath, outputMtime: ss.outputMtime, inputMtimes: ss.inputMtimes };
+    }
+    if (Object.keys(recorded).length > 0) {
+      try {
+        const fresh = await freshnessActivities.checkFreshness({
+          runId: input.runId,
+          workspacePath: input.workspacePath,
+          workingDir: input.workingDir,
+          recorded,
+        });
+        const stale = new Set<string>([...fresh.externallyModified, ...fresh.inputsNewer]);
+        for (const key of stale) {
+          const ss = state.steps[key];
+          if (ss) ss.status = StepStatus.STALE;
+        }
+        if (stale.size > 0) propagateForward(state, stale, config);
+      } catch (err) {
+        // Freshness scan is best-effort — log + continue with prior state.
+        console.warn('[FsmProcessWorkflow] checkFreshness failed (non-fatal):', err);
+      }
+    }
+  }
 
   // ── Pull workspace from S3 (skip on resume — already pulled) ──────────
   // Scoped by `workingDir` so a run in "<root>/test1" only pulls S3
@@ -277,6 +324,25 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   }
 
   while (state.iteration <= effectiveMaxIterations && !cancelled) {
+    // ── Backprop · stale-replay pass ────────────────────────────────────
+    // Any preamble step the prior iteration's `handleBackprop` (or a
+    // resume freshness check) flagged STALE re-runs here, BEFORE the
+    // generator phase, so downstream output picks up the corrected
+    // preamble artifact. Feedback stashed on the stale step (set by
+    // `handleBackprop`) gets prepended to the new prompt via
+    // `collectStaleFeedback`, mirroring tne-engine's behavior.
+    for (const step of config.preamble) {
+      if (cancelled) return { status: 'cancelled', state };
+      const stepKey = `preamble.${step.number}`;
+      if (state.steps[stepKey]?.status !== StepStatus.STALE) continue;
+      const replayFeedback = state.steps[stepKey]?.feedback;
+      const replayResult = await executeStep(
+        buildStepParams(step, state.iteration, input, config, state, replayFeedback),
+      );
+      updateStepState(state, stepKey, replayResult);
+      if (!replayResult.success) return { status: 'failed', state };
+    }
+
     // Generator phase
     state.phase = Phase.GENERATOR;
     const feedback = collectFeedback(state);
@@ -368,6 +434,15 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
     state.iterations.push(record);
 
     if (allPassed) break;
+
+    // ── Backprop · evaluator-driven ─────────────────────────────────────
+    // Scan the evaluators' combined feedback for an explicit or inferred
+    // backprop target (e.g. `backprop_to: preamble.2`). When matched,
+    // mark the target STALE + cascade to dependents — the next iteration
+    // of this loop replays it before re-running the generator. No-op
+    // when the feedback doesn't name a target; the generator just iterates
+    // normally with the evaluator feedback as before.
+    handleBackprop(state, keyIssues.join('\n'), config);
 
     state.iteration++;
 
@@ -545,6 +620,12 @@ function updateStepState(state: FsmWorkflowState, stepKey: string, result: StepR
     gateResults: result.gateResults,
     completedAt: new Date().toISOString(),
     retries: state.steps[stepKey]?.retries || 0,
+    // Snapshot the activity-recorded mtimes so a future resume's
+    // freshness check has a baseline. Only set when present — preserving
+    // any prior values on a re-run that didn't write the output (e.g.
+    // gate-cascade infra error).
+    ...(result.outputMtime != null ? { outputMtime: result.outputMtime } : {}),
+    ...(result.inputMtimes ? { inputMtimes: result.inputMtimes } : {}),
   };
 }
 
