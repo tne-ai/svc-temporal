@@ -263,7 +263,13 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   // (p-ceo1-manage-strategy et al.) now actually run their generator.
 
   const sequentialOnly = config.evaluatorMode === EvaluatorMode.SEQUENTIAL_ONLY;
-  const effectiveMaxIterations = sequentialOnly ? 1 : config.maxIterations;
+  // Caller-supplied input.maxIterations acts as a ceiling against the
+  // skill's own cap — never raises it. Watchdogs pass 1 for one-shot
+  // semantics; everything else leaves it undefined.
+  const skillCap = sequentialOnly ? 1 : config.maxIterations;
+  const effectiveMaxIterations = input.maxIterations != null
+    ? Math.min(skillCap, input.maxIterations)
+    : skillCap;
 
   if (state.phase === Phase.PREAMBLE || state.phase === Phase.APPROVAL_GATE) {
     state.phase = Phase.GENERATOR;

@@ -56,11 +56,25 @@ export async function WatchdogWorkflow(input: WatchdogInput): Promise<WatchdogRe
   const fsmInput: FsmProcessInput = {
     runId,
     skillName: input.skill,
+    // Python passes dry_run as a first-class FSM param; svc-temporal's
+    // FsmProcessInput has no dryRun field, so surface it as a templateVar
+    // the skill can read (`{{dry_run}}`). Slight semantic gap with the
+    // Python engine — documented here so a future first-class dryRun
+    // field on FsmProcessInput knows what to absorb.
     templateVars: input.dryRun ? { dry_run: 'true' } : {},
-    workspacePath: input.workspacePath ?? `/tmp/temporal-watchdog/${runId}`,
+    // Default to "." (cwd of the worker activity) to match Python's
+    // `project_dir = params.project_dir or "."`. A watchdog that
+    // inspects "the repo I'm running against" then sees real files
+    // instead of an empty tmp dir. Callers that want isolation pass
+    // an absolute path explicitly.
+    workspacePath: input.workspacePath ?? '.',
     workingDir: input.workingDir,
     userId: input.userId,
     autoApprove: true,
+    // One-shot semantics — caps the FSM's generator↔evaluator loop at
+    // a single iteration. Matches Python's WatchdogWorkflow which
+    // passes `max_iterations=1` to its child ProcessWorkflow.
+    maxIterations: 1,
     s3Bucket: input.s3Bucket,
     s3Prefix: input.s3Prefix,
     agentBackend: input.agentBackend,
@@ -73,6 +87,11 @@ export async function WatchdogWorkflow(input: WatchdogInput): Promise<WatchdogRe
       taskQueue: info.taskQueue,
       workflowId: childWorkflowId,
       args: [fsmInput],
+      // 30-min hard cap on the child — matches Python's
+      // `execution_timeout=timedelta(minutes=30)`. Without this a
+      // misbehaving watchdog could spin indefinitely on its schedule
+      // and starve the FSM queue.
+      workflowExecutionTimeout: '30m',
     },
   );
 

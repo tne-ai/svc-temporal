@@ -164,6 +164,11 @@ export interface FsmProcessInput {
    *  backend selection is decided by Horizon and surfaced via
    *  `agentBackend`; this field is informational + future-proofing. */
   delegateProvider?: string;
+  /** Optional cap on the generator↔evaluator iteration count. Acts as a
+   *  ceiling against `config.maxIterations` (never raises it). Set to 1
+   *  for one-shot semantics (watchdogs); leave undefined to honor the
+   *  skill's own cap. */
+  maxIterations?: number;
 }
 
 export interface FsmProcessResult {
