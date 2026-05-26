@@ -194,6 +194,15 @@ export interface StepState {
   retries: number;
   startedAt?: string;
   completedAt?: string;
+  /** Mtime (Unix epoch ms) of `outputPath` recorded at step-complete time.
+   *  Used by `checkFreshness` on resume to detect external edits and by
+   *  `propagateForward` after a backprop event. Mirrors the Python engine's
+   *  `state.steps[key]["output_mtime"]` field. */
+  outputMtime?: number;
+  /** Mtimes of every file declared in `step.inputs`, captured when the step
+   *  ran. On resume the freshness check compares these against current
+   *  mtimes to spot inputs that changed since this step last completed. */
+  inputMtimes?: Record<string, number>;
 }
 
 export interface IterationRecord {
@@ -256,6 +265,41 @@ export interface StepResult {
   feedback?: string;
   error?: string;
   gateResults?: Record<number, string>;
+  /** Mtime (Unix epoch ms) of the file at `outputPath`, captured by the
+   *  activity right after gate cascade passes. The workflow stores it on
+   *  the step's StepState so a later `checkFreshness` pass can detect
+   *  external edits across runs. */
+  outputMtime?: number;
+  /** Mtimes of the files referenced by `step.inputs` at the moment the
+   *  step ran. */
+  inputMtimes?: Record<string, number>;
+}
+
+// ─── Freshness Check (backprop on resume) ──────────────────────────────────
+
+export interface FreshnessCheckParams {
+  /** Workflow runId — forwarded for log correlation. */
+  runId: string;
+  /** Workspace root the step executed against (same semantics as
+   *  `FsmProcessInput.workspacePath`). */
+  workspacePath: string;
+  /** Optional working subdir — input/output paths are resolved against
+   *  `join(workspacePath, workingDir)`. */
+  workingDir?: string;
+  /** Snapshot of every step's recorded mtimes. Keyed by step key
+   *  (e.g. `"preamble.1"`). */
+  recorded: Record<string, { outputPath?: string; outputMtime?: number; inputMtimes?: Record<string, number> }>;
+}
+
+export interface FreshnessCheckResult {
+  /** Step keys whose output was edited externally since the last recorded
+   *  mtime. Per the Python engine's conservative model these mark the
+   *  step itself stale; the workflow's `propagateForward` then cascades
+   *  to dependents. */
+  externallyModified: string[];
+  /** Step keys whose declared inputs are newer than the step's recorded
+   *  output — the step needs to re-run. */
+  inputsNewer: string[];
 }
 
 export interface InvocationResult {
