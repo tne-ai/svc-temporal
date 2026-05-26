@@ -169,6 +169,12 @@ export interface FsmProcessInput {
    *  for one-shot semantics (watchdogs); leave undefined to honor the
    *  skill's own cap. */
   maxIterations?: number;
+  /** Per-run routing for the Claude Agent SDK invocation. Mirrors the
+   *  user's `agentBackendVia` column. When `'litellm'`, invokeSkill
+   *  rewrites `ANTHROPIC_BASE_URL` to the LiteLLM proxy URL so the SDK
+   *  fans out via the proxy's model_list instead of api.anthropic.com.
+   *  Undefined / `'direct'` keeps the historical behavior. */
+  agentBackendVia?: 'direct' | 'litellm';
 }
 
 export interface FsmProcessResult {
@@ -249,6 +255,10 @@ export interface StepExecutionParams {
    *  generation to know which step is "current" (excluded from manifest). */
   currentStepKey?: string;
   agentBackend?: AgentBackend;
+  /** Per-run routing for the Claude Agent SDK invocation. Mirrors
+   *  `FsmProcessInput.agentBackendVia` — threaded through here so the
+   *  per-step executeStep activity can forward it to invokeSkill. */
+  agentBackendVia?: 'direct' | 'litellm';
   /** Parent FSM run id — passed to the agent so nested fsm-start calls link back. */
   parentRunId?: string;
   /** User id — forwarded to horizon's /api/fsm-invoke/start for nested FSM runs. */
@@ -386,6 +396,10 @@ export interface JobInput {
    *  headless / M2M callers aren't parked forever waiting for a human
    *  approval signal. Ignored outside the FSM dispatch path. */
   autoApprove?: boolean;
+  /** Same semantics as `FsmProcessInput.agentBackendVia` — route the
+   *  Claude Agent SDK call through LiteLLM (`'litellm'`) or straight to
+   *  api.anthropic.com (`'direct'` / undefined). */
+  agentBackendVia?: 'direct' | 'litellm';
 }
 
 export interface JobResult {
