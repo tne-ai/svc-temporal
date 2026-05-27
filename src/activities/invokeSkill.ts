@@ -894,13 +894,53 @@ async function invokeViaClaudeAgentSDK(
         const proxyUrl = (process.env.LITELLM_PROXY_URL || '').replace(/\/+$/, '');
         const masterKey = process.env.LITELLM_MASTER_KEY || '';
 
-        if (proxyUrl && masterKey) {
+        // Anthropic-native models (claude-*) bypass LiteLLM and talk to
+        // api.anthropic.com directly. The cluster carries a Claude Max
+        // OAuth token (CLAUDE_CODE_OAUTH_TOKEN, sk-ant-oat01-…) — routing
+        // those calls through LiteLLM would force its model_list entries
+        // to use a metered ANTHROPIC_API_KEY (silent downgrade off the
+        // subscription) AND LiteLLM doesn't currently forward sk-ant-oat
+        // tokens. So for claude-* we keep the SDK pointed at Anthropic
+        // and let it use OAuth (or BYOK). Non-Anthropic models still go
+        // through LiteLLM, which is where the gateway adds value.
+        const isAnthropicModel = !!resolvedModel && /^claude[-_]/i.test(resolvedModel);
+
+        if (proxyUrl && masterKey && !isAnthropicModel) {
           out.ANTHROPIC_BASE_URL = proxyUrl;
           out.ANTHROPIC_AUTH_TOKEN = masterKey;
           out.ANTHROPIC_API_KEY = '';
           delete out.CLAUDE_CODE_OAUTH_TOKEN;
           console.log('[invokeViaClaudeAgentSDK] routing via LiteLLM proxy', {
             proxyUrl, model: resolvedModel, userId: context?.userId,
+          });
+        } else if (isAnthropicModel) {
+          // Direct-to-Anthropic with OAuth (Claude Max) or BYOK.
+          if (byokOAuth) {
+            out.CLAUDE_CODE_OAUTH_TOKEN = byokOAuth;
+            out.ANTHROPIC_API_KEY = '';
+          } else if (byokKey) {
+            out.ANTHROPIC_API_KEY = byokKey;
+            delete out.CLAUDE_CODE_OAUTH_TOKEN;
+          } else {
+            // Deploy default: prefer the OAuth token; only fall back to a
+            // metered API key if no OAuth is configured.
+            const oauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+            const apiKey = process.env.ANTHROPIC_API_KEY;
+            if (oauth) {
+              out.CLAUDE_CODE_OAUTH_TOKEN = oauth;
+              out.ANTHROPIC_API_KEY = '';
+            } else if (apiKey && apiKey.trim()) {
+              out.ANTHROPIC_API_KEY = apiKey;
+              delete out.CLAUDE_CODE_OAUTH_TOKEN;
+            }
+          }
+          // Make sure we're NOT pointed at LiteLLM for this call.
+          delete out.ANTHROPIC_BASE_URL;
+          delete out.ANTHROPIC_AUTH_TOKEN;
+          console.log('[invokeViaClaudeAgentSDK] direct to api.anthropic.com', {
+            model: resolvedModel,
+            auth: out.CLAUDE_CODE_OAUTH_TOKEN ? 'oauth' : (out.ANTHROPIC_API_KEY ? 'api_key' : 'none'),
+            userId: context?.userId,
           });
         } else {
           // Deploy missing LiteLLM config — fall back to the historical
