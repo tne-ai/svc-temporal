@@ -75,7 +75,7 @@ export async function executeStep(params: StepExecutionParams): Promise<StepResu
 }
 
 async function executeStepInner(params: StepExecutionParams): Promise<StepResult> {
-  const { step, iteration, templateVars, feedback, humanNotes, workspacePath, workingDir, manifestPath, manifestContent, config, state, currentStepKey, agentBackend, agentBackendVia, parentRunId, userId, s3Bucket, s3Prefix, phase, parallel, waveIdx } = params;
+  const { step, iteration, templateVars, feedback, humanNotes, workspacePath, workingDir, manifestPath, manifestContent, config, state, currentStepKey, agentBackend, toolHarness, parentRunId, userId, s3Bucket, s3Prefix, phase, parallel, waveIdx } = params;
 
   heartbeat({ step: step.number, skill: step.skill, status: 'starting' });
   emitEvent(parentRunId, 'step_start', { stepNumber: step.number, skill: step.skill, iteration, phase, parallel, waveIdx });
@@ -117,7 +117,7 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
     emitEvent(parentRunId, 'heartbeat', { stepNumber: step.number, skill: step.skill, status: 'invoking', retry: retries });
 
     // Invoke the skill
-    const invResult = await invokeSkill(step, prompt + (currentFeedback ? `\n\n## Revision Feedback\n\n${currentFeedback}` : ''), workspacePath, agentBackend, { parentRunId, userId, s3Bucket, s3Prefix, workingDir, agentBackendVia });
+    const invResult = await invokeSkill(step, prompt + (currentFeedback ? `\n\n## Revision Feedback\n\n${currentFeedback}` : ''), workspacePath, agentBackend, { parentRunId, userId, s3Bucket, s3Prefix, workingDir, toolHarness });
 
     if (!invResult.success) {
       // Check for stage review pause (nested orchestrator)

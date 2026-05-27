@@ -808,7 +808,7 @@ async function invokeViaClaudeAgentSDK(
   prompt: string,
   model?: string,
   workspacePath?: string,
-  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string; outputSchema?: Record<string, unknown>; agentBackendVia?: 'direct' | 'litellm' },
+  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string; outputSchema?: Record<string, unknown>; toolHarness?: 'pi' | 'claude_sdk' },
 ): Promise<InvocationResult> {
   const resolvedModel = resolveModelId(model);
   const workspaceRoot = workspacePath || process.cwd();
@@ -874,80 +874,64 @@ async function invokeViaClaudeAgentSDK(
         ? { type: 'json_schema', schema: context.outputSchema }
         : undefined,
       env: (() => {
-        // BYOK takes precedence over env-var defaults; see fetch above.
+        // LiteLLM is the always-on model transport. The Claude Agent SDK
+        // speaks Anthropic protocol to the proxy; the proxy translates to
+        // whatever the model_name resolves to in its model_list (Anthropic,
+        // OpenRouter, Kimi, Gemini, etc.). This collapses the previous
+        // per-provider branching (OpenRouter slug path, agentBackendVia
+        // toggle, BYOK env juggling) into one path.
+        //
+        // Auth ladder:
+        //   1. proxy <- LITELLM_MASTER_KEY (proxy admin auth)
+        //   2. upstream <- whatever model_list entry's api_key resolves to
+        //      (env-substituted per provider in the LiteLLM config)
+        //   BYOK passthrough for the SDK path is a follow-up — the SDK
+        //   doesn't expose extra_body, so user keys can't ride the request
+        //   today. Until then, users on this path share the deploy's
+        //   upstream credentials. The chat-mode path (litellmProvider.ts)
+        //   does forward BYOK via body.api_key.
         const out: Record<string, string> = { ...(process.env as Record<string, string>) };
-        const isOpenRouterModel = !!resolvedModel && resolvedModel.includes('/');
+        const proxyUrl = (process.env.LITELLM_PROXY_URL || '').replace(/\/+$/, '');
+        const masterKey = process.env.LITELLM_MASTER_KEY || '';
 
-        if (isOpenRouterModel) {
-          // OpenRouter via the Anthropic Skin pattern. BYOK key (per-user
-          // OpenRouter key) wins; otherwise the deployment OPENROUTER_API_KEY.
-          const orKey = byokKey || process.env.OPENROUTER_API_KEY?.trim();
-          if (orKey) {
-            out.ANTHROPIC_BASE_URL = 'https://openrouter.ai/api';
-            out.ANTHROPIC_AUTH_TOKEN = orKey;
-            out.ANTHROPIC_API_KEY = ''; // explicitly empty per OpenRouter docs
-            delete out.CLAUDE_CODE_OAUTH_TOKEN;
-            const lower = resolvedModel.toLowerCase();
-            if (lower.includes('opus') || lower.includes('pro')) {
-              out.ANTHROPIC_DEFAULT_OPUS_MODEL = resolvedModel;
-            } else if (lower.includes('haiku') || lower.includes('mini') || lower.includes('flash')) {
-              out.ANTHROPIC_DEFAULT_HAIKU_MODEL = resolvedModel;
-            } else {
-              out.ANTHROPIC_DEFAULT_SONNET_MODEL = resolvedModel;
-            }
-          } else {
-            console.warn(
-              '[invokeViaClaudeAgentSDK] OpenRouter slug requested but no API key (BYOK or OPENROUTER_API_KEY) available; the call will fail',
-              { model: resolvedModel, userId: context?.userId },
-            );
-          }
-        } else if (context?.agentBackendVia === 'litellm') {
-          // Per-user "Route through LiteLLM" preference (Settings → Models).
-          // Point the Agent SDK at the LiteLLM proxy instead of
-          // api.anthropic.com so the SAME request can be fanned out by
-          // the proxy to whatever the model_list resolves to — Claude
-          // Max OAuth, OpenRouter, DeepSeek, Kimi-direct, etc. LiteLLM
-          // authenticates the caller via its master key (the upstream
-          // provider keys are env-substituted into each model entry's
-          // api_key field on its side).
-          const proxyUrl = (process.env.LITELLM_PROXY_URL || '').replace(/\/+$/, '');
-          const masterKey = process.env.LITELLM_MASTER_KEY || '';
-          if (proxyUrl && masterKey) {
-            out.ANTHROPIC_BASE_URL = proxyUrl;
-            out.ANTHROPIC_AUTH_TOKEN = masterKey;
-            out.ANTHROPIC_API_KEY = '';
-            delete out.CLAUDE_CODE_OAUTH_TOKEN;
-            console.log('[invokeViaClaudeAgentSDK] routing via LiteLLM proxy', { proxyUrl, model: resolvedModel, userId: context?.userId });
-          } else {
-            // Misconfigured deploy — fall through to the existing BYOK /
-            // env defaults so we don't break the run. Loud warn so it's
-            // visible in pod logs.
-            console.warn(
-              '[invokeViaClaudeAgentSDK] agentBackendVia=litellm but LITELLM_PROXY_URL/LITELLM_MASTER_KEY missing; falling back to direct',
-              { proxyUrlSet: !!proxyUrl, masterKeySet: !!masterKey, userId: context?.userId },
-            );
-            if (byokOAuth) { out.CLAUDE_CODE_OAUTH_TOKEN = byokOAuth; out.ANTHROPIC_API_KEY = ''; }
-            else if (byokKey) { out.ANTHROPIC_API_KEY = byokKey; delete out.CLAUDE_CODE_OAUTH_TOKEN; }
-          }
-        } else if (byokOAuth) {
-          // Anthropic with BYOK Claude Max OAuth — auth via subscription.
-          // Clear API key so the SDK doesn't try to send both auth headers.
-          out.CLAUDE_CODE_OAUTH_TOKEN = byokOAuth;
+        if (proxyUrl && masterKey) {
+          out.ANTHROPIC_BASE_URL = proxyUrl;
+          out.ANTHROPIC_AUTH_TOKEN = masterKey;
           out.ANTHROPIC_API_KEY = '';
-        } else if (byokKey) {
-          // Anthropic with BYOK: user's own ANTHROPIC_API_KEY. Clear the
-          // OAuth token so the SDK prefers the API key.
-          out.ANTHROPIC_API_KEY = byokKey;
           delete out.CLAUDE_CODE_OAUTH_TOKEN;
+          console.log('[invokeViaClaudeAgentSDK] routing via LiteLLM proxy', {
+            proxyUrl, model: resolvedModel, userId: context?.userId,
+          });
         } else {
-          // No BYOK; use env defaults. OAuth tokens must stay in
-          // CLAUDE_CODE_OAUTH_TOKEN — they're rejected as invalid if sent
-          // via x-api-key (ANTHROPIC_API_KEY).
-          const oauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-          const apiKey = process.env.ANTHROPIC_API_KEY;
-          if (oauth && (!apiKey || !apiKey.trim())) {
-            delete out.ANTHROPIC_API_KEY;
-            out.CLAUDE_CODE_OAUTH_TOKEN = oauth;
+          // Deploy missing LiteLLM config — fall back to the historical
+          // direct-to-Anthropic path so the call still goes through. Loud
+          // warn so the misconfiguration is visible in pod logs.
+          console.warn(
+            '[invokeViaClaudeAgentSDK] LITELLM_PROXY_URL/LITELLM_MASTER_KEY missing — falling back to direct provider auth (BYOK or env)',
+            { proxyUrlSet: !!proxyUrl, masterKeySet: !!masterKey, userId: context?.userId },
+          );
+          const isOpenRouterModel = !!resolvedModel && resolvedModel.includes('/');
+          if (isOpenRouterModel) {
+            const orKey = byokKey || process.env.OPENROUTER_API_KEY?.trim();
+            if (orKey) {
+              out.ANTHROPIC_BASE_URL = 'https://openrouter.ai/api';
+              out.ANTHROPIC_AUTH_TOKEN = orKey;
+              out.ANTHROPIC_API_KEY = '';
+              delete out.CLAUDE_CODE_OAUTH_TOKEN;
+            }
+          } else if (byokOAuth) {
+            out.CLAUDE_CODE_OAUTH_TOKEN = byokOAuth;
+            out.ANTHROPIC_API_KEY = '';
+          } else if (byokKey) {
+            out.ANTHROPIC_API_KEY = byokKey;
+            delete out.CLAUDE_CODE_OAUTH_TOKEN;
+          } else {
+            const oauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+            const apiKey = process.env.ANTHROPIC_API_KEY;
+            if (oauth && (!apiKey || !apiKey.trim())) {
+              delete out.ANTHROPIC_API_KEY;
+              out.CLAUDE_CODE_OAUTH_TOKEN = oauth;
+            }
           }
         }
         return out;
@@ -1124,14 +1108,31 @@ export async function invokeSkill(
   prompt: string,
   workspacePath?: string,
   agentBackend?: AgentBackend,
-  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; workingDir?: string; agentBackendVia?: 'direct' | 'litellm' },
+  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; workingDir?: string; toolHarness?: 'pi' | 'claude_sdk' },
 ): Promise<InvocationResult> {
-  const requestedBackend = agentBackend || AGENT_BACKEND;
-  const backend = requestedBackend === 'auto'
-    ? pickBackendByModel(step.model)
-    : requestedBackend;
+  // toolHarness overrides the legacy `agentBackend` param when set.
+  // Orion resolves the user's `User.toolHarness` (auto/pi/claude_sdk) +
+  // reasoning provider into a concrete 'pi' | 'claude_sdk' before calling
+  // svc-temporal, so by the time we land here it's a hard choice.
+  const harness = context?.toolHarness;
+  let backend: AgentBackend;
+  if (harness === 'pi') {
+    backend = 'harness';
+  } else if (harness === 'claude_sdk') {
+    backend = 'claude-agent-sdk';
+  } else {
+    const requestedBackend = agentBackend || AGENT_BACKEND;
+    backend = requestedBackend === 'auto'
+      ? pickBackendByModel(step.model)
+      : requestedBackend;
+  }
+  // Surface where the backend choice came from: explicit toolHarness wins,
+  // else legacy auto/agentBackend resolution applied.
+  const choiceSource = harness
+    ? `toolHarness=${harness}`
+    : (agentBackend || AGENT_BACKEND) === 'auto' ? 'auto' : 'agentBackend';
   console.log(
-    `[invokeSkill] backend=${backend}${requestedBackend === 'auto' ? ' (auto)' : ''}, ` +
+    `[invokeSkill] backend=${backend} (${choiceSource}), ` +
     `skill=${step.skill}, model=${step.model || 'default'}, parentRunId=${context?.parentRunId || ''}`,
   );
 
