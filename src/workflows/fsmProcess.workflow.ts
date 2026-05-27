@@ -604,7 +604,7 @@ function buildStepParams(
     workspacePath: input.workspacePath,
     workingDir: input.workingDir,
     agentBackend: input.agentBackend,
-    agentBackendVia: input.agentBackendVia,
+    toolHarness: input.toolHarness,
     parentRunId: input.runId,
     userId: input.userId,
     s3Bucket: input.s3Bucket,

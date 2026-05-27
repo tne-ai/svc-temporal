@@ -169,12 +169,15 @@ export interface FsmProcessInput {
    *  for one-shot semantics (watchdogs); leave undefined to honor the
    *  skill's own cap. */
   maxIterations?: number;
-  /** Per-run routing for the Claude Agent SDK invocation. Mirrors the
-   *  user's `agentBackendVia` column. When `'litellm'`, invokeSkill
-   *  rewrites `ANTHROPIC_BASE_URL` to the LiteLLM proxy URL so the SDK
-   *  fans out via the proxy's model_list instead of api.anthropic.com.
-   *  Undefined / `'direct'` keeps the historical behavior. */
-  agentBackendVia?: 'direct' | 'litellm';
+  /** Per-run tool harness — picks who runs the agent loop. Mirrors orion's
+   *  `User.toolHarness` resolved into a concrete choice:
+   *    `'claude_sdk'` — invokeSkill uses the Claude Agent SDK
+   *    `'pi'`         — invokeSkill uses the Pi (in-process) harness
+   *  LiteLLM is always-on as the model transport regardless of this value;
+   *  the proxy translates per-model upstream. Undefined falls back to the
+   *  per-deploy AGENT_BACKEND env-var default for compatibility with the
+   *  pre-toolHarness migration. */
+  toolHarness?: 'pi' | 'claude_sdk';
 }
 
 export interface FsmProcessResult {
@@ -255,10 +258,10 @@ export interface StepExecutionParams {
    *  generation to know which step is "current" (excluded from manifest). */
   currentStepKey?: string;
   agentBackend?: AgentBackend;
-  /** Per-run routing for the Claude Agent SDK invocation. Mirrors
-   *  `FsmProcessInput.agentBackendVia` — threaded through here so the
-   *  per-step executeStep activity can forward it to invokeSkill. */
-  agentBackendVia?: 'direct' | 'litellm';
+  /** Mirrors `FsmProcessInput.toolHarness` — threaded through so the
+   *  per-step executeStep activity can forward it to invokeSkill, which
+   *  picks Claude SDK vs Pi orchestration. */
+  toolHarness?: 'pi' | 'claude_sdk';
   /** Parent FSM run id — passed to the agent so nested fsm-start calls link back. */
   parentRunId?: string;
   /** User id — forwarded to horizon's /api/fsm-invoke/start for nested FSM runs. */
@@ -396,10 +399,9 @@ export interface JobInput {
    *  headless / M2M callers aren't parked forever waiting for a human
    *  approval signal. Ignored outside the FSM dispatch path. */
   autoApprove?: boolean;
-  /** Same semantics as `FsmProcessInput.agentBackendVia` — route the
-   *  Claude Agent SDK call through LiteLLM (`'litellm'`) or straight to
-   *  api.anthropic.com (`'direct'` / undefined). */
-  agentBackendVia?: 'direct' | 'litellm';
+  /** Same semantics as `FsmProcessInput.toolHarness` — picks who runs the
+   *  agent loop (Pi vs Claude SDK). LiteLLM is always-on as transport. */
+  toolHarness?: 'pi' | 'claude_sdk';
 }
 
 export interface JobResult {

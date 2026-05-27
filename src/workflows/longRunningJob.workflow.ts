@@ -93,11 +93,9 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
       s3Bucket: input.s3Bucket,
       s3Prefix: input.s3Prefix,
       agentBackend: input.agentBackend,
-      // Forward the per-user "Route through LiteLLM" preference so the
-      // child FSM's executeStep activities see the flag in their
-      // StepExecutionParams and invokeViaClaudeAgentSDK rewrites
-      // ANTHROPIC_BASE_URL accordingly.
-      agentBackendVia: input.agentBackendVia,
+      // Forward the resolved tool-harness so executeStep can pick Pi vs
+      // Claude SDK for each step. LiteLLM is always-on as transport.
+      toolHarness: input.toolHarness,
     };
     try {
       const fsmResult = await executeChild<(i: FsmProcessInput) => Promise<FsmProcessResult>>(
@@ -190,14 +188,14 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
     // tool_result rows the same way FSM runs render their event stream.
     // workingDir gets the agent's cwd into the user's actual subdir
     // (matching what they see in the editor) instead of the workspace root.
-    // agentBackendVia: per-user "Route through LiteLLM" — forwarded so
-    // the agent-task path (no skillName, direct invokeSkill call) gets
-    // the same routing the FSM-child path gets.
+    // toolHarness: per-run Pi vs Claude SDK choice — forwarded so the
+    // agent-task path (no skillName, direct invokeSkill call) routes
+    // the same way the FSM-child path does.
     {
       jobId: input.jobId, userId: input.userId,
       s3Bucket: input.s3Bucket, s3Prefix: input.s3Prefix,
       workingDir: input.workingDir,
-      agentBackendVia: input.agentBackendVia,
+      toolHarness: input.toolHarness,
     },
   );
 
