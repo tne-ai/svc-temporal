@@ -21,6 +21,9 @@ import {
   defineQuery,
   setHandler,
   sleep,
+  workflowInfo,
+  executeChild,
+  ChildWorkflowCancellationType,
   CancellationScope,
   isCancellation,
 } from '@temporalio/workflow';
@@ -158,6 +161,19 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
     };
   }
 
+  // Merge `sop: vars:` skill-level defaults under the caller-supplied
+  // templateVars. Precedence matches the python engine: caller (cli /
+  // inputs file equivalent) wins over sop.vars, which wins over engine
+  // builtins (already handled in the parser). See
+  // engine.parser._find_and_load_template_vars (tne-plugins #2018).
+  // We compute this once and thread it through every step builder so
+  // an inline step's manifest sees the same view as a child workflow
+  // dispatched for a leaf.
+  const mergedTemplateVars: Record<string, string> = {
+    ...(config.vars || {}),
+    ...(input.templateVars || {}),
+  };
+
   // Initialize or resume state
   const state: FsmWorkflowState = input.resumeState || initializeState(config);
 
@@ -266,6 +282,142 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   setHandler(getPhaseQuery, () => state.phase);
   setHandler(getAutoApproveQuery, () => autoApprove);
 
+  // ── Step execution helpers (parity with engine.temporal_workflow) ─────
+  //
+  // runStepUnified wraps the per-step dispatch decision so the four serial
+  // call sites in this workflow stay tidy:
+  //   - step.tneEngine = true (and step.run !== 'subagent')
+  //       → dispatch FsmProcessWorkflow as a child workflow with bounded
+  //         iterations. Mirrors engine.temporal_workflow's tne-engine leaf
+  //         branch (tne-plugins #2060).
+  //   - otherwise
+  //       → call executeStep activity with an optional per-step
+  //         startToCloseTimeout override (engine.schema.Step.timeout).
+  //
+  // Parallel runner is intentionally NOT routed through this helper yet —
+  // see the TODO at runPostambleParallel. Parallel + child-workflow needs
+  // its own batching design; we keep parallel waves on the existing
+  // executeStep proxy until that lands.
+  async function runStepUnified(
+    step: Step,
+    iteration: number,
+    feedback: string | undefined,
+    overridePhase?: 'preamble' | 'generator' | 'evaluator' | 'postamble',
+  ): Promise<StepResult> {
+    const phase =
+      overridePhase || (stepPhase(step, config) as 'preamble' | 'generator' | 'evaluator' | 'postamble');
+    const stepKey = `${phase}.${step.number}`;
+
+    // tne-engine leaf opt-in: declared by the leaf SKILL.md's top-level
+    // `tne-engine: true` frontmatter, surfaced as Step.tneEngine by the
+    // parser. Skip when this is itself a subagent step — those are
+    // already nested orchestrators and python treats them separately.
+    if (step.tneEngine && step.skill && step.skill !== 'inline') {
+      const wfRun = workflowInfo().runId;
+      const childWorkflowId = `${wfRun.slice(0, 8)}-${step.skill}`;
+      const childInput: FsmProcessInput = {
+        runId: childWorkflowId,
+        skillName: step.skill,
+        templateVars: mergedTemplateVars,
+        workspacePath: input.workspacePath,
+        workingDir: input.workingDir,
+        userId: input.userId,
+        autoApprove: true, // leaves don't gate (matches python leaf params)
+        s3Bucket: input.s3Bucket,
+        s3Prefix: input.s3Prefix,
+        agentBackend: input.agentBackend,
+        delegateModel: input.delegateModel,
+        delegateProvider: input.delegateProvider,
+        toolHarness: input.toolHarness,
+        maxIterations: step.tneEngineMaxIterations || 3,
+      };
+      const timeoutSec = step.timeout && step.timeout > 0 ? step.timeout : 0;
+      try {
+        await executeChild(FsmProcessWorkflow, {
+          args: [childInput],
+          workflowId: childWorkflowId,
+          cancellationType: ChildWorkflowCancellationType.WAIT_CANCELLATION_COMPLETED,
+          ...(timeoutSec > 0 ? { workflowExecutionTimeout: `${timeoutSec}s` } : {}),
+        });
+        // Synthesize a successful StepResult so the surrounding state
+        // machine doesn't need to special-case child workflows. The leaf
+        // child wrote its outputs to S3 inside the child workflow; the
+        // parent doesn't snapshot mtimes for it (mirrors python).
+        return { success: true, gateResults: {} };
+      } catch (err: any) {
+        return {
+          success: false,
+          error: `[tne-engine leaf child workflow ${childWorkflowId} failed: ${err?.message ?? String(err)}]`,
+          gateResults: {},
+        };
+      }
+    }
+
+    // Per-step Temporal activity timeout. When step.timeout > 0 we create
+    // a one-off proxy with the overridden startToCloseTimeout; otherwise
+    // the workflow-level executeStep proxy (STEP_ACTIVITY_TIMEOUT) applies.
+    // Per-step proxy is required because @temporalio/workflow's
+    // proxyActivities options are baked into the proxy — there's no
+    // per-call override on the returned proxy fn.
+    const stepParams = buildStepParams(
+      step,
+      iteration,
+      input,
+      config,
+      state,
+      feedback,
+      overridePhase,
+      undefined,
+      undefined,
+      mergedTemplateVars,
+    );
+    if (step.timeout && step.timeout > 0) {
+      const perStepProxy = proxyActivities<typeof activities>({
+        startToCloseTimeout: `${step.timeout}s`,
+        heartbeatTimeout: STEP_HEARTBEAT_TIMEOUT,
+        retry: STEP_RETRY_POLICY,
+      });
+      return perStepProxy.executeStep(stepParams);
+    }
+    void stepKey;
+    return executeStep(stepParams);
+  }
+
+  // Per-step review pause (parity with engine.temporal_workflow per_step_review,
+  // tne-plugins #1975). Python pauses after every successful step when
+  // config.per_step_review is true and !auto_approve, regardless of phase
+  // (preamble included). It also honours skill-requested pauses via the
+  // activity's stage_review_pause flag, but that signal isn't propagated
+  // through svc-temporal's StepResult today — a separate plumbing change.
+  // For this PR we only honour config.perStepReview.
+  //
+  // config.stageReview keeps its existing svc-temporal semantics (a coarser
+  // preamble-only gate fired by the caller before this pause runs); this
+  // function is gated on a different flag so the two never double up on
+  // the preamble path.
+  async function maybePerStepReviewPause(
+    step: Step,
+    phase: 'preamble' | 'generator' | 'evaluator' | 'postamble',
+    result: StepResult,
+  ): Promise<'continue' | 'cancelled'> {
+    if (!result.success) return 'continue';
+    if (autoApprove) return 'continue';
+    if (!config.perStepReview) return 'continue';
+    const stepKey = `${phase}.${step.number}`;
+    state.steps[stepKey] = state.steps[stepKey] || {
+      status: StepStatus.AWAITING_REVIEW,
+      retries: 0,
+    };
+    state.steps[stepKey]!.status = StepStatus.AWAITING_REVIEW;
+    await syncBeforeGate(syncActivities, input);
+    approvalReceived = false;
+    await condition(() => approvalReceived || cancelled, '7 days');
+    if (cancelled) return 'cancelled';
+    state.steps[stepKey]!.humanNotes = approvalNotes;
+    state.steps[stepKey]!.status = StepStatus.COMPLETE;
+    return 'continue';
+  }
+
   // ─── PREAMBLE ──────────────────────────────────────────────────────────
 
   if (state.phase === Phase.INIT || state.phase === Phase.PREAMBLE) {
@@ -280,7 +432,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
       // Skip already completed steps (resume case)
       if (stepState?.status === StepStatus.COMPLETE) continue;
 
-      const result = await executeStep(buildStepParams(step, 0, input, config, state));
+      const result = await runStepUnified(step, 0, undefined, 'preamble');
       updateStepState(state, stepKey, result);
 
       if (!result.success) {
@@ -299,6 +451,13 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
         state.steps[stepKey]!.humanNotes = approvalNotes;
         state.steps[stepKey]!.status = StepStatus.COMPLETE;
       }
+
+      // Skill- or config-requested per-step review. config.stageReview
+      // above is a coarser preamble-only gate that already pauses here;
+      // maybePerStepReviewPause is a no-op in preamble unless
+      // config.perStepReview is true, so the two don't double up.
+      const reviewOutcome = await maybePerStepReviewPause(step, 'preamble', result);
+      if (reviewOutcome === 'cancelled') return { status: 'cancelled', state };
     }
   }
 
@@ -350,9 +509,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
       const stepKey = `preamble.${step.number}`;
       if (state.steps[stepKey]?.status !== StepStatus.STALE) continue;
       const replayFeedback = state.steps[stepKey]?.feedback;
-      const replayResult = await executeStep(
-        buildStepParams(step, state.iteration, input, config, state, replayFeedback),
-      );
+      const replayResult = await runStepUnified(step, state.iteration, replayFeedback, 'preamble');
       updateStepState(state, stepKey, replayResult);
       if (!replayResult.success) return { status: 'failed', state };
     }
@@ -377,6 +534,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
         'generator', config.generator, input, config, state, executeStep,
         state.iteration, feedback, () => cancelled,
         (data) => eventActivities.emitFsmEventActivity({ runId: input.runId, type: 'step_cancelled', data }),
+        mergedTemplateVars,
       );
       if (cancelled) return { status: 'cancelled', state };
       if (outcome.failed) {
@@ -387,9 +545,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
         if (cancelled) return { status: 'cancelled', state };
 
         const stepKey = `generator.${step.number}`;
-        const result = await executeStep(
-          buildStepParams(step, state.iteration, input, config, state, feedback)
-        );
+        const result = await runStepUnified(step, state.iteration, feedback, 'generator');
         updateStepState(state, stepKey, result);
 
         if (!result.success) {
@@ -405,6 +561,9 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
           state.steps[stepKey]!.humanNotes = approvalNotes;
           state.steps[stepKey]!.status = StepStatus.COMPLETE;
         }
+
+        const reviewOutcome = await maybePerStepReviewPause(step, 'generator', result);
+        if (reviewOutcome === 'cancelled') return { status: 'cancelled', state };
       }
     }
 
@@ -422,9 +581,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
         const stepKey = `evaluator.${step.number}`;
         resetStepState(state, stepKey);
 
-        const result = await executeStep(
-          buildStepParams(step, state.iteration, input, config, state)
-        );
+        const result = await runStepUnified(step, state.iteration, undefined, 'evaluator');
         updateStepState(state, stepKey, result);
 
         if (!result.success) {
@@ -433,6 +590,9 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
           keyIssues.push(result.feedback || result.error || 'Evaluator failed');
 
           if (config.evaluatorMode === EvaluatorMode.FAIL_FAST) break;
+        } else {
+          const reviewOutcome = await maybePerStepReviewPause(step, 'evaluator', result);
+          if (reviewOutcome === 'cancelled') return { status: 'cancelled', state };
         }
       }
     }
@@ -488,6 +648,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
         'postamble', config.postamble, input, config, state, executeStep,
         0, undefined, () => cancelled,
         (data) => eventActivities.emitFsmEventActivity({ runId: input.runId, type: 'step_cancelled', data }),
+        mergedTemplateVars,
       );
       if (cancelled) return { status: 'cancelled', state };
     }
@@ -585,6 +746,7 @@ function buildStepParams(
   overridePhase?: 'preamble' | 'generator' | 'evaluator' | 'postamble',
   parallel?: boolean,
   waveIdx?: number,
+  templateVarsOverride?: Record<string, string>,
 ): StepExecutionParams {
   const phase = overridePhase || (stepPhase(step, config) as 'preamble' | 'generator' | 'evaluator' | 'postamble');
   // Per-user delegate (worker) model override: when the user has configured
@@ -598,7 +760,7 @@ function buildStepParams(
   return {
     step: effectiveStep,
     iteration,
-    templateVars: input.templateVars,
+    templateVars: templateVarsOverride ?? input.templateVars,
     feedback,
     humanNotes: state.steps[`${phase}.${step.number}`]?.humanNotes,
     workspacePath: input.workspacePath,
@@ -740,6 +902,11 @@ async function runPhaseParallel(
   feedback: string | undefined,
   isCancelled: () => boolean,
   emitCancelEvent: (data: Record<string, any>) => Promise<void>,
+  /** sop.vars-merged template_vars; parallel runner skips the
+   *  per-step timeout / tneEngine / perStepReview wiring for now (see
+   *  TODO at the executeStep call site) but still gets vars threaded
+   *  through so inline manifest expansion matches the serial path. */
+  templateVarsOverride?: Record<string, string>,
 ): Promise<{ failed: boolean }> {
   if (steps.length === 0) return { failed: false };
 
@@ -836,8 +1003,14 @@ async function runPhaseParallel(
         await Promise.all(
           ready.map(async (step) => {
             try {
+              // TODO(parity): the parallel runner doesn't yet route through
+              // runStepUnified, so it skips per-step timeout overrides,
+              // tne-engine child-workflow dispatch, and per-step review
+              // pauses. Adding those needs a fan-in design for the review
+              // pause (you can't realistically pause inside a Promise.all
+              // wave). For now we still thread mergedTemplateVars through.
               const result = await executeStep(
-                buildStepParams(step, iteration, input, config, state, feedback, phaseKey, isFanOut, waveIdx)
+                buildStepParams(step, iteration, input, config, state, feedback, phaseKey, isFanOut, waveIdx, templateVarsOverride)
               );
               waveResults.set(step.number, { step, result, wasCancelled: false });
               if (!result.success) {
