@@ -25,6 +25,9 @@ function makeStep(overrides: Partial<Step> = {}): Step {
     failFast: { maxRetries: 3, gates: [] },
     permissionMode: 'acceptEdits',
     model: '',
+    timeout: 0,
+    tneEngine: false,
+    tneEngineMaxIterations: 3,
     ...overrides,
   };
 }

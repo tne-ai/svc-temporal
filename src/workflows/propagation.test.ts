@@ -34,6 +34,9 @@ function mkStep(number: string, opts: Partial<Step> = {}): Step {
     failFast: { maxRetries: 0, gates: [] },
     permissionMode: '',
     model: '',
+    timeout: 0,
+    tneEngine: false,
+    tneEngineMaxIterations: 3,
   };
 }
 
@@ -52,6 +55,7 @@ function mkConfig(opts: {
     approvalGate: false,
     userCheckpoint: false,
     stageReview: false,
+    perStepReview: true,
     preFlightInputs: [],
     inputsFile: '',
     inputsBackprop: false,
@@ -63,6 +67,7 @@ function mkConfig(opts: {
     postamble: opts.postamble ?? [],
     finalization: [],
     council: [],
+    vars: {},
   };
 }
 
