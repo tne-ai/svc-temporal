@@ -179,6 +179,75 @@ async function collectLocalFiles(baseDir: string): Promise<string[]> {
   return files;
 }
 
+/**
+ * Walk a workspace and compute a cheap fingerprint plus the file list, in
+ * a single pass. The fingerprint is `count|totalBytes|maxMtimeMs` — enough
+ * to detect "nothing has changed since the last sync" without HEADing
+ * anything in S3. Mtime resolution on macOS/Linux is millisecond-level for
+ * the relevant filesystems we run on, so the max-mtime check catches every
+ * write-since-last-sync that matters.
+ *
+ * Returns the file list (relative paths) AND the fingerprint string, so
+ * callers don't have to walk twice.
+ */
+async function collectLocalFilesWithFingerprint(
+  baseDir: string,
+): Promise<{ files: string[]; fingerprint: string }> {
+  const files: string[] = [];
+  let totalBytes = 0;
+  let maxMtimeMs = 0;
+
+  async function walk(dir: string): Promise<void> {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      const relPath = relative(baseDir, fullPath);
+
+      if (shouldExclude(relPath)) continue;
+
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+      } else if (entry.isFile()) {
+        files.push(relPath);
+        try {
+          const st = await stat(fullPath);
+          totalBytes += st.size;
+          const mtimeMs = st.mtime.getTime();
+          if (mtimeMs > maxMtimeMs) maxMtimeMs = mtimeMs;
+        } catch {
+          // unreadable file — skip its stat contribution; the upload pass
+          // will surface a per-file error if it matters.
+        }
+      }
+    }
+  }
+
+  await walk(baseDir);
+  return { files, fingerprint: `${files.length}|${totalBytes}|${maxMtimeMs}` };
+}
+
+/**
+ * In-memory record of the last successful push per (bucket, prefix, scanDir).
+ * Reset on process restart. Each tne-fsm-queue worker keeps its own copy —
+ * different pods don't share, so in multi-pod prod a sibling pod can still
+ * push the same workspace once before its own fingerprint catches up. This
+ * is fine: pushWorkspaceToS3 is content-idempotent (the per-file MD5
+ * fast-path inside the upload pass skips identical bytes), the fingerprint
+ * just avoids the directory walk + 781-HEAD scan when the local-pod state
+ * is unchanged.
+ */
+const LAST_PUSH_FINGERPRINT = new Map<string, string>();
+
+function fingerprintKey(bucket: string, prefix: string, scanDir: string): string {
+  return `${bucket}|${prefix}|${scanDir}`;
+}
+
 // ─── Pull ──────────────────────────────────────────────────────────────────
 
 /**
@@ -400,8 +469,28 @@ export async function pushWorkspaceToS3(
 
   const scanDir = scopePath ? join(localPath, scopePath) : localPath;
   console.log(`[pushWorkspaceToS3] bucket=${bucket}, prefix=${prefix}, scanDir=${scanDir}`);
-  const localFiles = await collectLocalFiles(scanDir);
-  console.log(`[pushWorkspaceToS3] Found ${localFiles.length} files:`, localFiles);
+
+  // Walk + fingerprint in one pass. The fingerprint encodes file count,
+  // total bytes, and max mtime; if it's identical to the last successful
+  // push for this scope we can short-circuit before doing 781 HEAD calls
+  // against S3. invokeSkill's per-step periodic timer + the workflow's
+  // terminal sync routinely produce 3-4 push calls per run; without this
+  // they all walk and HEAD-check an unchanged workspace.
+  const { files: localFiles, fingerprint } = await collectLocalFilesWithFingerprint(scanDir);
+  const fpKey = fingerprintKey(bucket, prefix, scanDir);
+  const lastFp = LAST_PUSH_FINGERPRINT.get(fpKey);
+  if (lastFp && lastFp === fingerprint) {
+    console.log(
+      `[pushWorkspaceToS3] no changes since last push (${localFiles.length} files, fingerprint=${fingerprint}) — skipping`,
+    );
+    return { fileCount: 0, bytes: 0, conflicts: [] };
+  }
+  // Truncated file listing: dumping 781 paths to the console on every
+  // sync drowned the worker log. Show count + a sample; if a caller
+  // needs the full list they can re-scan offline.
+  const sample = localFiles.slice(0, 10);
+  const tail = localFiles.length > sample.length ? ` (+${localFiles.length - sample.length} more)` : '';
+  console.log(`[pushWorkspaceToS3] Found ${localFiles.length} files; sample: ${sample.join(', ')}${tail}`);
 
   let fileCount = 0;
   let bytes = 0;
@@ -513,6 +602,15 @@ export async function pushWorkspaceToS3(
     if (r.uploaded) fileCount++;
     bytes += r.bytes;
     heartbeat({ op: 'push', fileCount, bytes });
+  }
+
+  // Stamp the fingerprint after the push completes so the next call for
+  // this scope can short-circuit. Only stamp on the no-conflict success
+  // path — a partial push (some files failed) leaves a divergence that
+  // a future call needs to actually re-examine, so we explicitly DO want
+  // the next push to redo the scan in that case.
+  if (conflicts.length === 0) {
+    LAST_PUSH_FINGERPRINT.set(fingerprintKey(bucket, prefix, scanDir), fingerprint);
   }
 
   return { fileCount, conflicts, bytes };
