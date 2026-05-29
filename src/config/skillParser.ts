@@ -804,8 +804,7 @@ function parseConfigBlock(content: string): ProcessConfig {
   const block = extractRcooBlock(content);
   if (!block) {
     throw new Error(
-      "No /r-coo-sop1-process config block found in SKILL.md. " +
-      "Expected a fenced code block containing '/r-coo-sop1-process'."
+      "No fenced /r-coo-sop*-process config block found in SKILL.md.",
     );
   }
   return parseBlockText(block);
@@ -917,9 +916,15 @@ export function parseSkillFile(
   }
 
   if (best) return best.cfg;
+  // The four-extractor ladder + dict-sop frontmatter parser all came back
+  // empty. The legacy "No /r-coo-sop1-process found" wording was misleading
+  // because the parser actually accepts ## SOP body blocks, frontmatter
+  // sop: strings, dict-form sop: phases, AND inline /r-coo-sop*-process
+  // fences. The actual signal is "no SOP candidate had any phases."
   throw new Error(
-    "No /r-coo-sop1-process config block found in SKILL.md. " +
-    "Expected a fenced code block containing '/r-coo-sop1-process'."
+    `No usable SOP found in ${path}. Expected one of: ` +
+    "`## SOP` body block, frontmatter `sop:` string, dict-form " +
+    "`sop: { phases: { ... } }`, or a fenced /r-coo-sop*-process block.",
   );
 }
 

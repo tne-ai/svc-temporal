@@ -644,13 +644,23 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
       // Always route postamble through the parallel runner. When every step
       // has empty `dependsOn`, wave 1 fans them all out; when deps form a
       // DAG, waves respect it. Sequential is the degenerate case.
-      await runPhaseParallel(
+      const outcome = await runPhaseParallel(
         'postamble', config.postamble, input, config, state, executeStep,
         0, undefined, () => cancelled,
         (data) => eventActivities.emitFsmEventActivity({ runId: input.runId, type: 'step_cancelled', data }),
         mergedTemplateVars,
       );
       if (cancelled) return { status: 'cancelled', state };
+      // Propagate postamble failures up. Without this the workflow returned
+      // `status: 'completed'` even when every postamble step failed, which:
+      //   (a) made the orion-side delegate-fallback retry skip the run
+      //       (the watcher only retries when dbStatus !== 'completed'); and
+      //   (b) misled the UI into showing the parent run as completed while
+      //       each step card carried a fail message.
+      // Mirrors the generator parallel-runner branch above.
+      if (outcome.failed) {
+        return { status: 'failed', state };
+      }
     }
   }
 
