@@ -21,22 +21,48 @@ import { join } from 'path';
 
 // ── Model ID resolution ───────────────────────────────────────────────────
 
-/** Anthropic alias → full model ID. Mirrors what the harness shipped. */
+/** Anthropic alias → full model ID. Mirrors what the harness shipped,
+ *  refreshed to point at ids that are actually in LiteLLM's model_list.
+ *
+ *  Older versions of this map pointed sonnet/sonnet-4/claude-sonnet-4-6
+ *  all at the dated snapshot `claude-sonnet-4-20250514`. That snapshot
+ *  is no longer in the LiteLLM proxy's model_list (it was removed when
+ *  orion's prisma migration #353 bumped defaults to claude-sonnet-4-6
+ *  and the corresponding LiteLLM aliases were retired). When the
+ *  resolver returned the stale id, LiteLLM responded "no healthy
+ *  deployments" / pi adapter fell back to localhost:4000 and the user
+ *  saw `pi errored: Connection error. (model=claude-sonnet-4-20250514…)`.
+ *
+ *  Rules of thumb when editing:
+ *   - Map every alias to a model id that exists in
+ *     orion/litellm/config.template.yaml under model_list.
+ *   - Bare model ids (claude-sonnet-4-6, claude-opus-4-7, etc.) are
+ *     listed as identity entries so the pass-through behaviour in
+ *     resolveModelId is explicit. */
 const ANTHROPIC_MODELS: Record<string, string> = {
-  sonnet:                 'claude-sonnet-4-20250514',
-  opus:                   'claude-opus-4-20250514',
+  // Friendly aliases → current LiteLLM-routable ids.
+  sonnet:                 'claude-sonnet-4-6',
+  opus:                   'claude-opus-4-7',
   haiku:                  'claude-haiku-4-5-20251001',
-  'sonnet-4':             'claude-sonnet-4-20250514',
-  'opus-4':               'claude-opus-4-20250514',
+  'sonnet-4':             'claude-sonnet-4-6',
+  'opus-4':               'claude-opus-4-7',
   'haiku-4':              'claude-haiku-4-5-20251001',
   'sonnet-4.5':           'claude-sonnet-4-5-20250929',
   'sonnet-4-5':           'claude-sonnet-4-5-20250929',
-  'claude-sonnet-4-6':    'claude-sonnet-4-20250514',
-  'claude-opus-4-6':      'claude-opus-4-20250514',
+  'sonnet-4.6':           'claude-sonnet-4-6',
+  'sonnet-4-6':           'claude-sonnet-4-6',
+  'opus-4.7':             'claude-opus-4-7',
+  'opus-4-7':             'claude-opus-4-7',
+  'haiku-4.5':            'claude-haiku-4-5-20251001',
+  'haiku-4-5':            'claude-haiku-4-5-20251001',
+  // Identity entries — preserve the bare LiteLLM id when callers pass it.
+  'claude-sonnet-4-6':    'claude-sonnet-4-6',
+  'claude-opus-4-6':      'claude-opus-4-6',
+  'claude-opus-4-7':      'claude-opus-4-7',
   'claude-haiku-4-5':     'claude-haiku-4-5-20251001',
 };
 
-const DEFAULT_AGENT_MODEL = process.env.DEFAULT_AGENT_MODEL || 'claude-sonnet-4-20250514';
+const DEFAULT_AGENT_MODEL = process.env.DEFAULT_AGENT_MODEL || 'claude-sonnet-4-6';
 
 /**
  * Resolve a model alias or short ID to a full Anthropic model ID.
