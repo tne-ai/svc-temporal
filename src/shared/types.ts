@@ -71,6 +71,21 @@ export interface Step {
   failFast: FailFastConfig;
   permissionMode: string;
   model: string;
+  /** Per-step Temporal activity timeout in seconds. 0 = use the worker's
+   *  DEFAULT_STEP_TIMEOUT. Parity with engine.schema.Step.timeout
+   *  (tne-plugins #2060). Currently parsed but not enforced — the
+   *  TS FsmProcessWorkflow still uses its global default for every
+   *  step. A follow-up will thread this into the activity options. */
+  timeout: number;
+  /** When true, the leaf is dispatched as a separate child workflow with
+   *  bounded iterations. Parity with engine.schema.Step.tne_engine
+   *  (tne-plugins #2060). Parsed from the leaf SKILL.md's `tne-engine:`
+   *  top-level frontmatter key. Currently parsed but not enforced —
+   *  see FsmProcessWorkflow follow-up. */
+  tneEngine: boolean;
+  /** Max iterations for the leaf child workflow when `tneEngine` is set.
+   *  Parity with engine.schema.Step.tne_engine_max_iterations. */
+  tneEngineMaxIterations: number;
 }
 
 export interface FinalizationEntry {
@@ -106,6 +121,12 @@ export interface ProcessConfig {
   approvalGate: boolean;
   userCheckpoint: boolean;
   stageReview: boolean;
+  /** Pause after each subagent step so a human can review before the
+   *  next step runs. Defaults to true. Parity with
+   *  engine.schema.ProcessConfig.per_step_review (tne-plugins #1975).
+   *  Parsed but not yet enforced — currently every step runs to
+   *  completion regardless. */
+  perStepReview: boolean;
   preFlightInputs: string[];
   inputsFile: string;
   inputsBackprop: boolean;
@@ -123,6 +144,15 @@ export interface ProcessConfig {
 
   expert?: ExpertConfig;
   council: CouncilMember[];
+
+  /** `sop: vars:` — skill-level variable defaults from frontmatter.
+   *  Parity with engine.schema.ProcessConfig.vars (tne-plugins #2018).
+   *  Resolved between CLI overrides and the inputs file in the
+   *  template_vars precedence chain:
+   *      cli > inputs_file > vars > builtins
+   *  Currently parsed but not yet wired into the template_vars
+   *  resolution path — follow-up will plumb it through invokeSkill. */
+  vars: Record<string, string>;
 }
 
 // ─── Workflow Input/Output Types ────────────────────────────────────────────

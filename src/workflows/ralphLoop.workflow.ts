@@ -77,6 +77,9 @@ export async function RalphLoopWorkflow(input: RalphInput): Promise<RalphResult>
         failFast: { maxRetries: 0, gates: [] },
         permissionMode: 'bypassPermissions',
         model: input.model || '',
+        timeout: 0,
+        tneEngine: false,
+        tneEngineMaxIterations: 3,
       },
       prompt,
     );

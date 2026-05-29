@@ -7,7 +7,7 @@
  * expert/council config, and top-level parameters.
  */
 
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { basename, dirname } from 'path';
 import { parse as parseYaml } from 'yaml';
 import {
@@ -215,9 +215,55 @@ function extractFrontmatterSop(content: string): string | null {
  * Returns a fully-populated ProcessConfig (with defaults for fields the dict
  * form does not declare) or null when no usable `sop:` mapping is present.
  */
+/** Read the `tne-engine: true` flag from a leaf SKILL.md's top-level
+ *  frontmatter. Parity with engine.parser._read_leaf_tne_engine_flag
+ *  (tne-plugins #2060). Returns false on missing file / parse error so
+ *  any breakage falls back to the default (run inline, not as a child
+ *  workflow). */
+function readLeafTneEngineFlag(skillName: string, skillsRoot: string): boolean {
+  if (!skillsRoot || !skillName) return false;
+  const candidate = `${skillsRoot}/${skillName}/SKILL.md`;
+  if (!existsSync(candidate)) return false;
+  try {
+    const text = readFileSync(candidate, 'utf-8');
+    if (!text.startsWith('---')) return false;
+    const end = text.indexOf('\n---', 3);
+    if (end === -1) return false;
+    const fm: any = parseYaml(text.slice(3, end));
+    return Boolean(fm?.['tne-engine']);
+  } catch {
+    return false;
+  }
+}
+
+/** Read `sop.max_iterations` from a leaf SKILL.md's frontmatter,
+ *  defaulting to `defaultValue` (engine ships 3) when absent. Parity
+ *  with engine.parser._read_leaf_max_iterations. */
+function readLeafMaxIterations(skillName: string, skillsRoot: string, defaultValue = 3): number {
+  if (!skillsRoot || !skillName) return defaultValue;
+  const candidate = `${skillsRoot}/${skillName}/SKILL.md`;
+  if (!existsSync(candidate)) return defaultValue;
+  try {
+    const text = readFileSync(candidate, 'utf-8');
+    if (!text.startsWith('---')) return defaultValue;
+    const end = text.indexOf('\n---', 3);
+    if (end === -1) return defaultValue;
+    const fm: any = parseYaml(text.slice(3, end));
+    const sop = fm?.sop;
+    if (sop && typeof sop === 'object' && 'max_iterations' in sop) {
+      const n = Number(sop.max_iterations);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    return defaultValue;
+  } catch {
+    return defaultValue;
+  }
+}
+
 function parseFrontmatterDictSop(
   content: string,
   fallbackScope: string,
+  skillsRoot: string,
 ): ProcessConfig | null {
   if (!content.startsWith('---')) return null;
   const end = content.indexOf('\n---', 3);
@@ -282,9 +328,23 @@ function parseFrontmatterDictSop(
           ? [rawInputs]
           : [];
 
+      const skillName = typeof s?.skill === 'string' && s.skill ? s.skill : 'inline';
+      const stepTimeoutRaw = s?.timeout;
+      const stepTimeout =
+        typeof stepTimeoutRaw === 'number' && Number.isFinite(stepTimeoutRaw) && stepTimeoutRaw > 0
+          ? stepTimeoutRaw
+          : 0;
+      // Leaf-skill opt-in: open the leaf's SKILL.md and check its top-level
+      // `tne-engine:` frontmatter. The python parser does the same — see
+      // _read_leaf_tne_engine_flag. Missing skillsRoot (when the parser is
+      // called against a content string with no on-disk path) falls back to
+      // the default (false / 3 iterations).
+      const tneEngine = readLeafTneEngineFlag(skillName, skillsRoot);
+      const tneEngineMaxIterations = readLeafMaxIterations(skillName, skillsRoot, 3);
+
       return {
         number: String(i + 1),
-        skill: typeof s?.skill === 'string' && s.skill ? s.skill : 'inline',
+        skill: skillName,
         inputs,
         output: typeof s?.output === 'string' ? s.output : '',
         verify: '',
@@ -303,6 +363,9 @@ function parseFrontmatterDictSop(
         failFast: { maxRetries: 3, gates: [1, 2, 3, 4] },
         permissionMode: 'acceptEdits',
         model: '',
+        timeout: stepTimeout,
+        tneEngine,
+        tneEngineMaxIterations,
       };
     });
   };
@@ -320,6 +383,16 @@ function parseFrontmatterDictSop(
     return null;
   }
 
+  // sop.vars — skill-level variable defaults. Coerced to string/string
+  // pairs so downstream consumers don't have to revalidate.
+  const rawVars: any = (sop as any).vars;
+  const vars: Record<string, string> =
+    rawVars && typeof rawVars === 'object' && !Array.isArray(rawVars)
+      ? Object.fromEntries(
+          Object.entries(rawVars).map(([k, v]) => [String(k), String(v ?? '')]),
+        )
+      : {};
+
   return {
     scope,
     maxIterations,
@@ -329,6 +402,7 @@ function parseFrontmatterDictSop(
     approvalGate: Boolean(preambleDict?.human_gate),
     userCheckpoint: false,
     stageReview: true,
+    perStepReview: true,
     preFlightInputs: [],
     inputsFile: '',
     inputsBackprop: true,
@@ -340,6 +414,7 @@ function parseFrontmatterDictSop(
     postamble,
     finalization: [],
     council: [],
+    vars,
   };
 }
 
@@ -593,6 +668,12 @@ function parseStepTable(sectionText: string): Step[] {
       failFast,
       permissionMode,
       model,
+      // Body-block SOPs don't declare per-step timeout / tne-engine fields.
+      // Defaults match the engine schema (0 = use worker default; false /
+      // 3 iterations for child-workflow dispatch).
+      timeout: 0,
+      tneEngine: false,
+      tneEngineMaxIterations: 3,
     });
   }
   return steps;
@@ -702,6 +783,7 @@ function parseBlockText(block: string): ProcessConfig {
     approvalGate,
     userCheckpoint,
     stageReview,
+    perStepReview: true, // engine default; not declared by body-block SOPs
     preFlightInputs,
     inputsFile,
     inputsBackprop,
@@ -714,6 +796,7 @@ function parseBlockText(block: string): ProcessConfig {
     finalization: parseFinalizationTable(sections['finalization'] || ''),
     expert: parseExpertTable(sections['expert'] || ''),
     council: parseCouncilTable(sections['council'] || ''),
+    vars: {}, // body-block SOPs don't declare sop.vars; dict-sop populates it
   };
 }
 
@@ -803,9 +886,16 @@ export function parseSkillFile(
     });
   }
 
+  // Derive the skills root from the parent SKILL.md path so the dict
+  // parser can read leaf SKILL.md fields (tne-engine flag, leaf
+  // max_iterations) the same way engine.parser does. For a parent at
+  //   <root>/<skill-name>/SKILL.md
+  // the sibling skills live at <root>/, i.e. dirname(dirname(path)).
+  const skillsRoot = path.split('/').slice(0, -2).join('/');
   const dictCfg = parseFrontmatterDictSop(
     resolved,
     filenameDefaults['CALLER_AGENT'] || '',
+    skillsRoot,
   );
   if (dictCfg) {
     candidates.push({
