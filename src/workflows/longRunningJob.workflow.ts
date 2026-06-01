@@ -125,6 +125,49 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
     }
   }
 
+  // ── Completion mode: single model call, no tools, no workspace ─────────
+  // For single-shot "prompt → answer/JSON" jobs (compass-helm analyzer,
+  // briefing, relevance, audit, …). Skips S3 sync entirely and runs ONE
+  // turn with no tools. Still Temporal-durable/retried like any job; only
+  // the executor differs. `skillName` (when set) loads the leaf output
+  // schema for Structured Outputs on the claude_sdk backend.
+  if (input.completionMode) {
+    statusMessage = 'Running completion...';
+    progress = 20;
+    const result = await invokeSkill(
+      {
+        number: '0',
+        skill: input.skillName || 'completion',
+        inputs: [],
+        output: '',
+        verify: '',
+        run: '',
+        notes: '',
+        passCondition: '',
+        stageType: 'default' as any,
+        dependsOn: [],
+        backpropSkill: '',
+        failFast: { maxRetries: 0, gates: [] },
+        permissionMode: 'bypassPermissions',
+        model: input.model || '',
+        timeout: 0,
+        tneEngine: false,
+        tneEngineMaxIterations: 1,
+      },
+      input.prompt,
+      `/tmp/temporal-jobs/${input.jobId}`,
+      input.agentBackend,
+      { jobId: input.jobId, userId: input.userId, toolHarness: input.toolHarness, completion: true },
+    );
+    progress = 100;
+    status = result.success ? 'completed' : 'failed';
+    statusMessage = result.success ? 'Complete' : 'Failed';
+    return {
+      status: result.success ? 'completed' : 'failed',
+      output: result.success ? result.stdout : (result.stderr || result.stdout || 'Unknown error'),
+    };
+  }
+
   // ── Step 1: Pull user workspace from S3 ────────────────────────────────
   // Two scope modes:
   //   workingDir present: behave like FsmProcessWorkflow — pull/push the

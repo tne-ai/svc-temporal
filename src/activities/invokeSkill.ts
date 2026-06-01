@@ -374,7 +374,7 @@ async function invokeViaHarness(
   model?: string,
   _permissionMode?: string,
   workspacePath?: string,
-  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string },
+  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string; outputSchema?: Record<string, unknown>; toolHarness?: 'pi' | 'claude_sdk'; completion?: boolean },
 ): Promise<InvocationResult> {
   const stopSync = startPeriodicS3Sync(workspacePath || '', context?.s3Bucket, context?.s3Prefix, context?.parentRunId, context?.workingDir);
   // Pi session captured in the outer scope so the finally block can
@@ -502,11 +502,14 @@ async function invokeViaHarness(
       apiKey: apiKey!,
       baseURL,
       cwd,
-      systemPrompt:
-        'You are a skill execution agent running inside a temporal worker. ' +
-        'Use the provided tools (Read/Write/Edit/Bash/Glob/Grep) to accomplish the task in the workspace. ' +
-        'Files written or edited will be synced to S3 after the run completes.',
-      tools: piTools,
+      systemPrompt: context?.completion
+        ? // Completion mode: single model call, no tools — the skill body and
+          // inputs are in the prompt; just answer.
+          'You are a skill execution agent. Follow the instructions in the prompt and respond directly. Do not use tools.'
+        : 'You are a skill execution agent running inside a temporal worker. ' +
+          'Use the provided tools (Read/Write/Edit/Bash/Glob/Grep) to accomplish the task in the workspace. ' +
+          'Files written or edited will be synced to S3 after the run completes.',
+      tools: context?.completion ? [] : piTools,
       maxTokens: 16384,
       provider: byokProvider,
     });
@@ -808,7 +811,7 @@ async function invokeViaClaudeAgentSDK(
   prompt: string,
   model?: string,
   workspacePath?: string,
-  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string; outputSchema?: Record<string, unknown>; toolHarness?: 'pi' | 'claude_sdk' },
+  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string; outputSchema?: Record<string, unknown>; toolHarness?: 'pi' | 'claude_sdk'; completion?: boolean },
 ): Promise<InvocationResult> {
   const resolvedModel = resolveModelId(model);
   const workspaceRoot = workspacePath || process.cwd();
@@ -866,7 +869,11 @@ async function invokeViaClaudeAgentSDK(
       persistSession: false,
       // FSM steps can legitimately need many tool rounds. 30 was the observed
       // cap that failed p-cso1-write-business-plan mid-execution.
-      maxTurns: 200,
+      // Completion mode: single model call, no tools, one turn (see
+      // LongRunningJobWorkflow completionMode). Structured Outputs still
+      // applies via outputFormat below.
+      maxTurns: context?.completion ? 1 : 200,
+      allowedTools: context?.completion ? [] : undefined,
       wrapPrompt: true,
       workspacePath,
       hooks: buildNestedFsmHooks(context),
@@ -1148,7 +1155,7 @@ export async function invokeSkill(
   prompt: string,
   workspacePath?: string,
   agentBackend?: AgentBackend,
-  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; workingDir?: string; toolHarness?: 'pi' | 'claude_sdk' },
+  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; workingDir?: string; toolHarness?: 'pi' | 'claude_sdk'; completion?: boolean },
 ): Promise<InvocationResult> {
   // toolHarness overrides the legacy `agentBackend` param when set.
   // Orion resolves the user's `User.toolHarness` (auto/pi/claude_sdk) +
