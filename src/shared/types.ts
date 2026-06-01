@@ -432,6 +432,13 @@ export interface JobInput {
   /** Same semantics as `FsmProcessInput.toolHarness` — picks who runs the
    *  agent loop (Pi vs Claude SDK). LiteLLM is always-on as transport. */
   toolHarness?: 'pi' | 'claude_sdk';
+  /** Completion mode: run the job as a SINGLE model call — no tools, one
+   *  turn, no S3 workspace — instead of the agent loop. For single-shot
+   *  "prompt → answer/JSON" jobs (e.g. compass-helm's analyzer/briefing/
+   *  relevance). `skillName` (when set) still loads the leaf output schema
+   *  for Structured Outputs on the claude_sdk backend. Durable via Temporal
+   *  like any other job; the difference is purely the executor. */
+  completionMode?: boolean;
 }
 
 export interface JobResult {
