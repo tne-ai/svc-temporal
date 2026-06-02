@@ -519,6 +519,12 @@ async function invokeViaHarness(
     };
 
     let stdout = '';
+    // Captured separately from the streamed assistant text: some Pi adapters
+    // (notably openai-completions) put the ENTIRE prompt + the answer in the
+    // `result` event's text. Appending that to stdout echoed the whole prompt
+    // (and duplicated the answer) into the job output. We keep it as a
+    // fallback only — see the reconciliation before the success return.
+    let resultText = '';
     let lastHeartbeat = Date.now();
     const runId = context?.parentRunId;
     const jobId = context?.jobId;
@@ -537,6 +543,15 @@ async function invokeViaHarness(
       if (ev.type === 'assistant' && ev.message?.content) {
         for (const block of ev.message.content) {
           if (block.type === 'text') {
+            // Some Pi adapters (openai-completions) replay the prompt back as
+            // an assistant text block. Skip it — don't accumulate into the
+            // output or surface it as a `message` event. A genuine answer is
+            // never a verbatim substring of the prompt; gate on length so a
+            // short coincidental match can't drop real output.
+            const t: string = block.text || '';
+            if (t.trim().length > 40 && prompt.includes(t.trim())) {
+              continue;
+            }
             stdout += block.text;
             const text = previewText(block.text);
             emitEvent(runId, 'message', { backend: 'harness', text, stepNumber: context?.stepNumber, skill: context?.skill });
@@ -589,7 +604,10 @@ async function invokeViaHarness(
           isError: !!r.is_error,
         });
       } else if (ev.type === 'result') {
-        if (typeof ev.text === 'string') stdout += ev.text;
+        // Capture, don't append — the streamed `assistant` text above is the
+        // clean source of truth. This result text is a fallback for adapters
+        // that don't stream assistant blocks, and may include the prompt.
+        if (typeof ev.text === 'string') resultText = ev.text;
         // Surface token usage so the UI can render per-step spend. The
         // harness path runs against many backends — Anthropic Claude
         // (input_tokens / output_tokens) and OpenAI-compatible providers
@@ -676,7 +694,14 @@ async function invokeViaHarness(
       });
       return { success: false, stdout, stderr: detail, exitCode: 1 };
     }
-    return { success: true, stdout, stderr: '', exitCode: 0 };
+    // Prefer the streamed assistant text; fall back to the result event's text
+    // only when nothing streamed. Strip an echoed prompt prefix so the job
+    // output is just the model's answer (some adapters return prompt+answer).
+    let finalOut = stdout.trim() ? stdout : resultText;
+    if (prompt && finalOut.startsWith(prompt)) {
+      finalOut = finalOut.slice(prompt.length).replace(/^\s+/, '');
+    }
+    return { success: true, stdout: finalOut, stderr: '', exitCode: 0 };
   } catch (err) {
     return {
       success: false,
