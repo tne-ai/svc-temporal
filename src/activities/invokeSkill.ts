@@ -620,6 +620,13 @@ async function invokeViaHarness(
           const tokenPayload = {
             backend: 'harness',
             model: resolvedModel,
+            // Provider attribution for orion's spend dashboard. Without this,
+            // harness-backed jobs land as provider=null ("unknown") in
+            // usage_logs — orion only knows how to infer a provider from the
+            // claude-agent-sdk backend. byokProvider is the routing truth for
+            // this path: 'openrouter' for vendor-slugged models, 'anthropic'
+            // for bare Claude ids.
+            provider: byokProvider,
             ...norm,
             costUsd: typeof ev.total_cost_usd === 'number' ? ev.total_cost_usd : undefined,
           };
@@ -1065,6 +1072,10 @@ async function invokeViaClaudeAgentSDK(
           const tokenPayload = {
             backend: 'claude-agent-sdk',
             model: resolvedModel,
+            // The Claude Agent SDK only ever talks to Anthropic — stamp the
+            // provider explicitly so orion's spend attribution doesn't have
+            // to infer it from the backend name.
+            provider: 'anthropic',
             ...norm,
             costUsd: typeof (event as any).total_cost_usd === 'number' ? (event as any).total_cost_usd : undefined,
           };
