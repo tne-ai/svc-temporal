@@ -42,6 +42,7 @@ import type {
   ApprovalSignalPayload,
 } from '../shared/types.js';
 import { handleBackprop, propagateForward } from './propagation.js';
+import { scanFeedbackForFindings, formatFindingsForReview } from '../shared/backpropFindings.js';
 import {
   Phase,
   StepStatus,
@@ -141,6 +142,13 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   const eventActivities = proxyActivities<typeof activities>({
     startToCloseTimeout: '15s',
     retry: { maximumAttempts: 1 },
+  });
+
+  // Backprop-to-inputs apply proxy — a short file write in finalization.
+  // Transient retry so a momentary FS hiccup doesn't drop approved findings.
+  const backpropActivities = proxyActivities<typeof activities>({
+    startToCloseTimeout: '30s',
+    retry: TRANSIENT_RETRY_POLICY,
   });
 
   // ── Resolve config: either provided directly or parsed from skillName ──
@@ -294,20 +302,23 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   //       → call executeStep activity with an optional per-step
   //         startToCloseTimeout override (engine.schema.Step.timeout).
   //
-  // Parallel runner is intentionally NOT routed through this helper yet —
-  // see the TODO at runPostambleParallel. Parallel + child-workflow needs
-  // its own batching design; we keep parallel waves on the existing
-  // executeStep proxy until that lands.
-  async function runStepUnified(
-    step: Step,
-    iteration: number,
-    feedback: string | undefined,
-    overridePhase?: 'preamble' | 'generator' | 'evaluator' | 'postamble',
-  ): Promise<StepResult> {
-    const phase =
-      overridePhase || (stepPhase(step, config) as 'preamble' | 'generator' | 'evaluator' | 'postamble');
-    const stepKey = `${phase}.${step.number}`;
-
+  // Both the sequential call sites (runStepUnified) and the parallel runner
+  // (runPhaseParallel) route their per-step dispatch through dispatchStep, so
+  // tne-engine child-workflow dispatch and per-step timeout overrides apply
+  // uniformly regardless of execution shape.
+  //
+  // dispatchStep is the dispatch core: given a step and its fully-built
+  // StepExecutionParams it decides HOW to run the step —
+  //   - step.tneEngine = true (and step.run !== 'subagent')
+  //       → dispatch FsmProcessWorkflow as a child workflow with bounded
+  //         iterations. Mirrors engine.temporal_workflow's tne-engine leaf
+  //         branch (tne-plugins #2060).
+  //   - step.timeout > 0
+  //       → call executeStep through a one-off proxy with the overridden
+  //         startToCloseTimeout (engine.schema.Step.timeout).
+  //   - otherwise
+  //       → call the workflow-level executeStep proxy.
+  async function dispatchStep(step: Step, stepParams: StepExecutionParams): Promise<StepResult> {
     // tne-engine leaf opt-in: declared by the leaf SKILL.md's top-level
     // `tne-engine: true` frontmatter, surfaced as Step.tneEngine by the
     // parser. Skip when this is itself a subagent step — those are
@@ -359,6 +370,26 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
     // Per-step proxy is required because @temporalio/workflow's
     // proxyActivities options are baked into the proxy — there's no
     // per-call override on the returned proxy fn.
+    if (step.timeout && step.timeout > 0) {
+      const perStepProxy = proxyActivities<typeof activities>({
+        startToCloseTimeout: `${step.timeout}s`,
+        heartbeatTimeout: STEP_HEARTBEAT_TIMEOUT,
+        retry: STEP_RETRY_POLICY,
+      });
+      return perStepProxy.executeStep(stepParams);
+    }
+    return executeStep(stepParams);
+  }
+
+  // runStepUnified wraps dispatchStep for the four serial call sites: it
+  // builds the StepExecutionParams (including mergedTemplateVars) and then
+  // hands off to dispatchStep.
+  async function runStepUnified(
+    step: Step,
+    iteration: number,
+    feedback: string | undefined,
+    overridePhase?: 'preamble' | 'generator' | 'evaluator' | 'postamble',
+  ): Promise<StepResult> {
     const stepParams = buildStepParams(
       step,
       iteration,
@@ -371,16 +402,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
       undefined,
       mergedTemplateVars,
     );
-    if (step.timeout && step.timeout > 0) {
-      const perStepProxy = proxyActivities<typeof activities>({
-        startToCloseTimeout: `${step.timeout}s`,
-        heartbeatTimeout: STEP_HEARTBEAT_TIMEOUT,
-        retry: STEP_RETRY_POLICY,
-      });
-      return perStepProxy.executeStep(stepParams);
-    }
-    void stepKey;
-    return executeStep(stepParams);
+    return dispatchStep(step, stepParams);
   }
 
   // Per-step review pause (parity with engine.temporal_workflow per_step_review,
@@ -415,6 +437,21 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
     if (cancelled) return 'cancelled';
     state.steps[stepKey]!.humanNotes = approvalNotes;
     state.steps[stepKey]!.status = StepStatus.COMPLETE;
+    return 'continue';
+  }
+
+  // Drive per-step review pauses for a parallel wave: after the wave's
+  // outcomes are committed, pause sequentially for each succeeded step.
+  // maybePerStepReviewPause only reads result.success, so a minimal
+  // successful stub is sufficient here.
+  async function runWaveReviewPauses(
+    phase: 'preamble' | 'generator' | 'evaluator' | 'postamble',
+    completedSteps: Step[],
+  ): Promise<'continue' | 'cancelled'> {
+    for (const step of completedSteps) {
+      const outcome = await maybePerStepReviewPause(step, phase, { success: true, gateResults: {} });
+      if (outcome === 'cancelled') return 'cancelled';
+    }
     return 'continue';
   }
 
@@ -531,10 +568,11 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
     // bypasses per-step stage review inside the generator wave.
     if (config.parallelGenerator) {
       const outcome = await runPhaseParallel(
-        'generator', config.generator, input, config, state, executeStep,
+        'generator', config.generator, input, config, state, dispatchStep,
         state.iteration, feedback, () => cancelled,
         (data) => eventActivities.emitFsmEventActivity({ runId: input.runId, type: 'step_cancelled', data }),
         mergedTemplateVars,
+        (completedSteps) => runWaveReviewPauses('generator', completedSteps),
       );
       if (cancelled) return { status: 'cancelled', state };
       if (outcome.failed) {
@@ -583,6 +621,21 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
 
         const result = await runStepUnified(step, state.iteration, undefined, 'evaluator');
         updateStepState(state, stepKey, result);
+
+        // Backprop-to-inputs: scan evaluator feedback for
+        // `backprop_to_inputs: "..."` signals (parity with Python's
+        // backprop_inputs.scan_feedback_for_findings) and accumulate.
+        if (result.feedback) {
+          const evalFindings = scanFeedbackForFindings(
+            result.feedback,
+            stepKey,
+            step.skill,
+            new Date().toISOString(),
+          );
+          if (evalFindings.length > 0) {
+            state.inputFindings = [...(state.inputFindings || []), ...evalFindings];
+          }
+        }
 
         if (!result.success) {
           allPassed = false;
@@ -645,10 +698,11 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
       // has empty `dependsOn`, wave 1 fans them all out; when deps form a
       // DAG, waves respect it. Sequential is the degenerate case.
       const outcome = await runPhaseParallel(
-        'postamble', config.postamble, input, config, state, executeStep,
+        'postamble', config.postamble, input, config, state, dispatchStep,
         0, undefined, () => cancelled,
         (data) => eventActivities.emitFsmEventActivity({ runId: input.runId, type: 'step_cancelled', data }),
         mergedTemplateVars,
+        (completedSteps) => runWaveReviewPauses('postamble', completedSteps),
       );
       if (cancelled) return { status: 'cancelled', state };
       // Propagate postamble failures up. Without this the workflow returned
@@ -672,6 +726,43 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   // For now, finalization entries are simple enough to skip (the output files
   // are already in place from the generator). Full finalization (versioned → final
   // file copy) can be added as an activity.
+
+  // ── Backprop to Inputs · review/apply (parity with Python backprop_inputs)
+  // If the run collected any pending `## Backprop to Inputs` findings (from
+  // skill outputs and evaluator feedback), surface them for review. When
+  // autoApprove is set we apply them straight to the master inputs file.
+  {
+    const pending = (state.inputFindings || []).filter((f) => f.status === 'pending');
+    if (pending.length > 0) {
+      // Emit the review document so a human (or the UI) can see what was found.
+      await eventActivities.emitFsmEventActivity({
+        runId: input.runId,
+        type: 'message',
+        data: { text: formatFindingsForReview(state.inputFindings || []) },
+      });
+
+      if (autoApprove) {
+        // Auto-approve path: mark all pending findings approved and append
+        // them to the master inputs file. Guard for an unset inputsFile —
+        // without a target there's nowhere to write.
+        for (const f of state.inputFindings || []) {
+          if (f.status === 'pending') f.status = 'approved';
+        }
+        if (config.inputsFile) {
+          const applied = await backpropActivities.applyFindingsToInputs({
+            workspacePath: input.workspacePath,
+            inputsRelPath: config.inputsFile,
+            findings: state.inputFindings || [],
+          });
+          if (applied) {
+            for (const f of state.inputFindings || []) {
+              if (f.status === 'approved') f.status = 'applied';
+            }
+          }
+        }
+      }
+    }
+  }
 
   // ─── PUSH WORKSPACE TO S3 ───────────────────────────────────────────
 
@@ -743,6 +834,7 @@ function initializeState(config: ProcessConfig): FsmWorkflowState {
     steps,
     iterations: [],
     earlyExit: false,
+    inputFindings: [],
   };
 }
 
@@ -814,6 +906,12 @@ function updateStepState(state: FsmWorkflowState, stepKey: string, result: StepR
     ...(result.outputMtime != null ? { outputMtime: result.outputMtime } : {}),
     ...(result.inputMtimes ? { inputMtimes: result.inputMtimes } : {}),
   };
+
+  // Backprop-to-inputs: accumulate any `## Backprop to Inputs` findings the
+  // activity scanned out of this step's output into the run-level list.
+  if (result.success && result.inputFindings && result.inputFindings.length > 0) {
+    state.inputFindings = [...(state.inputFindings || []), ...result.inputFindings];
+  }
 }
 
 function resetStepState(state: FsmWorkflowState, stepKey: string): void {
@@ -907,16 +1005,22 @@ async function runPhaseParallel(
   input: FsmProcessInput,
   config: ProcessConfig,
   state: FsmWorkflowState,
-  executeStep: (params: StepExecutionParams) => Promise<StepResult>,
+  /** Per-step dispatch closure (the workflow's dispatchStep). Routes each
+   *  wave step through the same per-step timeout / tne-engine child-workflow
+   *  logic as the sequential path. */
+  dispatchStep: (step: Step, params: StepExecutionParams) => Promise<StepResult>,
   iteration: number,
   feedback: string | undefined,
   isCancelled: () => boolean,
   emitCancelEvent: (data: Record<string, any>) => Promise<void>,
-  /** sop.vars-merged template_vars; parallel runner skips the
-   *  per-step timeout / tneEngine / perStepReview wiring for now (see
-   *  TODO at the executeStep call site) but still gets vars threaded
-   *  through so inline manifest expansion matches the serial path. */
+  /** sop.vars-merged template_vars threaded through so inline manifest
+   *  expansion matches the serial path. */
   templateVarsOverride?: Record<string, string>,
+  /** Called after each wave's outcomes are committed to state, with the
+   *  steps that succeeded in that wave. Used to drive per-step review pauses
+   *  sequentially after a parallel wave (you can't pause inside Promise.all).
+   *  Returning 'cancelled' aborts the phase with `failed: true`. */
+  onWaveComplete?: (completedSteps: Step[]) => Promise<'continue' | 'cancelled'>,
 ): Promise<{ failed: boolean }> {
   if (steps.length === 0) return { failed: false };
 
@@ -1013,14 +1117,14 @@ async function runPhaseParallel(
         await Promise.all(
           ready.map(async (step) => {
             try {
-              // TODO(parity): the parallel runner doesn't yet route through
-              // runStepUnified, so it skips per-step timeout overrides,
-              // tne-engine child-workflow dispatch, and per-step review
-              // pauses. Adding those needs a fan-in design for the review
-              // pause (you can't realistically pause inside a Promise.all
-              // wave). For now we still thread mergedTemplateVars through.
-              const result = await executeStep(
-                buildStepParams(step, iteration, input, config, state, feedback, phaseKey, isFanOut, waveIdx, templateVarsOverride)
+              // Route through the workflow's dispatchStep so each wave step
+              // gets the same per-step timeout overrides and tne-engine
+              // child-workflow dispatch as the sequential path. Per-step
+              // review pauses can't run inside a Promise.all wave, so they're
+              // handled after the wave via the onWaveComplete callback below.
+              const result = await dispatchStep(
+                step,
+                buildStepParams(step, iteration, input, config, state, feedback, phaseKey, isFanOut, waveIdx, templateVarsOverride),
               );
               waveResults.set(step.number, { step, result, wasCancelled: false });
               if (!result.success) {
@@ -1043,6 +1147,7 @@ async function runPhaseParallel(
     }
 
     // Commit wave outcomes to state + notify UI for cancelled siblings.
+    const waveSucceeded: Step[] = [];
     for (const { step, result, wasCancelled } of waveResults.values()) {
       const stepKey = `${phaseKey}.${step.number}`;
       if (wasCancelled) {
@@ -1060,9 +1165,20 @@ async function runPhaseParallel(
         });
       } else if (result) {
         updateStepState(state, stepKey, result);
-        if (result.success) completed.add(step.number);
-        else failed.add(step.number);
+        if (result.success) {
+          completed.add(step.number);
+          waveSucceeded.push(step);
+        } else {
+          failed.add(step.number);
+        }
       }
+    }
+
+    // Per-step review after the wave: pause sequentially for each step that
+    // succeeded (parity with the sequential path's maybePerStepReviewPause).
+    if (onWaveComplete && waveSucceeded.length > 0) {
+      const outcome = await onWaveComplete(waveSucceeded);
+      if (outcome === 'cancelled') return { failed: true };
     }
 
     // Cascade failures/cancellations to transitively blocked dependents.

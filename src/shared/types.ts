@@ -221,6 +221,11 @@ export interface FsmWorkflowState {
   steps: Record<string, StepState>;
   iterations: IterationRecord[];
   earlyExit: boolean;
+  /** Backprop-to-inputs findings collected over the run from skill outputs
+   *  (`## Backprop to Inputs` sections) and evaluator feedback
+   *  (`backprop_to_inputs: "..."` signals). Surfaced for review in the
+   *  finalization phase. Mirrors the Python engine's backprop_inputs.py. */
+  inputFindings?: InputFinding[];
 }
 
 export interface StepState {
@@ -316,6 +321,29 @@ export interface StepResult {
   /** Mtimes of the files referenced by `step.inputs` at the moment the
    *  step ran. */
   inputMtimes?: Record<string, number>;
+  /** Backprop-to-inputs findings scanned out of this step's output file
+   *  (`## Backprop to Inputs` section). The workflow accumulates these into
+   *  `FsmWorkflowState.inputFindings`. */
+  inputFindings?: InputFinding[];
+}
+
+// ─── Backprop to Inputs ─────────────────────────────────────────────────────
+
+/** A single backprop-to-inputs finding — a suggestion that the master inputs
+ *  file should be amended based on something a skill discovered. Mirrors the
+ *  Python engine's `backprop_inputs.InputFinding` dataclass (camelCase here). */
+export interface InputFinding {
+  /** Phase-scoped step key `${phase}.${step.number}` that produced it. */
+  sourceStep: string;
+  /** Name of the skill that produced it. */
+  sourceSkill: string;
+  /** The finding text (a `## Backprop to Inputs` section body, or a
+   *  `backprop_to_inputs:` signal value). */
+  content: string;
+  /** ISO timestamp the finding was collected. */
+  timestamp: string;
+  /** Review lifecycle: pending | approved | rejected | applied. */
+  status: 'pending' | 'approved' | 'rejected' | 'applied';
 }
 
 // ─── Freshness Check (backprop on resume) ──────────────────────────────────

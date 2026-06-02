@@ -10,3 +10,4 @@ export { pullWorkspaceFromS3, pushWorkspaceToS3, wipeWorkspace } from './workspa
 export { parseConfig } from './parseConfig.js';
 export { checkFreshness } from './checkFreshness.js';
 export { emitFsmEventActivity } from './emitEvent.js';
+export { applyFindingsToInputs } from './backpropInputs.js';

@@ -16,6 +16,7 @@ import { resolveTemplateVars } from '../config/templateResolver.js';
 import { buildManifestContent } from '../config/manifestGenerator.js';
 import { emitEvent } from './emitEvent.js';
 import { withWallClockHeartbeat } from './heartbeatTicker.js';
+import { scanOutputForFindings } from './backpropInputs.js';
 
 /** Regex matching inline/manual step names: "(gather inputs)" or "APPROVAL_GATE" */
 const INLINE_STEP_RE = /^\(.*\)$|^[A-Z][A-Z0-9_]+$/;
@@ -189,11 +190,23 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
       if (cascadeResult.passed) {
         emitEvent(parentRunId, 'step_complete', { stepNumber: step.number, skill: step.skill, iteration, outputPath });
         const mt = snapshotMtimes(step.inputs, cwdRoot, outputPathAbs);
+        // Backprop-to-inputs: scan the just-written output for a
+        // `## Backprop to Inputs` section (parity with Python's
+        // backprop_inputs.scan_output_for_findings). The step key is
+        // `${phase}.${step.number}`; the workflow accumulates these.
+        const stepKey = `${phase ?? ''}.${step.number}`;
+        const inputFindings = scanOutputForFindings(
+          outputPathAbs,
+          stepKey,
+          step.skill,
+          new Date().toISOString(),
+        );
         return {
           success: true,
           outputPath,
           outputMtime: mt.outputMtime,
           inputMtimes: mt.inputMtimes,
+          ...(inputFindings.length > 0 ? { inputFindings } : {}),
           gateResults: Object.fromEntries(
             cascadeResult.gateResults.map(gr => [
               gr.gateNumber,
