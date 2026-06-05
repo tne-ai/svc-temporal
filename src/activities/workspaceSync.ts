@@ -93,6 +93,28 @@ export function shouldExclude(relativePath: string): boolean {
 }
 
 /**
+ * Whether a workspace-relative path is a doubled working-dir artifact — e.g.
+ * `tne-website/tne-website/…` (an immediately-repeated top-level segment), or,
+ * for a scoped sync, a path that already begins with the scope name and would
+ * get the scope prepended again to form `<scope>/<scope>/…`.
+ *
+ * These come from a cwd-relative write that re-includes the project name (or a
+ * Bash copy/clone). Left alone, push uploads a doubled S3 key and pull
+ * recreates the bogus nested directory — and a wipe→re-pull cycle keeps
+ * resurrecting it, bloating every sync. Skipping them at both ends breaks the
+ * loop. (Existing doubled keys still need a one-time S3 cleanup.)
+ */
+export function isDoubledDirArtifact(relPath: string, scopePath?: string): boolean {
+  const segs = relPath.split('/').filter(Boolean);
+  if (segs.length >= 2 && segs[0] === segs[1]) return true;
+  if (scopePath) {
+    const sp = scopePath.replace(/^\/+|\/+$/g, '');
+    if (sp && (relPath === sp || relPath.startsWith(sp + '/'))) return true;
+  }
+  return false;
+}
+
+/**
  * Process items in batches of `concurrency`.
  */
 async function batchProcess<T, R>(
@@ -192,8 +214,12 @@ async function collectLocalFiles(baseDir: string): Promise<string[]> {
  */
 async function collectLocalFilesWithFingerprint(
   baseDir: string,
-): Promise<{ files: string[]; fingerprint: string }> {
+): Promise<{ files: string[]; fingerprint: string; sigs: Map<string, string> }> {
   const files: string[] = [];
+  // Per-file signature `mtimeMs:size` — lets the push process only the delta
+  // (files changed since the last confirmed push) instead of HEAD-checking
+  // every file in the workspace on every tick.
+  const sigs = new Map<string, string>();
   let totalBytes = 0;
   let maxMtimeMs = 0;
 
@@ -220,6 +246,7 @@ async function collectLocalFilesWithFingerprint(
           totalBytes += st.size;
           const mtimeMs = st.mtime.getTime();
           if (mtimeMs > maxMtimeMs) maxMtimeMs = mtimeMs;
+          sigs.set(relPath, `${mtimeMs}:${st.size}`);
         } catch {
           // unreadable file — skip its stat contribution; the upload pass
           // will surface a per-file error if it matters.
@@ -229,7 +256,7 @@ async function collectLocalFilesWithFingerprint(
   }
 
   await walk(baseDir);
-  return { files, fingerprint: `${files.length}|${totalBytes}|${maxMtimeMs}` };
+  return { files, fingerprint: `${files.length}|${totalBytes}|${maxMtimeMs}`, sigs };
 }
 
 /**
@@ -243,6 +270,18 @@ async function collectLocalFilesWithFingerprint(
  * is unchanged.
  */
 const LAST_PUSH_FINGERPRINT = new Map<string, string>();
+
+/**
+ * Per-file signatures (`mtimeMs:size`) confirmed in S3 after the last push,
+ * keyed the same way as LAST_PUSH_FINGERPRINT. When the workspace fingerprint
+ * changes (some file was written) we don't re-HEAD every file — only the ones
+ * whose signature differs from this snapshot. A fanout child that touches a
+ * handful of files then does HEAD/upload work proportional to that handful,
+ * not to the whole 800-file project. Files that error during upload are
+ * dropped from the snapshot so they're retried next push. Process-local and
+ * reset on restart (a cold push falls back to the full scan, which is correct).
+ */
+const LAST_PUSH_FILE_SIGS = new Map<string, Map<string, string>>();
 
 function fingerprintKey(bucket: string, prefix: string, scanDir: string): string {
   return `${bucket}|${prefix}|${scanDir}`;
@@ -389,11 +428,18 @@ export async function pullWorkspaceFromS3(
       : undefined;
   } while (continuationToken);
 
-  // 2. Filter out excluded files
+  // 2. Filter out excluded files + doubled-dir artifacts (so a wipe→re-pull
+  //    cycle stops resurrecting tne-website/tne-website/… locally).
+  let doubledSkipped = 0;
   const toProcess = s3Objects.filter((obj) => {
     const relPath = obj.key.slice(prefix.length + 1); // strip "{prefix}/"
-    return !shouldExclude(relPath);
+    if (shouldExclude(relPath)) return false;
+    if (isDoubledDirArtifact(relPath)) { doubledSkipped++; return false; }
+    return true;
   });
+  if (doubledSkipped > 0) {
+    console.warn(`[pullWorkspaceFromS3] skipped ${doubledSkipped} doubled-dir S3 key(s)`);
+  }
 
   // 3. Download files in batches
   let fileCount = 0;
@@ -476,8 +522,9 @@ export async function pushWorkspaceToS3(
   // against S3. invokeSkill's per-step periodic timer + the workflow's
   // terminal sync routinely produce 3-4 push calls per run; without this
   // they all walk and HEAD-check an unchanged workspace.
-  const { files: localFiles, fingerprint } = await collectLocalFilesWithFingerprint(scanDir);
+  const { files: localFiles, fingerprint, sigs } = await collectLocalFilesWithFingerprint(scanDir);
   const fpKey = fingerprintKey(bucket, prefix, scanDir);
+  const lastSigs = LAST_PUSH_FILE_SIGS.get(fpKey) ?? new Map<string, string>();
   const lastFp = LAST_PUSH_FINGERPRINT.get(fpKey);
   if (lastFp && lastFp === fingerprint) {
     console.log(
@@ -488,15 +535,34 @@ export async function pushWorkspaceToS3(
   // Truncated file listing: dumping 781 paths to the console on every
   // sync drowned the worker log. Show count + a sample; if a caller
   // needs the full list they can re-scan offline.
-  const sample = localFiles.slice(0, 10);
-  const tail = localFiles.length > sample.length ? ` (+${localFiles.length - sample.length} more)` : '';
-  console.log(`[pushWorkspaceToS3] Found ${localFiles.length} files; sample: ${sample.join(', ')}${tail}`);
+  // Don't push doubled-dir artifacts to S3 (a cwd-relative write or copy that
+  // re-included the project name). Uploading them creates `<scope>/<scope>/…`
+  // keys that pull then resurrects on every wipe→re-pull cycle.
+  const pushable = localFiles.filter((relFile) => !isDoubledDirArtifact(relFile, scopePath));
+  const doubledSkipped = localFiles.length - pushable.length;
+  if (doubledSkipped > 0) {
+    console.warn(`[pushWorkspaceToS3] skipped ${doubledSkipped} doubled-dir path(s)`);
+  }
+  const sample = pushable.slice(0, 10);
+  const tail = pushable.length > sample.length ? ` (+${pushable.length - sample.length} more)` : '';
+  console.log(`[pushWorkspaceToS3] Found ${pushable.length} files; sample: ${sample.join(', ')}${tail}`);
 
   let fileCount = 0;
   let bytes = 0;
   const conflicts: FileConflict[] = [];
 
-  const results = await batchProcess(localFiles, S3_SYNC_CONCURRENCY, async (relFile) => {
+  let deltaSkipped = 0;
+  const results = await batchProcess(pushable, S3_SYNC_CONCURRENCY, async (relFile) => {
+    // Delta fast-path: if this file's signature (mtime:size) matches what we
+    // confirmed in S3 on the last push, it's unchanged and already in sync —
+    // skip the read + HEAD entirely. A fanout child that wrote 3 files does
+    // HEAD/upload work for ~3 files, not all 800.
+    const sig = sigs.get(relFile);
+    if (sig !== undefined && lastSigs.get(relFile) === sig) {
+      deltaSkipped++;
+      return { uploaded: false, bytes: 0, relFile, inSync: true };
+    }
+
     // relFile is relative to scanDir; the S3 key needs to include scopePath
     const s3RelPath = scopePath
       ? posix.join(scopePath, relFile.split('/').join('/'))
@@ -544,14 +610,14 @@ export async function pushWorkspaceToS3(
         if (!s3Hash.includes('-')) {
           const localMd5 = createHash('md5').update(body).digest('hex');
           if (localMd5 === s3Hash) {
-            return { uploaded: false, bytes: 0 };
+            return { uploaded: false, bytes: 0, relFile, inSync: true };
           }
         } else {
           try {
             const remote = await getS3().send(new GetObjectCommand({ Bucket: bucket, Key: s3Key }));
             const remoteBuf = await streamToBuffer(remote.Body as any);
             if (Buffer.compare(remoteBuf, body) === 0) {
-              return { uploaded: false, bytes: 0 };
+              return { uploaded: false, bytes: 0, relFile, inSync: true };
             }
           } catch {
             // Fall through to the existing branches; not worse than before.
@@ -579,7 +645,9 @@ export async function pushWorkspaceToS3(
           s3ETag,
           localModified: localStat.mtime.toISOString(),
         });
-        return { uploaded: false, bytes: 0 };
+        // S3 holds a newer/different version — our local copy isn't canonical,
+        // so don't record it as in sync (next push should re-examine it).
+        return { uploaded: false, bytes: 0, relFile, inSync: false };
       }
 
       // Upload (new file or local is newer)
@@ -591,17 +659,30 @@ export async function pushWorkspaceToS3(
         }),
       );
 
-      return { uploaded: true, bytes: body.length };
+      return { uploaded: true, bytes: body.length, relFile, inSync: true };
     } catch (err) {
       console.error(`[pushWorkspaceToS3] Failed to upload ${relFile}:`, err);
-      return { uploaded: false, bytes: 0 };
+      return { uploaded: false, bytes: 0, relFile, inSync: false };
     }
   });
 
+  // Rebuild the per-file snapshot from this push: a file is "confirmed in S3
+  // with our content" only if it uploaded, matched byte-for-byte, or was a
+  // delta-skip of an already-confirmed file. Errors and S3-newer conflicts are
+  // omitted so the next push re-examines them.
+  const confirmedSigs = new Map<string, string>();
   for (const r of results) {
     if (r.uploaded) fileCount++;
     bytes += r.bytes;
+    if (r.inSync) {
+      const s = sigs.get(r.relFile);
+      if (s !== undefined) confirmedSigs.set(r.relFile, s);
+    }
     heartbeat({ op: 'push', fileCount, bytes });
+  }
+  LAST_PUSH_FILE_SIGS.set(fpKey, confirmedSigs);
+  if (deltaSkipped > 0) {
+    console.log(`[pushWorkspaceToS3] delta: skipped HEAD/upload for ${deltaSkipped} unchanged file(s)`);
   }
 
   // Stamp the fingerprint after the push completes so the next call for
@@ -610,7 +691,7 @@ export async function pushWorkspaceToS3(
   // a future call needs to actually re-examine, so we explicitly DO want
   // the next push to redo the scan in that case.
   if (conflicts.length === 0) {
-    LAST_PUSH_FINGERPRINT.set(fingerprintKey(bucket, prefix, scanDir), fingerprint);
+    LAST_PUSH_FINGERPRINT.set(fpKey, fingerprint);
   }
 
   return { fileCount, conflicts, bytes };
