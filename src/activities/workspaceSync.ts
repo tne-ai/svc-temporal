@@ -93,6 +93,28 @@ export function shouldExclude(relativePath: string): boolean {
 }
 
 /**
+ * Whether a workspace-relative path is a doubled working-dir artifact — e.g.
+ * `tne-website/tne-website/…` (an immediately-repeated top-level segment), or,
+ * for a scoped sync, a path that already begins with the scope name and would
+ * get the scope prepended again to form `<scope>/<scope>/…`.
+ *
+ * These come from a cwd-relative write that re-includes the project name (or a
+ * Bash copy/clone). Left alone, push uploads a doubled S3 key and pull
+ * recreates the bogus nested directory — and a wipe→re-pull cycle keeps
+ * resurrecting it, bloating every sync. Skipping them at both ends breaks the
+ * loop. (Existing doubled keys still need a one-time S3 cleanup.)
+ */
+export function isDoubledDirArtifact(relPath: string, scopePath?: string): boolean {
+  const segs = relPath.split('/').filter(Boolean);
+  if (segs.length >= 2 && segs[0] === segs[1]) return true;
+  if (scopePath) {
+    const sp = scopePath.replace(/^\/+|\/+$/g, '');
+    if (sp && (relPath === sp || relPath.startsWith(sp + '/'))) return true;
+  }
+  return false;
+}
+
+/**
  * Process items in batches of `concurrency`.
  */
 async function batchProcess<T, R>(
@@ -389,11 +411,18 @@ export async function pullWorkspaceFromS3(
       : undefined;
   } while (continuationToken);
 
-  // 2. Filter out excluded files
+  // 2. Filter out excluded files + doubled-dir artifacts (so a wipe→re-pull
+  //    cycle stops resurrecting tne-website/tne-website/… locally).
+  let doubledSkipped = 0;
   const toProcess = s3Objects.filter((obj) => {
     const relPath = obj.key.slice(prefix.length + 1); // strip "{prefix}/"
-    return !shouldExclude(relPath);
+    if (shouldExclude(relPath)) return false;
+    if (isDoubledDirArtifact(relPath)) { doubledSkipped++; return false; }
+    return true;
   });
+  if (doubledSkipped > 0) {
+    console.warn(`[pullWorkspaceFromS3] skipped ${doubledSkipped} doubled-dir S3 key(s)`);
+  }
 
   // 3. Download files in batches
   let fileCount = 0;
@@ -488,15 +517,23 @@ export async function pushWorkspaceToS3(
   // Truncated file listing: dumping 781 paths to the console on every
   // sync drowned the worker log. Show count + a sample; if a caller
   // needs the full list they can re-scan offline.
-  const sample = localFiles.slice(0, 10);
-  const tail = localFiles.length > sample.length ? ` (+${localFiles.length - sample.length} more)` : '';
-  console.log(`[pushWorkspaceToS3] Found ${localFiles.length} files; sample: ${sample.join(', ')}${tail}`);
+  // Don't push doubled-dir artifacts to S3 (a cwd-relative write or copy that
+  // re-included the project name). Uploading them creates `<scope>/<scope>/…`
+  // keys that pull then resurrects on every wipe→re-pull cycle.
+  const pushable = localFiles.filter((relFile) => !isDoubledDirArtifact(relFile, scopePath));
+  const doubledSkipped = localFiles.length - pushable.length;
+  if (doubledSkipped > 0) {
+    console.warn(`[pushWorkspaceToS3] skipped ${doubledSkipped} doubled-dir path(s)`);
+  }
+  const sample = pushable.slice(0, 10);
+  const tail = pushable.length > sample.length ? ` (+${pushable.length - sample.length} more)` : '';
+  console.log(`[pushWorkspaceToS3] Found ${pushable.length} files; sample: ${sample.join(', ')}${tail}`);
 
   let fileCount = 0;
   let bytes = 0;
   const conflicts: FileConflict[] = [];
 
-  const results = await batchProcess(localFiles, S3_SYNC_CONCURRENCY, async (relFile) => {
+  const results = await batchProcess(pushable, S3_SYNC_CONCURRENCY, async (relFile) => {
     // relFile is relative to scanDir; the S3 key needs to include scopePath
     const s3RelPath = scopePath
       ? posix.join(scopePath, relFile.split('/').join('/'))

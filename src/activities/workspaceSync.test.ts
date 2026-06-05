@@ -3,7 +3,26 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
-import { wipeWorkspace, shouldExclude } from './workspaceSync.js';
+import { wipeWorkspace, shouldExclude, isDoubledDirArtifact } from './workspaceSync.js';
+
+describe('isDoubledDirArtifact', () => {
+  it('flags an immediately-repeated top-level segment', () => {
+    expect(isDoubledDirArtifact('tne-website/tne-website/tne-ai-web-hugo/x.md')).toBe(true);
+    expect(isDoubledDirArtifact('ppm/ppm/src/index.ts')).toBe(true);
+  });
+  it('flags a scoped path that re-includes the scope name', () => {
+    // scanned under <scope>; a relFile that starts with the scope would form
+    // <scope>/<scope>/… once the scope is prepended for the S3 key.
+    expect(isDoubledDirArtifact('tne-website/foo.md', 'tne-website')).toBe(true);
+    expect(isDoubledDirArtifact('tne-website', '/tne-website/')).toBe(true);
+  });
+  it('passes normal paths', () => {
+    expect(isDoubledDirArtifact('tne-website/tne-ai-web-hugo/x.md')).toBe(false);
+    expect(isDoubledDirArtifact('tne-ai-web-hugo/x.md', 'tne-website')).toBe(false);
+    expect(isDoubledDirArtifact('TNE-CONTEXT/cmo/plan.md')).toBe(false);
+    expect(isDoubledDirArtifact('a/a-b/c')).toBe(false);
+  });
+});
 
 let tmpRoot: string;
 beforeEach(() => { tmpRoot = mkdtempSync(join(tmpdir(), 'wipe-')); });
