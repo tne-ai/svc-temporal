@@ -2,11 +2,16 @@
  * Shared constants for the Temporal FSM service.
  */
 
-/** Task queue for FSM process orchestration workflows */
-export const FSM_TASK_QUEUE = 'tne-fsm-queue';
+/**
+ * Task queue for FSM process orchestration workflows.
+ * Env-overridable so an EDGE deployment (svc-temporal sidecar in a per-user pod)
+ * polls a per-user queue (e.g. `edge-<user>-fsm`); orion's fsmService reads the
+ * same env var to dispatch there. Central leaves it unset → shared queue.
+ */
+export const FSM_TASK_QUEUE = process.env.FSM_TASK_QUEUE || 'tne-fsm-queue';
 
-/** Task queue for generic long-running Horizon jobs */
-export const JOBS_TASK_QUEUE = 'tne-jobs-queue';
+/** Task queue for generic long-running Horizon jobs (env-overridable; see above). */
+export const JOBS_TASK_QUEUE = process.env.JOBS_TASK_QUEUE || 'tne-jobs-queue';
 
 /**
  * Runtime-only constants (use process.env).

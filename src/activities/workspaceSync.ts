@@ -29,6 +29,18 @@ import type {
   FileConflict,
 } from '../shared/types.js';
 
+/**
+ * EDGE / local-PVC mode: when the worker runs in a per-user edge pod, the
+ * workspace is a durable PVC, so the S3 pull/push sync is skipped — the PVC is
+ * the source of truth. Enabled by LOCAL_WORKSPACE=true (or INFERENCE_EDGE=true).
+ */
+function isLocalWorkspace(): boolean {
+  return (
+    (process.env.LOCAL_WORKSPACE || '').toLowerCase() === 'true' ||
+    (process.env.INFERENCE_EDGE || '').toLowerCase() === 'true'
+  );
+}
+
 let _s3: S3Client | undefined;
 function getS3(): S3Client {
   if (!_s3) {
@@ -350,6 +362,13 @@ async function cleanupTemporalBackups(
 export async function pullWorkspaceFromS3(
   params: WorkspaceSyncParams,
 ): Promise<WorkspaceSyncResult> {
+  // EDGE / local-PVC mode: the workspace IS a durable per-user PVC, so there's
+  // nothing to pull from S3 (and doing so would clobber newer local edits).
+  // No-op. Set LOCAL_WORKSPACE=true (or INFERENCE_EDGE=true) on the edge sidecar.
+  if (isLocalWorkspace()) {
+    console.log('[pullWorkspaceFromS3] LOCAL_WORKSPACE — skipping S3 pull (PVC is source of truth)');
+    return { fileCount: 0, conflicts: [], bytes: 0 };
+  }
   const { bucket, prefix, localPath, scopePath } = params;
 
   // Scrub conflict-backup debris before pulling — keeps workspaces lean and
@@ -465,6 +484,13 @@ export async function pullWorkspaceFromS3(
 export async function pushWorkspaceToS3(
   params: WorkspaceSyncParams,
 ): Promise<WorkspaceSyncResult> {
+  // EDGE / local-PVC mode: files already live on the durable PVC; central's
+  // periodic backup (or the orion-backend's own S3 sweep) handles off-pod
+  // backup. Skip the per-run push. See pullWorkspaceFromS3.
+  if (isLocalWorkspace()) {
+    console.log('[pushWorkspaceToS3] LOCAL_WORKSPACE — skipping S3 push (PVC is source of truth)');
+    return { fileCount: 0, conflicts: [], bytes: 0 };
+  }
   const { bucket, prefix, localPath, scopePath } = params;
 
   const scanDir = scopePath ? join(localPath, scopePath) : localPath;
