@@ -41,12 +41,18 @@ import { heartbeat } from '@temporalio/activity';
 import type { Step, GateResult, CascadeResult } from '../shared/types.js';
 import { StageType } from '../shared/types.js';
 import { withWallClockHeartbeat } from './heartbeatTicker.js';
+import { roleModel } from '../config/llmCliConfig.js';
 
 const JSON_SUFFIX = '\n\nReturn ONLY valid JSON (no markdown fencing):\n' +
   '{"passed": true/false, "feedback": "...", "score": <number>}';
 
-/** Gate model is fixed independent of the step model. Override via env. */
-const GATE_MODEL = process.env.GATE_MODEL?.trim() || 'claude-haiku-4-5-20251001';
+/** Gate model is fixed independent of the step model. Resolution order:
+ *    1. GATE_MODEL env override
+ *    2. llm-cli.yaml `similarity` role (the engine's scalar-scoring role,
+ *       the equivalent of gates) — parity with the Python engine
+ *    3. hardcoded default
+ */
+const GATE_MODEL = process.env.GATE_MODEL?.trim() || roleModel('similarity') || 'claude-haiku-4-5-20251001';
 
 /** Per-gate maxTurns. Gates only need to read one file and emit JSON;
  *  more than ~5 turns means the model is wandering. */

@@ -8,10 +8,16 @@
  * polls a per-user queue (e.g. `edge-<user>-fsm`); orion's fsmService reads the
  * same env var to dispatch there. Central leaves it unset → shared queue.
  */
-export const FSM_TASK_QUEUE = process.env.FSM_TASK_QUEUE || 'tne-fsm-queue';
+// Guarded with `typeof process` because fsmProcess.workflow.ts imports timeout
+// constants from this module, which drags the WHOLE module into the Temporal
+// workflow bundle. The sandbox has no `process` global, so an unguarded
+// `process.env` here throws ReferenceError at bundle init → the workflow can't
+// instantiate (stuck on INIT, no steps). The default is fine in-sandbox; the
+// worker (outside the sandbox) still reads the real env to pick its queue.
+export const FSM_TASK_QUEUE = typeof process !== 'undefined' ? (process.env.FSM_TASK_QUEUE || 'tne-fsm-queue') : 'tne-fsm-queue';
 
 /** Task queue for generic long-running Horizon jobs (env-overridable; see above). */
-export const JOBS_TASK_QUEUE = process.env.JOBS_TASK_QUEUE || 'tne-jobs-queue';
+export const JOBS_TASK_QUEUE = typeof process !== 'undefined' ? (process.env.JOBS_TASK_QUEUE || 'tne-jobs-queue') : 'tne-jobs-queue';
 
 /**
  * Runtime-only constants (use process.env).
