@@ -754,6 +754,16 @@ export async function wipeWorkspace(
 ): Promise<WipeWorkspaceResult> {
   const { localPath, scopePath } = params;
 
+  // EDGE / local-PVC mode: the workspace is the user's DURABLE PVC, not an
+  // ephemeral per-run dir. Wiping it would destroy the boot-seeded files (and
+  // rmdir'ing the PVC mount point itself fails EACCES → unbounded retry → the
+  // run hangs on "Wipe workspace"). The PVC persists across runs by design, so
+  // skip — same rationale as pull/pushWorkspaceFromS3 (the PVC is source of truth).
+  if (isLocalWorkspace()) {
+    console.log('[wipeWorkspace] LOCAL_WORKSPACE — skipping wipe (PVC is the durable workspace)');
+    return { wipedPath: localPath, existed: false };
+  }
+
   let target = localPath;
   if (scopePath) {
     if (isAbsolute(scopePath) || scopePath.split(/[\\/]+/).includes('..')) {
