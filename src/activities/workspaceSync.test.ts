@@ -72,6 +72,20 @@ describe('wipeWorkspace', () => {
       wipeWorkspace({ localPath: tmpRoot, scopePath: '../foo' }),
     ).rejects.toThrow(/unsafe scopePath/);
   });
+
+  it('is a no-op on the edge (LOCAL_WORKSPACE) — the PVC is durable, never wiped', async () => {
+    writeFileSync(join(tmpRoot, 'keep.txt'), 'keep');
+    const prev = process.env.LOCAL_WORKSPACE;
+    process.env.LOCAL_WORKSPACE = 'true';
+    try {
+      const res = await wipeWorkspace({ localPath: tmpRoot });
+      expect(res.existed).toBe(false);
+      expect(existsSync(join(tmpRoot, 'keep.txt'))).toBe(true); // files survive
+    } finally {
+      if (prev === undefined) delete process.env.LOCAL_WORKSPACE;
+      else process.env.LOCAL_WORKSPACE = prev;
+    }
+  });
 });
 
 describe('shouldExclude', () => {
