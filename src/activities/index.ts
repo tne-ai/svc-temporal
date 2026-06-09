@@ -10,3 +10,5 @@ export { pullWorkspaceFromS3, pushWorkspaceToS3, wipeWorkspace } from './workspa
 export { parseConfig } from './parseConfig.js';
 export { checkFreshness } from './checkFreshness.js';
 export { emitFsmEventActivity } from './emitEvent.js';
+export { recordProvenance, lookupProvenance } from './provenanceStore.js';
+export { judgeSimilarity, llmInvert, runBijectionInverse } from './backwardDispatch.js';
