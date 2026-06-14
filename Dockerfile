@@ -5,7 +5,7 @@ WORKDIR /app
 # git is needed to install the @tne-ai/agent-harness GitHub dependency;
 # Python/build tools are needed when npm dependencies compile native modules.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates git python3 make g++ \
+    ca-certificates git python3 python3-yaml make g++ \
     && rm -rf /var/lib/apt/lists/*
 
 # Configure git auth for private GitHub repos. npm resolves github URLs to
@@ -40,6 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     openssh-client \
     python3 \
+    python3-yaml \
     python3-pip \
     python3-venv \
     make \
