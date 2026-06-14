@@ -479,8 +479,14 @@ async function invokeViaHarness(
     if (!isPiAgentEnabled()) {
       console.warn('[invokeViaPi] USE_PI_AGENT is unset — enabling implicitly (harness backend retired)');
     }
-    const githubEnv = context?.githubToken
-      ? { GH_TOKEN: context.githubToken, GITHUB_TOKEN: context.githubToken, GITHUB_PERSONAL_ACCESS_TOKEN: context.githubToken }
+    const fallbackGitHubToken = process.env.GH_TOKEN
+      || process.env.GITHUB_TOKEN
+      || process.env.GITHUB_PERSONAL_ACCESS_TOKEN
+      || process.env.GITHUB_PAT
+      || process.env.TNE_PLUGINS_GITHUB_TOKEN;
+    const effectiveGitHubToken = context?.githubToken || fallbackGitHubToken;
+    const githubEnv = effectiveGitHubToken
+      ? { GH_TOKEN: effectiveGitHubToken, GITHUB_TOKEN: effectiveGitHubToken, GITHUB_PERSONAL_ACCESS_TOKEN: effectiveGitHubToken }
       : {};
     const piTools = buildPiTools(cwd, { sessionKey: context?.parentRunId || cwd, env: githubEnv });
     // `resolvedModel` was already normalized for the LiteLLM branch
@@ -941,10 +947,16 @@ async function invokeViaClaudeAgentSDK(
         //   upstream credentials. The chat-mode path (litellmProvider.ts)
         //   does forward BYOK via body.api_key.
         const out: Record<string, string> = { ...(process.env as Record<string, string>) };
-        if (context?.githubToken) {
-          out.GH_TOKEN = context.githubToken;
-          out.GITHUB_TOKEN = context.githubToken;
-          out.GITHUB_PERSONAL_ACCESS_TOKEN = context.githubToken;
+        const fallbackGitHubToken = process.env.GH_TOKEN
+          || process.env.GITHUB_TOKEN
+          || process.env.GITHUB_PERSONAL_ACCESS_TOKEN
+          || process.env.GITHUB_PAT
+          || process.env.TNE_PLUGINS_GITHUB_TOKEN;
+        const effectiveGitHubToken = context?.githubToken || fallbackGitHubToken;
+        if (effectiveGitHubToken) {
+          out.GH_TOKEN = effectiveGitHubToken;
+          out.GITHUB_TOKEN = effectiveGitHubToken;
+          out.GITHUB_PERSONAL_ACCESS_TOKEN = effectiveGitHubToken;
         }
         const proxyUrl = (process.env.LITELLM_PROXY_URL || '').replace(/\/+$/, '');
         const masterKey = process.env.LITELLM_MASTER_KEY || '';
