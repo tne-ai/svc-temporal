@@ -7,9 +7,10 @@
  */
 
 import { heartbeat } from '@temporalio/activity';
-import { spawn } from 'child_process';
-import { cpSync, existsSync, mkdirSync, statSync, writeFileSync } from 'fs';
+import { execFileSync, spawn } from 'child_process';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'fs';
 import { basename, dirname, isAbsolute, join } from 'path';
+import { tmpdir } from 'os';
 import type { StepExecutionParams, StepResult } from '../shared/types.js';
 import { invokeSkill, buildPrompt } from './invokeSkill.js';
 import { runGateCascade } from './runGateCascade.js';
@@ -29,8 +30,12 @@ function commandFromStep(step: StepExecutionParams['step']): string {
   return step.notes || step.skill || '';
 }
 
+function commandRequiresPath(command: string): string | null {
+  const match = command.match(/(?:^|\s)(?:python3?|node|bash|sh)\s+([^\s;&|]+plugins\/tne\/skills\/[^\s;&|]+)/);
+  return match?.[1]?.replace(/^['"]|['"]$/g, '') || null;
+}
 
-function findBundledTnePluginsRoot(): string | null {
+function findBundledTnePluginsRoot(requiredRelativePath?: string | null): string | null {
   const candidates = [
     process.env.TNE_PLUGINS_PATH,
     join(process.cwd(), 'tne-plugins'),
@@ -38,36 +43,71 @@ function findBundledTnePluginsRoot(): string | null {
     '/app/tne-plugins',
   ].filter(Boolean) as string[];
   for (const candidate of candidates) {
-    if (existsSync(join(candidate, 'plugins', 'tne', 'skills'))) return candidate;
+    if (!existsSync(join(candidate, 'plugins', 'tne', 'skills'))) continue;
+    if (requiredRelativePath && !existsSync(join(candidate, requiredRelativePath))) continue;
+    return candidate;
   }
   return null;
 }
 
-function ensureCommandWorkingDir(workspacePath: string, workingDir: string | undefined, cwdRoot: string): void {
-  if (!workingDir) return;
-  // Command-mode deterministic skills often execute repository-relative scripts
-  // such as `python3 plugins/tne/skills/...`. Central Temporal workers receive
-  // an S3 workspace that may contain only the scoped working directory outputs,
-  // not a full tne-plugins checkout. In that case, seed the requested workingDir
-  // from the worker image's bundled tne-plugins so the command can run while its
-  // generated artifacts still land under workspacePath and can be synced/read.
-  if (basename(workingDir) !== 'tne-plugins') return;
-  if (existsSync(join(cwdRoot, 'plugins', 'tne', 'skills'))) return;
-
-  const bundled = findBundledTnePluginsRoot();
-  if (!bundled) return;
-  mkdirSync(dirname(cwdRoot), { recursive: true });
-  cpSync(bundled, cwdRoot, {
+function copyTnePluginsTree(source: string, destination: string): void {
+  mkdirSync(dirname(destination), { recursive: true });
+  cpSync(source, destination, {
     recursive: true,
     force: true,
     dereference: true,
     filter: (src) => {
-      const rel = src.slice(bundled.length).replace(/^[/\\]+/, '');
+      const rel = src.slice(source.length).replace(/^[/\\]+/, '');
       if (!rel) return true;
       const parts = rel.split(/[/\\]+/);
       return !parts.some((part) => part === '.git' || part === 'node_modules' || part === '.venv' || part === '__pycache__');
     },
   });
+}
+
+function cloneTnePlugins(destination: string): boolean {
+  if (process.env.SVC_TEMPORAL_DISABLE_TNE_PLUGINS_CLONE === 'true') return false;
+  const repoUrl = process.env.TNE_PLUGINS_REPO_URL || 'https://github.com/tne-ai/tne-plugins.git';
+  const ref = process.env.TNE_PLUGINS_REF || 'main';
+  const tmp = mkdtempSync(join(tmpdir(), 'tne-plugins-'));
+  try {
+    execFileSync('git', ['clone', '--depth', '1', '--branch', ref, repoUrl, tmp], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      timeout: 120_000,
+    });
+    copyTnePluginsTree(tmp, destination);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+export function ensureCommandWorkingDir(workspacePath: string, workingDir: string | undefined, cwdRoot: string, command = ''): void {
+  mkdirSync(cwdRoot, { recursive: true });
+  if (!workingDir) return;
+  // Command-mode deterministic skills often execute repository-relative scripts
+  // such as `python3 plugins/tne/skills/...`. Central Temporal workers receive
+  // an S3 workspace that may contain only the scoped working directory outputs,
+  // not a full tne-plugins checkout. Seed the requested workingDir from a known
+  // good source, and if the image bundled stale plugins, fetch current plugins
+  // directly instead of burning another rollout cycle.
+  if (basename(workingDir) !== 'tne-plugins') return;
+
+  const requiredRelativePath = commandRequiresPath(command);
+  const hasRequiredPath = () => !requiredRelativePath || existsSync(join(cwdRoot, requiredRelativePath));
+  if (existsSync(join(cwdRoot, 'plugins', 'tne', 'skills')) && hasRequiredPath()) return;
+
+  const bundled = findBundledTnePluginsRoot(requiredRelativePath) || findBundledTnePluginsRoot();
+  if (bundled) copyTnePluginsTree(bundled, cwdRoot);
+  if (hasRequiredPath()) return;
+
+  // Last-resort self-healing path for exactly the failure mode that caused the
+  // CRM loop: svc-temporal was rolled out with fresh worker code but stale
+  // bundled tne-plugins. The worker has git/network; fetch current plugins into
+  // the workspace so command-mode steps can proceed immediately.
+  cloneTnePlugins(cwdRoot);
 }
 
 function runShellCommand(command: string, cwd: string, env: NodeJS.ProcessEnv): Promise<{ exitCode: number; stdout: string; stderr: string }> {
@@ -149,7 +189,7 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
   const cwdRoot = workingDir ? join(workspacePath, workingDir) : workspacePath;
 
   if (isCommandStep(step)) {
-    try { ensureCommandWorkingDir(workspacePath, workingDir, cwdRoot); } catch (err: any) {
+    try { ensureCommandWorkingDir(workspacePath, workingDir, cwdRoot, commandFromStep(step)); } catch (err: any) {
       const error = `Failed to prepare command working directory '${cwdRoot}': ${err?.message || String(err)}`;
       emitEvent(parentRunId, 'step_failed', { stepNumber: step.number, skill: step.skill, iteration, error });
       return { success: false, error };
