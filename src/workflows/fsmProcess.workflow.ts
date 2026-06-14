@@ -332,6 +332,7 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
         delegateModel: input.delegateModel,
         delegateProvider: input.delegateProvider,
         toolHarness: input.toolHarness,
+        githubToken: input.githubToken,
         maxIterations: step.tneEngineMaxIterations || 3,
       };
       const timeoutSec = step.timeout && step.timeout > 0 ? step.timeout : 0;
@@ -808,6 +809,7 @@ function buildStepParams(
     workingDir: input.workingDir,
     agentBackend: input.agentBackend,
     toolHarness: input.toolHarness,
+    githubToken: input.githubToken,
     parentRunId: input.runId,
     userId: input.userId,
     s3Bucket: input.s3Bucket,

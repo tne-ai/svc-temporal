@@ -96,6 +96,7 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
       // Forward the resolved tool-harness so executeStep can pick Pi vs
       // Claude SDK for each step. LiteLLM is always-on as transport.
       toolHarness: input.toolHarness,
+      githubToken: input.githubToken,
     };
     try {
       const fsmResult = await executeChild<(i: FsmProcessInput) => Promise<FsmProcessResult>>(
@@ -157,7 +158,7 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
       input.prompt,
       `/tmp/temporal-jobs/${input.jobId}`,
       input.agentBackend,
-      { jobId: input.jobId, userId: input.userId, toolHarness: input.toolHarness, completion: true },
+      { jobId: input.jobId, userId: input.userId, toolHarness: input.toolHarness, completion: true, githubToken: input.githubToken },
     );
     progress = 100;
     status = result.success ? 'completed' : 'failed';
@@ -242,6 +243,7 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
       s3Bucket: input.s3Bucket, s3Prefix: input.s3Prefix,
       workingDir: input.workingDir,
       toolHarness: input.toolHarness,
+      githubToken: input.githubToken,
     },
   );
 

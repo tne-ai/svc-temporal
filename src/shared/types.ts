@@ -208,6 +208,10 @@ export interface FsmProcessInput {
    *  per-deploy AGENT_BACKEND env-var default for compatibility with the
    *  pre-toolHarness migration. */
   toolHarness?: 'pi' | 'claude_sdk';
+  /** User-scoped GitHub token fetched by Orion from the user's synced GitHub
+   *  connection. Forwarded to activities as GH_TOKEN/GITHUB_TOKEN for gh CLI
+   *  and git operations; never persisted by svc-temporal. */
+  githubToken?: string;
 }
 
 export interface FsmProcessResult {
@@ -292,6 +296,8 @@ export interface StepExecutionParams {
    *  per-step executeStep activity can forward it to invokeSkill, which
    *  picks Claude SDK vs Pi orchestration. */
   toolHarness?: 'pi' | 'claude_sdk';
+  /** User-scoped GitHub token from the synced Orion GitHub connection. */
+  githubToken?: string;
   /** Parent FSM run id — passed to the agent so nested fsm-start calls link back. */
   parentRunId?: string;
   /** User id — forwarded to horizon's /api/fsm-invoke/start for nested FSM runs. */
@@ -439,6 +445,10 @@ export interface JobInput {
    *  for Structured Outputs on the claude_sdk backend. Durable via Temporal
    *  like any other job; the difference is purely the executor. */
   completionMode?: boolean;
+  /** Short-lived/per-user GitHub token fetched by Orion from the user's synced
+   *  GitHub connection and passed to the worker for this job only. svc-temporal
+   *  maps it to GH_TOKEN/GITHUB_TOKEN for gh CLI + HTTPS git operations. */
+  githubToken?: string;
 }
 
 export interface JobResult {

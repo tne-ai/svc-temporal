@@ -183,7 +183,7 @@ function snapshotMtimes(
  * This activity heartbeats throughout to keep Temporal informed of progress.
  */
 export async function executeStep(params: StepExecutionParams): Promise<StepResult> {
-  const { step, iteration, templateVars, feedback, humanNotes, workspacePath, workingDir, manifestPath, manifestContent, config, state, currentStepKey, agentBackend, parentRunId, userId, s3Bucket, s3Prefix, phase, parallel, waveIdx } = params;
+  const { step, iteration, templateVars, feedback, humanNotes, workspacePath, workingDir, manifestPath, manifestContent, config, state, currentStepKey, agentBackend, githubToken, parentRunId, userId, s3Bucket, s3Prefix, phase, parallel, waveIdx } = params;
 
   // Wall-clock heartbeat ticker for the entire step. Without this, a stall
   // anywhere inside invokeSkill / runGateCascade (cold worker pod, mid-LLM
@@ -196,7 +196,7 @@ export async function executeStep(params: StepExecutionParams): Promise<StepResu
 }
 
 async function executeStepInner(params: StepExecutionParams): Promise<StepResult> {
-  const { step, iteration, templateVars, feedback, humanNotes, workspacePath, workingDir, manifestPath, manifestContent, config, state, currentStepKey, agentBackend, toolHarness, parentRunId, userId, s3Bucket, s3Prefix, phase, parallel, waveIdx } = params;
+  const { step, iteration, templateVars, feedback, humanNotes, workspacePath, workingDir, manifestPath, manifestContent, config, state, currentStepKey, agentBackend, toolHarness, githubToken, parentRunId, userId, s3Bucket, s3Prefix, phase, parallel, waveIdx } = params;
 
   heartbeat({ step: step.number, skill: step.skill, status: 'starting' });
   emitEvent(parentRunId, 'step_start', { stepNumber: step.number, skill: step.skill, iteration, phase, parallel, waveIdx });
@@ -294,7 +294,7 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
     emitEvent(parentRunId, 'heartbeat', { stepNumber: step.number, skill: step.skill, status: 'invoking', retry: retries });
 
     // Invoke the skill
-    const invResult = await invokeSkill(step, prompt + (currentFeedback ? `\n\n## Revision Feedback\n\n${currentFeedback}` : ''), workspacePath, agentBackend, { parentRunId, userId, s3Bucket, s3Prefix, workingDir, toolHarness });
+    const invResult = await invokeSkill(step, prompt + (currentFeedback ? `\n\n## Revision Feedback\n\n${currentFeedback}` : ''), workspacePath, agentBackend, { parentRunId, userId, s3Bucket, s3Prefix, workingDir, toolHarness, githubToken });
 
     if (!invResult.success) {
       // Check for stage review pause (nested orchestrator)
