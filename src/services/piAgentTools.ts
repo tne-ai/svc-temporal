@@ -35,6 +35,7 @@ export function getGitHubToken(): string | undefined {
   return process.env.GH_TOKEN
     || process.env.GITHUB_TOKEN
     || process.env.GITHUB_PAT
+    || process.env.GITHUB_PERSONAL_ACCESS_TOKEN
     || process.env.TNE_PLUGINS_GITHUB_TOKEN;
 }
 
@@ -57,6 +58,7 @@ export function buildGitAskPassEnv(): Record<string, string> {
     GIT_TERMINAL_PROMPT: '0',
     GH_TOKEN: token,
     GITHUB_TOKEN: token,
+    GITHUB_PERSONAL_ACCESS_TOKEN: token,
   };
 }
 
