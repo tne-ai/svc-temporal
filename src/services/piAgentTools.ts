@@ -16,6 +16,8 @@
  */
 
 import { promises as fs } from 'fs';
+import { mkdtempSync, writeFileSync, chmodSync } from 'fs';
+import { tmpdir } from 'os';
 import { spawn } from 'child_process';
 import path from 'path';
 import { glob } from 'glob';
@@ -29,6 +31,35 @@ import type { AgentTool } from '@mariozechner/pi-agent-core';
  * message rather than failing the run, since most temporal activities
  * don't actually invoke WebSearch.
  */
+export function getGitHubToken(): string | undefined {
+  return process.env.GH_TOKEN
+    || process.env.GITHUB_TOKEN
+    || process.env.GITHUB_PAT
+    || process.env.TNE_PLUGINS_GITHUB_TOKEN;
+}
+
+export function buildGitAskPassEnv(): Record<string, string> {
+  const token = getGitHubToken();
+  if (!token) return {};
+  const dir = mkdtempSync(path.join(tmpdir(), 'git-askpass-'));
+  const script = path.join(dir, 'askpass.sh');
+  writeFileSync(script, [
+    '#!/bin/sh',
+    'case "$1" in',
+    '  *Username*) printf "%s\n" "x-access-token" ;;',
+    '  *) printf "%s\n" "$GITHUB_TOKEN" ;;',
+    'esac',
+    '',
+  ].join('\n'), { mode: 0o700 });
+  chmodSync(script, 0o700);
+  return {
+    GIT_ASKPASS: script,
+    GIT_TERMINAL_PROMPT: '0',
+    GH_TOKEN: token,
+    GITHUB_TOKEN: token,
+  };
+}
+
 async function executeTavilySearch(args: { query: string; max_results?: number }): Promise<string> {
   const apiKey = process.env.TAVILY_API_KEY?.trim();
   if (!apiKey) return 'WebSearch is not configured (TAVILY_API_KEY not set on the worker).';
@@ -95,7 +126,7 @@ const ALLOWED_ABS_PREFIXES = [
   '/dev/null', '/dev/stdin', '/dev/stdout', '/dev/stderr',
 ];
 
-function checkBashCommandSafety(
+export function checkBashCommandSafety(
   command: string,
   workspaceRoot: string,
 ): { ok: true } | { ok: false; reason: string } {
@@ -117,6 +148,11 @@ function checkBashCommandSafety(
   const absPathRe = /(?<![A-Za-z0-9_])(\/[A-Za-z0-9_./-]+)/g;
   let m: RegExpExecArray | null;
   while ((m = absPathRe.exec(command)) !== null) {
+    // URLs like https://github.com/org/repo.git are not filesystem paths.
+    // The regex sees the //github.com segment as an absolute path unless we
+    // explicitly ignore slash-runs immediately following a URI/config colon
+    // (also covers git config keys such as url.https:/.insteadOf).
+    if (m.index > 0 && command[m.index - 1] === ':') continue;
     const p = path.normalize(m[1]);
     if (p.startsWith(wsAbs)) continue;
     if (ALLOWED_ABS_PREFIXES.some((prefix) =>
@@ -298,7 +334,7 @@ export function buildPiTools(workspaceRoot: string, opts: BuildPiToolsOptions = 
       return await new Promise((resolve, reject) => {
         const child = spawn('/bin/bash', ['-c', params.command], {
           cwd: workspaceRoot,
-          env: { ...process.env },
+          env: { ...process.env, ...buildGitAskPassEnv() },
           stdio: ['ignore', 'pipe', 'pipe'],
         });
         let stdout = '';
