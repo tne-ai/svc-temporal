@@ -342,13 +342,14 @@ function parseFrontmatterDictSop(
       const tneEngine = readLeafTneEngineFlag(skillName, skillsRoot);
       const tneEngineMaxIterations = readLeafMaxIterations(skillName, skillsRoot, 3);
 
+      const run = typeof s?.run === 'string' ? s.run : '';
       return {
         number: String(i + 1),
         skill: skillName,
         inputs,
         output: typeof s?.output === 'string' ? s.output : '',
         verify: '',
-        run: '',
+        run,
         notes:
           typeof s?.description === 'string'
             ? s.description
