@@ -508,7 +508,11 @@ async function invokeViaHarness(
           'You are a skill execution agent. Follow the instructions in the prompt and respond directly. Do not use tools.'
         : 'You are a skill execution agent running inside a temporal worker. ' +
           'Use the provided tools (Read/Write/Edit/Bash/Glob/Grep) to accomplish the task in the workspace. ' +
-          'Files written or edited will be synced to S3 after the run completes.',
+          'Files written or edited will be synced to S3 after the run completes. ' +
+          'Workspace hygiene: do not inspect, glob, grep, read, or summarize .claude/ or any .claude/** paths unless the user explicitly asks you to modify agent configuration. ' +
+          'Do not run broad file listings such as Glob .claude/**/*, find .claude, find . -type f, or ls -R over the whole workspace. ' +
+          'Start by inspecting only the files and repositories directly relevant to the task. ' +
+          'If the workspace appears empty except for .claude/, clone or create the target repository named in the user request instead of enumerating .claude/.',
       tools: context?.completion ? [] : piTools,
       maxTokens: 16384,
       provider: byokProvider,

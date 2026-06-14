@@ -67,7 +67,15 @@ RUN if [ -n "$GITHUB_TOKEN" ]; then \
 # and move-to-/usr/local/bin pattern as horizon/backend/Dockerfile so the
 # binary is on PATH for node (UID 0) at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ripgrep \
+      curl gpg ripgrep \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      | dd of=/etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 RUN export USE_BUILTIN_RIPGREP=0 && \
     for i in 1 2 3; do \
