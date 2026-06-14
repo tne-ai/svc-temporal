@@ -87,6 +87,24 @@ RUN export USE_BUILTIN_RIPGREP=0 && \
     mv /root/.local/bin/claude /usr/local/bin/claude && \
     chmod +x /usr/local/bin/claude
 
+# Install the auth0 CLI (pinned, glibc x86_64 tarball — same as orion's image)
+# so jobs/skills running in the worker can create/manage Auth0 apps. The
+# entrypoint below logs in with M2M client credentials when AUTH0_CLI_* env is
+# present (mounted from the auth0-cli-manager secret in the coder pod).
+RUN curl -fsSL https://github.com/auth0/auth0-cli/releases/download/v1.31.0/auth0-cli_1.31.0_Linux_x86_64.tar.gz \
+      | tar xz -C /usr/local/bin auth0 \
+ && auth0 --version
+
+# Entrypoint: best-effort M2M auth0 login (non-fatal), then exec the worker CMD.
+RUN printf '%s\n' \
+  '#!/bin/sh' \
+  'if [ -n "$AUTH0_CLI_CLIENT_ID" ] && [ -n "$AUTH0_CLI_CLIENT_SECRET" ] && [ -n "$AUTH0_CLI_DOMAIN" ]; then' \
+  '  auth0 login --domain "$AUTH0_CLI_DOMAIN" --client-id "$AUTH0_CLI_CLIENT_ID" --client-secret "$AUTH0_CLI_CLIENT_SECRET" >/dev/null 2>&1 || echo "auth0 CLI: M2M login failed (non-fatal)"' \
+  'fi' \
+  'exec "$@"' \
+  > /usr/local/bin/svc-temporal-entrypoint.sh \
+ && chmod +x /usr/local/bin/svc-temporal-entrypoint.sh
+
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev && \
     git config --global --unset-all url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf 2>/dev/null || true
@@ -116,4 +134,6 @@ USER node
 
 ENV NODE_ENV=production
 
+# Entrypoint runs the M2M auth0 login (if creds present) before the worker.
+ENTRYPOINT ["/usr/local/bin/svc-temporal-entrypoint.sh"]
 CMD ["node", "dist/worker.js"]
