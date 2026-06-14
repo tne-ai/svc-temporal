@@ -2,9 +2,10 @@ FROM node:20-slim AS builder
 
 WORKDIR /app
 
-# git is needed to install the @tne-ai/agent-harness GitHub dependency
+# git is needed to install the @tne-ai/agent-harness GitHub dependency;
+# Python/build tools are needed when npm dependencies compile native modules.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates git \
+    ca-certificates git python3 make g++ \
     && rm -rf /var/lib/apt/lists/*
 
 # Configure git auth for private GitHub repos. npm resolves github URLs to
@@ -31,9 +32,26 @@ FROM node:20-slim
 
 WORKDIR /app
 
-# ca-certificates needed for S3/HTTPS; git needed for agent-harness git dep
+# Runtime toolbelt for command-mode FSM steps and implementation jobs.
+# Keep this broad enough for deterministic skills: Python scripts, package
+# installs, Postgres checks, JSON processing, repo operations, and archives.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates git \
+    ca-certificates \
+    git \
+    openssh-client \
+    python3 \
+    python3-pip \
+    python3-venv \
+    make \
+    g++ \
+    postgresql-client \
+    jq \
+    zip \
+    unzip \
+    rsync \
+    wget \
+    less \
+    tree \
     && rm -rf /var/lib/apt/lists/*
 
 ARG GITHUB_TOKEN=""
