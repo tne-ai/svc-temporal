@@ -65,9 +65,20 @@ function copyTnePluginsTree(source: string, destination: string): void {
   });
 }
 
-function cloneTnePlugins(destination: string): boolean {
-  if (process.env.SVC_TEMPORAL_DISABLE_TNE_PLUGINS_CLONE === 'true') return false;
-  const repoUrl = process.env.TNE_PLUGINS_REPO_URL || 'https://github.com/tne-ai/tne-plugins.git';
+function authenticatedRepoUrl(repoUrl: string): string {
+  if (!repoUrl.startsWith('https://github.com/')) return repoUrl;
+  if (repoUrl.includes('@github.com/')) return repoUrl;
+  const token = process.env.TNE_PLUGINS_GITHUB_TOKEN
+    || process.env.GITHUB_TOKEN
+    || process.env.GH_TOKEN
+    || process.env.GITHUB_PAT;
+  if (!token) return repoUrl;
+  return repoUrl.replace('https://github.com/', `https://x-access-token:${encodeURIComponent(token)}@github.com/`);
+}
+
+function cloneTnePlugins(destination: string): { ok: boolean; error?: string } {
+  if (process.env.SVC_TEMPORAL_DISABLE_TNE_PLUGINS_CLONE === 'true') return { ok: false, error: 'clone disabled by SVC_TEMPORAL_DISABLE_TNE_PLUGINS_CLONE' };
+  const repoUrl = authenticatedRepoUrl(process.env.TNE_PLUGINS_REPO_URL || 'https://github.com/tne-ai/tne-plugins.git');
   const ref = process.env.TNE_PLUGINS_REF || 'main';
   const tmp = mkdtempSync(join(tmpdir(), 'tne-plugins-'));
   try {
@@ -76,9 +87,10 @@ function cloneTnePlugins(destination: string): boolean {
       timeout: 120_000,
     });
     copyTnePluginsTree(tmp, destination);
-    return true;
-  } catch {
-    return false;
+    return { ok: true };
+  } catch (err: any) {
+    const stderr = err?.stderr?.toString?.() || err?.message || String(err);
+    return { ok: false, error: stderr.slice(0, 500) };
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -107,7 +119,10 @@ export function ensureCommandWorkingDir(workspacePath: string, workingDir: strin
   // CRM loop: svc-temporal was rolled out with fresh worker code but stale
   // bundled tne-plugins. The worker has git/network; fetch current plugins into
   // the workspace so command-mode steps can proceed immediately.
-  cloneTnePlugins(cwdRoot);
+  const cloned = cloneTnePlugins(cwdRoot);
+  if (!cloned.ok || !hasRequiredPath()) {
+    throw new Error(`Unable to prepare tne-plugins working directory for command${requiredRelativePath ? ` requiring ${requiredRelativePath}` : ''}. Clone fallback ${cloned.ok ? 'completed but required path is still missing' : `failed: ${cloned.error || 'unknown error'}`}`);
+  }
 }
 
 function runShellCommand(command: string, cwd: string, env: NodeJS.ProcessEnv): Promise<{ exitCode: number; stdout: string; stderr: string }> {
