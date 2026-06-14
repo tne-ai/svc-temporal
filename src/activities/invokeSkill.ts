@@ -71,6 +71,7 @@ import { resolveTemplateVars } from '../config/templateResolver.js';
 import { emitEvent, emitJobEvent } from './emitEvent.js';
 import { pushWorkspaceToS3 } from './workspaceSync.js';
 import { fetchUserProviderKey } from '../lib/fetchUserProviderKey.js';
+import { fetchUserGitHubToken } from '../lib/fetchUserGitHubToken.js';
 import { ensureSkillsInWorkspace } from './setupSkills.js';
 import { PiAgentSession, isPiAgentEnabled, isLiteLLMProxyEnabled, getLiteLLMBaseURL, normalizeModelForLitellm } from '../services/piAgentAdapter.js';
 import { buildPiTools } from '../services/piAgentTools.js';
@@ -374,7 +375,7 @@ async function invokeViaHarness(
   model?: string,
   _permissionMode?: string,
   workspacePath?: string,
-  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string; outputSchema?: Record<string, unknown>; toolHarness?: 'pi' | 'claude_sdk'; completion?: boolean },
+  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string; outputSchema?: Record<string, unknown>; toolHarness?: 'pi' | 'claude_sdk'; completion?: boolean; githubToken?: string },
 ): Promise<InvocationResult> {
   const stopSync = startPeriodicS3Sync(workspacePath || '', context?.s3Bucket, context?.s3Prefix, context?.parentRunId, context?.workingDir);
   // Pi session captured in the outer scope so the finally block can
@@ -478,7 +479,10 @@ async function invokeViaHarness(
     if (!isPiAgentEnabled()) {
       console.warn('[invokeViaPi] USE_PI_AGENT is unset — enabling implicitly (harness backend retired)');
     }
-    const piTools = buildPiTools(cwd, { sessionKey: context?.parentRunId || cwd });
+    const githubEnv = context?.githubToken
+      ? { GH_TOKEN: context.githubToken, GITHUB_TOKEN: context.githubToken, GITHUB_PERSONAL_ACCESS_TOKEN: context.githubToken }
+      : {};
+    const piTools = buildPiTools(cwd, { sessionKey: context?.parentRunId || cwd, env: githubEnv });
     // `resolvedModel` was already normalized for the LiteLLM branch
     // above (line ~383) if proxy mode is on. For direct upstreams
     // (OpenRouter / Anthropic) we need to pass the model id the
@@ -850,7 +854,7 @@ async function invokeViaClaudeAgentSDK(
   prompt: string,
   model?: string,
   workspacePath?: string,
-  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string; outputSchema?: Record<string, unknown>; toolHarness?: 'pi' | 'claude_sdk'; completion?: boolean },
+  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; stepNumber?: string; skill?: string; workingDir?: string; outputSchema?: Record<string, unknown>; toolHarness?: 'pi' | 'claude_sdk'; completion?: boolean; githubToken?: string },
 ): Promise<InvocationResult> {
   const resolvedModel = resolveModelId(model);
   const workspaceRoot = workspacePath || process.cwd();
@@ -937,6 +941,11 @@ async function invokeViaClaudeAgentSDK(
         //   upstream credentials. The chat-mode path (litellmProvider.ts)
         //   does forward BYOK via body.api_key.
         const out: Record<string, string> = { ...(process.env as Record<string, string>) };
+        if (context?.githubToken) {
+          out.GH_TOKEN = context.githubToken;
+          out.GITHUB_TOKEN = context.githubToken;
+          out.GITHUB_PERSONAL_ACCESS_TOKEN = context.githubToken;
+        }
         const proxyUrl = (process.env.LITELLM_PROXY_URL || '').replace(/\/+$/, '');
         const masterKey = process.env.LITELLM_MASTER_KEY || '';
 
@@ -1198,7 +1207,7 @@ export async function invokeSkill(
   prompt: string,
   workspacePath?: string,
   agentBackend?: AgentBackend,
-  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; workingDir?: string; toolHarness?: 'pi' | 'claude_sdk'; completion?: boolean },
+  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; workingDir?: string; toolHarness?: 'pi' | 'claude_sdk'; completion?: boolean; githubToken?: string },
 ): Promise<InvocationResult> {
   // toolHarness overrides the legacy `agentBackend` param when set.
   // Orion resolves the user's `User.toolHarness` (auto/pi/claude_sdk) +
@@ -1255,7 +1264,15 @@ export async function invokeSkill(
       `model output may drift. Re-route to a claude-* model to enable enforcement.`,
     );
   }
-  const innerContext: any = { ...(context || {}), stepNumber: step.number, skill: step.skill };
+  let githubToken = context?.githubToken;
+  if (!githubToken && context?.userId) {
+    githubToken = await fetchUserGitHubToken(context.userId) || undefined;
+    if (githubToken) {
+      console.log('[invokeSkill] fetched user GitHub token for worker agent env', { userId: context.userId });
+    }
+  }
+
+  const innerContext: any = { ...(context || {}), stepNumber: step.number, skill: step.skill, githubToken };
   if (leafSchema && backend === 'claude-agent-sdk') innerContext.outputSchema = leafSchema.schema;
 
   switch (backend) {

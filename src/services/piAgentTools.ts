@@ -31,16 +31,16 @@ import type { AgentTool } from '@mariozechner/pi-agent-core';
  * message rather than failing the run, since most temporal activities
  * don't actually invoke WebSearch.
  */
-export function getGitHubToken(): string | undefined {
-  return process.env.GH_TOKEN
-    || process.env.GITHUB_TOKEN
-    || process.env.GITHUB_PAT
-    || process.env.GITHUB_PERSONAL_ACCESS_TOKEN
-    || process.env.TNE_PLUGINS_GITHUB_TOKEN;
+export function getGitHubToken(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return env.GH_TOKEN
+    || env.GITHUB_TOKEN
+    || env.GITHUB_PAT
+    || env.GITHUB_PERSONAL_ACCESS_TOKEN
+    || env.TNE_PLUGINS_GITHUB_TOKEN;
 }
 
-export function buildGitAskPassEnv(): Record<string, string> {
-  const token = getGitHubToken();
+export function buildGitAskPassEnv(baseEnv: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const token = getGitHubToken(baseEnv);
   if (!token) return {};
   const dir = mkdtempSync(path.join(tmpdir(), 'git-askpass-'));
   const script = path.join(dir, 'askpass.sh');
@@ -247,6 +247,8 @@ const TodoWriteParams = Type.Object({
 export interface BuildPiToolsOptions {
   /** Stable identifier for the session — TodoWrite stores its list keyed by this. */
   sessionKey?: string;
+  /** Per-job env overrides, e.g. user-scoped GH_TOKEN/GITHUB_TOKEN. */
+  env?: NodeJS.ProcessEnv;
 }
 
 export function buildPiTools(workspaceRoot: string, opts: BuildPiToolsOptions = {}): AgentTool<any>[] {
@@ -336,7 +338,7 @@ export function buildPiTools(workspaceRoot: string, opts: BuildPiToolsOptions = 
       return await new Promise((resolve, reject) => {
         const child = spawn('/bin/bash', ['-c', params.command], {
           cwd: workspaceRoot,
-          env: { ...process.env, ...buildGitAskPassEnv() },
+          env: { ...process.env, ...(opts.env || {}), ...buildGitAskPassEnv({ ...process.env, ...(opts.env || {}) }) },
           stdio: ['ignore', 'pipe', 'pipe'],
         });
         let stdout = '';

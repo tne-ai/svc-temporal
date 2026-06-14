@@ -56,6 +56,12 @@ describe('piAgentTools GitHub token env', () => {
     await expect(fs.access(env.GIT_ASKPASS!)).resolves.toBeUndefined();
   });
 
+  it('can build askpass from a per-job user GitHub token env override', () => {
+    const env = buildGitAskPassEnv({ GITHUB_TOKEN: 'user-synced-token' } as any);
+    expect(env.GITHUB_TOKEN).toBe('user-synced-token');
+    expect(env.GH_TOKEN).toBe('user-synced-token');
+  });
+
   it('does not configure askpass when no token exists', () => {
     vi.stubEnv('GH_TOKEN', '');
     vi.stubEnv('GITHUB_TOKEN', '');
