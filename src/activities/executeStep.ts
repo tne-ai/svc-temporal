@@ -7,6 +7,7 @@
  */
 
 import { heartbeat } from '@temporalio/activity';
+import { spawn } from 'child_process';
 import { existsSync, mkdirSync, statSync, writeFileSync } from 'fs';
 import { dirname, isAbsolute, join } from 'path';
 import type { StepExecutionParams, StepResult } from '../shared/types.js';
@@ -19,6 +20,30 @@ import { withWallClockHeartbeat } from './heartbeatTicker.js';
 
 /** Regex matching inline/manual step names: "(gather inputs)" or "APPROVAL_GATE" */
 const INLINE_STEP_RE = /^\(.*\)$|^[A-Z][A-Z0-9_]+$/;
+
+function isCommandStep(step: StepExecutionParams['step']): boolean {
+  return (step.run || '').trim().toLowerCase() === 'command';
+}
+
+function commandFromStep(step: StepExecutionParams['step']): string {
+  return step.notes || step.skill || '';
+}
+
+function runShellCommand(command: string, cwd: string, env: NodeJS.ProcessEnv): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn('/bin/sh', ['-lc', command], {
+      cwd,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.on('close', (code) => resolve({ exitCode: code ?? 1, stdout, stderr }));
+    child.on('error', (err) => resolve({ exitCode: 1, stdout, stderr: stderr + String(err) }));
+  });
+}
 
 /**
  * Snapshot mtimes of a step's output + declared inputs at "step complete"
@@ -80,9 +105,55 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
   heartbeat({ step: step.number, skill: step.skill, status: 'starting' });
   emitEvent(parentRunId, 'step_start', { stepNumber: step.number, skill: step.skill, iteration, phase, parallel, waveIdx });
 
+  const cwdRoot = workingDir ? join(workspacePath, workingDir) : workspacePath;
+
+  // Deterministic command-mode steps execute the declared shell command directly
+  // instead of routing through an LLM agent. Dict-form SOPs use `run: command`
+  // with `skill: inline` and put the command in the step description. Treating
+  // those as manual inline steps made the workflow complete without ever running
+  // the command or writing the declared output artifact.
+  if (isCommandStep(step)) {
+    const command = commandFromStep(step).trim();
+    const outputPath = step.output
+      ? resolveTemplateVars(step.output, templateVars).replace('{{ITER}}', String(iteration || 1))
+      : '';
+    const outputPathAbs = outputPath
+      ? (isAbsolute(outputPath) ? outputPath : join(cwdRoot, outputPath))
+      : '';
+    if (!command) {
+      const error = 'Command-mode step has no command text.';
+      emitEvent(parentRunId, 'step_failed', { stepNumber: step.number, skill: step.skill, iteration, outputPath, error });
+      return { success: false, outputPath: outputPath || undefined, error };
+    }
+    emitEvent(parentRunId, 'heartbeat', { stepNumber: step.number, skill: step.skill, status: 'command_running', iteration, command: command.slice(0, 300) });
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const [key, value] of Object.entries(templateVars || {})) {
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) env[key] = String(value);
+    }
+    const commandResult = await runShellCommand(command, cwdRoot, env);
+    if (commandResult.exitCode !== 0) {
+      const error = (commandResult.stderr || commandResult.stdout || `Command exited ${commandResult.exitCode}`).slice(0, 2000);
+      emitEvent(parentRunId, 'step_failed', { stepNumber: step.number, skill: step.skill, iteration, outputPath, error, exitCode: commandResult.exitCode });
+      return { success: false, outputPath: outputPath || undefined, error };
+    }
+    if (outputPathAbs && !existsSync(outputPathAbs)) {
+      const error = `Command-mode step declared output '${outputPath}' but no file was written at '${outputPathAbs}'`;
+      emitEvent(parentRunId, 'step_failed', { stepNumber: step.number, skill: step.skill, iteration, outputPath, error, stdout: commandResult.stdout.slice(0, 1000) });
+      return { success: false, outputPath: outputPath || undefined, error };
+    }
+    const mt = snapshotMtimes(step.inputs, cwdRoot, outputPathAbs || undefined);
+    emitEvent(parentRunId, 'step_complete', { stepNumber: step.number, skill: step.skill, iteration, outputPath: outputPath || undefined, command: true });
+    return {
+      success: true,
+      outputPath: outputPath || undefined,
+      outputMtime: mt.outputMtime,
+      inputMtimes: mt.inputMtimes,
+    };
+  }
+
   // Handle inline/manual steps
   if (INLINE_STEP_RE.test(step.skill)) {
-    const result = handleInlineStep(step, iteration, templateVars);
+    const result = handleInlineStep(step, iteration, templateVars, cwdRoot);
     emitEvent(parentRunId, result.success ? 'step_complete' : 'step_failed', {
       stepNumber: step.number, skill: step.skill, iteration, inline: true,
       outputPath: result.outputPath, error: result.error,
@@ -97,7 +168,6 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
   // concurrent activities on the same worker.
   let resolvedManifest = manifestContent || '';
   if (!resolvedManifest && state && config && currentStepKey) {
-    const cwdRoot = workingDir ? join(workspacePath, workingDir) : workspacePath;
     try {
       resolvedManifest = buildManifestContent(state, config, currentStepKey, '', '', cwdRoot);
     } catch {
@@ -147,7 +217,6 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
     // and silently fell through to "side-effect-only success". Resolve to
     // an absolute path here so existsSync and the gate cascade both look
     // in the right place.
-    const cwdRoot = workingDir ? join(workspacePath, workingDir) : workspacePath;
     const outputPath = step.output
       ? resolveTemplateVars(step.output, templateVars).replace('{{ITER}}', String(iteration || 1))
       : '';
@@ -306,15 +375,19 @@ function handleInlineStep(
   step: StepExecutionParams['step'],
   iteration: number,
   templateVars: Record<string, string>,
+  cwdRoot: string,
 ): StepResult {
   const outputPath = step.output
     ? resolveTemplateVars(step.output, templateVars).replace('{{ITER}}', String(iteration || 1))
     : '';
+  const outputPathAbs = outputPath
+    ? (isAbsolute(outputPath) ? outputPath : join(cwdRoot, outputPath))
+    : '';
 
-  if (outputPath && existsSync(outputPath)) {
+  if (outputPathAbs && existsSync(outputPathAbs)) {
     let outputMtime: number | undefined;
     try {
-      outputMtime = statSync(outputPath).mtimeMs;
+      outputMtime = statSync(outputPathAbs).mtimeMs;
     } catch {
       // ignore
     }
