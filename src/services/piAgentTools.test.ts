@@ -35,12 +35,22 @@ describe('piAgentTools GitHub token env', () => {
     expect(getGitHubToken()).toBe('gh-test-token');
   });
 
-  it('builds non-interactive GIT_ASKPASS env when a token exists', async () => {
+  it('falls back to the deployed GitHub PAT secret key', () => {
     vi.stubEnv('GH_TOKEN', '');
-    vi.stubEnv('GITHUB_TOKEN', 'github-test-token');
+    vi.stubEnv('GITHUB_TOKEN', '');
+    vi.stubEnv('GITHUB_PAT', '');
+    vi.stubEnv('GITHUB_PERSONAL_ACCESS_TOKEN', 'github-personal-access-token');
+    expect(getGitHubToken()).toBe('github-personal-access-token');
+  });
+
+  it('builds non-interactive GIT_ASKPASS and gh CLI env when a token exists', async () => {
+    vi.stubEnv('GH_TOKEN', '');
+    vi.stubEnv('GITHUB_TOKEN', '');
+    vi.stubEnv('GITHUB_PERSONAL_ACCESS_TOKEN', 'github-pat-test-token');
     const env = buildGitAskPassEnv();
-    expect(env.GITHUB_TOKEN).toBe('github-test-token');
-    expect(env.GH_TOKEN).toBe('github-test-token');
+    expect(env.GITHUB_TOKEN).toBe('github-pat-test-token');
+    expect(env.GH_TOKEN).toBe('github-pat-test-token');
+    expect(env.GITHUB_PERSONAL_ACCESS_TOKEN).toBe('github-pat-test-token');
     expect(env.GIT_TERMINAL_PROMPT).toBe('0');
     expect(env.GIT_ASKPASS).toBeTruthy();
     await expect(fs.access(env.GIT_ASKPASS!)).resolves.toBeUndefined();
@@ -50,6 +60,7 @@ describe('piAgentTools GitHub token env', () => {
     vi.stubEnv('GH_TOKEN', '');
     vi.stubEnv('GITHUB_TOKEN', '');
     vi.stubEnv('GITHUB_PAT', '');
+    vi.stubEnv('GITHUB_PERSONAL_ACCESS_TOKEN', '');
     vi.stubEnv('TNE_PLUGINS_GITHUB_TOKEN', '');
     expect(buildGitAskPassEnv()).toEqual({});
   });

@@ -512,7 +512,10 @@ async function invokeViaHarness(
           'Workspace hygiene: do not inspect, glob, grep, read, or summarize .claude/ or any .claude/** paths unless the user explicitly asks you to modify agent configuration. ' +
           'Do not run broad file listings such as Glob .claude/**/*, find .claude, find . -type f, or ls -R over the whole workspace. ' +
           'Start by inspecting only the files and repositories directly relevant to the task. ' +
-          'If the workspace appears empty except for .claude/, clone or create the target repository named in the user request instead of enumerating .claude/.',
+          'If the workspace appears empty except for .claude/, clone or create the target repository named in the user request instead of enumerating .claude/. ' +
+          'GitHub access: prefer the GitHub CLI for GitHub repo work. First run `gh auth status`; if it is authenticated, use `gh repo clone owner/repo repo`, `gh pr create`, and related `gh` commands. ' +
+          'If gh is not authenticated but GH_TOKEN or GITHUB_TOKEN is present, `gh` will use it automatically and HTTPS git clone also works through the configured non-interactive GIT_ASKPASS. ' +
+          'If neither gh auth nor token env is available, stop and report that the worker is missing GitHub credentials; do not keep trying SSH or unrelated URL rewrites.',
       tools: context?.completion ? [] : piTools,
       maxTokens: 16384,
       provider: byokProvider,
