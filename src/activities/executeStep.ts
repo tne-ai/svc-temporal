@@ -120,12 +120,15 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
     const outputPathAbs = outputPath
       ? (isAbsolute(outputPath) ? outputPath : join(cwdRoot, outputPath))
       : '';
+    const stateOutputPath = outputPath && !isAbsolute(outputPath) && workingDir
+      ? join(workingDir, outputPath)
+      : outputPath;
     if (!command) {
       const error = 'Command-mode step has no command text.';
-      emitEvent(parentRunId, 'step_failed', { stepNumber: step.number, skill: step.skill, iteration, outputPath, error });
-      return { success: false, outputPath: outputPath || undefined, error };
+      emitEvent(parentRunId, 'step_failed', { stepNumber: step.number, skill: step.skill, iteration, outputPath: stateOutputPath || outputPath, error });
+      return { success: false, outputPath: stateOutputPath || outputPath || undefined, error };
     }
-    emitEvent(parentRunId, 'heartbeat', { stepNumber: step.number, skill: step.skill, status: 'command_running', iteration, command: command.slice(0, 300) });
+    emitEvent(parentRunId, 'heartbeat', { stepNumber: step.number, skill: step.skill, status: 'command_running', iteration, command: command.slice(0, 300), outputPath: stateOutputPath || outputPath || undefined });
     const env: NodeJS.ProcessEnv = { ...process.env };
     for (const [key, value] of Object.entries(templateVars || {})) {
       if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) env[key] = String(value);
@@ -133,19 +136,19 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
     const commandResult = await runShellCommand(command, cwdRoot, env);
     if (commandResult.exitCode !== 0) {
       const error = (commandResult.stderr || commandResult.stdout || `Command exited ${commandResult.exitCode}`).slice(0, 2000);
-      emitEvent(parentRunId, 'step_failed', { stepNumber: step.number, skill: step.skill, iteration, outputPath, error, exitCode: commandResult.exitCode });
-      return { success: false, outputPath: outputPath || undefined, error };
+      emitEvent(parentRunId, 'step_failed', { stepNumber: step.number, skill: step.skill, iteration, outputPath: stateOutputPath || outputPath || undefined, error, exitCode: commandResult.exitCode });
+      return { success: false, outputPath: stateOutputPath || outputPath || undefined, error };
     }
     if (outputPathAbs && !existsSync(outputPathAbs)) {
       const error = `Command-mode step declared output '${outputPath}' but no file was written at '${outputPathAbs}'`;
-      emitEvent(parentRunId, 'step_failed', { stepNumber: step.number, skill: step.skill, iteration, outputPath, error, stdout: commandResult.stdout.slice(0, 1000) });
-      return { success: false, outputPath: outputPath || undefined, error };
+      emitEvent(parentRunId, 'step_failed', { stepNumber: step.number, skill: step.skill, iteration, outputPath: stateOutputPath || outputPath || undefined, error, stdout: commandResult.stdout.slice(0, 1000) });
+      return { success: false, outputPath: stateOutputPath || outputPath || undefined, error };
     }
     const mt = snapshotMtimes(step.inputs, cwdRoot, outputPathAbs || undefined);
-    emitEvent(parentRunId, 'step_complete', { stepNumber: step.number, skill: step.skill, iteration, outputPath: outputPath || undefined, command: true });
+    emitEvent(parentRunId, 'step_complete', { stepNumber: step.number, skill: step.skill, iteration, outputPath: stateOutputPath || outputPath || undefined, command: true });
     return {
       success: true,
-      outputPath: outputPath || undefined,
+      outputPath: stateOutputPath || outputPath || undefined,
       outputMtime: mt.outputMtime,
       inputMtimes: mt.inputMtimes,
     };
