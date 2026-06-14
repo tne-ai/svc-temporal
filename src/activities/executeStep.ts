@@ -8,8 +8,8 @@
 
 import { heartbeat } from '@temporalio/activity';
 import { spawn } from 'child_process';
-import { existsSync, mkdirSync, statSync, writeFileSync } from 'fs';
-import { dirname, isAbsolute, join } from 'path';
+import { cpSync, existsSync, mkdirSync, statSync, writeFileSync } from 'fs';
+import { basename, dirname, isAbsolute, join } from 'path';
 import type { StepExecutionParams, StepResult } from '../shared/types.js';
 import { invokeSkill, buildPrompt } from './invokeSkill.js';
 import { runGateCascade } from './runGateCascade.js';
@@ -27,6 +27,47 @@ function isCommandStep(step: StepExecutionParams['step']): boolean {
 
 function commandFromStep(step: StepExecutionParams['step']): string {
   return step.notes || step.skill || '';
+}
+
+
+function findBundledTnePluginsRoot(): string | null {
+  const candidates = [
+    process.env.TNE_PLUGINS_PATH,
+    join(process.cwd(), 'tne-plugins'),
+    join(process.cwd(), '..', 'tne-plugins'),
+    '/app/tne-plugins',
+  ].filter(Boolean) as string[];
+  for (const candidate of candidates) {
+    if (existsSync(join(candidate, 'plugins', 'tne', 'skills'))) return candidate;
+  }
+  return null;
+}
+
+function ensureCommandWorkingDir(workspacePath: string, workingDir: string | undefined, cwdRoot: string): void {
+  if (!workingDir) return;
+  // Command-mode deterministic skills often execute repository-relative scripts
+  // such as `python3 plugins/tne/skills/...`. Central Temporal workers receive
+  // an S3 workspace that may contain only the scoped working directory outputs,
+  // not a full tne-plugins checkout. In that case, seed the requested workingDir
+  // from the worker image's bundled tne-plugins so the command can run while its
+  // generated artifacts still land under workspacePath and can be synced/read.
+  if (basename(workingDir) !== 'tne-plugins') return;
+  if (existsSync(join(cwdRoot, 'plugins', 'tne', 'skills'))) return;
+
+  const bundled = findBundledTnePluginsRoot();
+  if (!bundled) return;
+  mkdirSync(dirname(cwdRoot), { recursive: true });
+  cpSync(bundled, cwdRoot, {
+    recursive: true,
+    force: true,
+    dereference: true,
+    filter: (src) => {
+      const rel = src.slice(bundled.length).replace(/^[/\\]+/, '');
+      if (!rel) return true;
+      const parts = rel.split(/[/\\]+/);
+      return !parts.some((part) => part === '.git' || part === 'node_modules' || part === '.venv' || part === '__pycache__');
+    },
+  });
 }
 
 function runShellCommand(command: string, cwd: string, env: NodeJS.ProcessEnv): Promise<{ exitCode: number; stdout: string; stderr: string }> {
@@ -106,6 +147,14 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
   emitEvent(parentRunId, 'step_start', { stepNumber: step.number, skill: step.skill, iteration, phase, parallel, waveIdx });
 
   const cwdRoot = workingDir ? join(workspacePath, workingDir) : workspacePath;
+
+  if (isCommandStep(step)) {
+    try { ensureCommandWorkingDir(workspacePath, workingDir, cwdRoot); } catch (err: any) {
+      const error = `Failed to prepare command working directory '${cwdRoot}': ${err?.message || String(err)}`;
+      emitEvent(parentRunId, 'step_failed', { stepNumber: step.number, skill: step.skill, iteration, error });
+      return { success: false, error };
+    }
+  }
 
   // Deterministic command-mode steps execute the declared shell command directly
   // instead of routing through an LLM agent. Dict-form SOPs use `run: command`
