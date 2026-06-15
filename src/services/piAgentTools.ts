@@ -516,5 +516,55 @@ export function buildPiTools(workspaceRoot: string, opts: BuildPiToolsOptions = 
     },
   };
 
-  return [Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch, TodoWrite];
+  // graph_traverse — available to ERP fleet skills (afl-*, rga-*, etc.)
+  // Calls the in-process Kuzu graph server. Returns [] gracefully when the
+  // graph server is not running (DISABLE_GRAPH_SERVER=1) or has no data yet.
+  // Non-ERP skills can call this tool safely — it just returns an empty result.
+  const GraphTraverseParams = Type.Object({
+    fleet:           Type.String({ description: 'Fleet slug, e.g. "appfolio" or "regen-ag"' }),
+    org_id:          Type.String({ description: 'Organisation ID' }),
+    traversal_slug:  Type.String({ description: 'Named traversal from graph.yaml, e.g. "tenant_compliance_context"' }),
+    params:          Type.Record(Type.String(), Type.String(), { description: 'Parameter bindings for the Cypher query' }),
+  });
+
+  const GraphTraverse: AgentTool<typeof GraphTraverseParams> = {
+    name: 'graph_traverse',
+    label: 'Graph traversal',
+    description:
+      'Run a named knowledge graph traversal for an ERP fleet entity. ' +
+      'Returns cross-entity context (e.g. tenant → unit → property → certs → subsidy) ' +
+      'without writing SQL joins. Use before validating or reasoning about compliance state.',
+    parameters: GraphTraverseParams,
+    execute: async (_toolCallId, p: Static<typeof GraphTraverseParams>) => {
+      const port = parseInt(process.env.GRAPH_SERVER_PORT ?? '8001', 10);
+      const secret = process.env.GRAPH_SERVER_SECRET ?? '';
+      try {
+        const body = JSON.stringify({
+          fleet: p.fleet, org_id: p.org_id,
+          traversal_slug: p.traversal_slug, params: p.params,
+        });
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (secret) {
+          const { createHmac } = await import('crypto');
+          headers['x-graph-signature'] = createHmac('sha256', secret).update(body).digest('hex');
+        }
+        const res = await fetch(`http://127.0.0.1:${port}/graph/traverse`, {
+          method: 'POST', headers, body,
+        });
+        if (!res.ok) {
+          const err = await res.text();
+          return { content: [{ type: 'text', text: `graph_traverse error: ${err}` }] };
+        }
+        const data = await res.json() as { rows: unknown[] };
+        const text = JSON.stringify(data.rows, null, 2);
+        return { content: [{ type: 'text', text }], details: { count: data.rows.length } };
+      } catch (err) {
+        // Graph service unavailable — return empty rather than failing the skill.
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: 'text', text: `graph_traverse unavailable: ${msg}` }] };
+      }
+    },
+  };
+
+  return [Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch, TodoWrite, GraphTraverse];
 }
