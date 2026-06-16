@@ -23,8 +23,10 @@
     "@temporalio/client": "^1.16.0",
     "@temporalio/worker": "^1.16.0",
     "@temporalio/workflow": "^1.16.0",
+    "@types/js-yaml": "^4.0.9",
     "dotenv": "^17.4.2",
     "glob": "^10.5.0",
+    "js-yaml": "^4.2.0",
     "typebox": "^1.1.38",
     "yaml": "^2.8.3"
   },

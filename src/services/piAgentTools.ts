@@ -553,15 +553,14 @@ export function buildPiTools(workspaceRoot: string, opts: BuildPiToolsOptions = 
         });
         if (!res.ok) {
           const err = await res.text();
-          return { content: [{ type: 'text', text: `graph_traverse error: ${err}` }] };
+          return { content: [{ type: 'text', text: `graph_traverse error: ${err}` }], details: { count: 0 } };
         }
         const data = await res.json() as { rows: unknown[] };
         const text = JSON.stringify(data.rows, null, 2);
         return { content: [{ type: 'text', text }], details: { count: data.rows.length } };
       } catch (err) {
-        // Graph service unavailable — return empty rather than failing the skill.
         const msg = err instanceof Error ? err.message : String(err);
-        return { content: [{ type: 'text', text: `graph_traverse unavailable: ${msg}` }] };
+        return { content: [{ type: 'text', text: `graph_traverse unavailable: ${msg}` }], details: { count: 0 } };
       }
     },
   };

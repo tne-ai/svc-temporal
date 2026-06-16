@@ -38,15 +38,21 @@ export async function graphUpsertNode(
   }
 
   // Build MERGE ... ON MATCH SET ... ON CREATE SET ...
-  const allProps = { id: nodeId, ...props };
-  const setClauses = Object.keys(allProps)
-    .map((k) => `n.${k} = $${k}`)
-    .join(', ');
+  // Exclude 'id' from SET clauses — it's the primary key and cannot be set
+  const nonIdProps = Object.fromEntries(Object.entries(props).filter(([k]) => k !== 'id'));
+  const execParams: Record<string, string> = { id: nodeId, ...nonIdProps };
 
-  // LadybugDB: use prepare() + execute() for parameterized writes
-  const cypher = `MERGE (n:${nodeType} {id: $id}) ON MATCH SET ${setClauses} ON CREATE SET ${setClauses}`;
-  const ps = await conn.prepare(cypher);
-  await conn.execute(ps, allProps);
+  if (Object.keys(nonIdProps).length > 0) {
+    const setClauses = Object.keys(nonIdProps).map((k) => `n.${k} = $${k}`).join(', ');
+    const cypher = `MERGE (n:${nodeType} {id: $id}) ON MATCH SET ${setClauses} ON CREATE SET ${setClauses}`;
+    const ps = await conn.prepare(cypher);
+    await conn.execute(ps, execParams);
+  } else {
+    // No extra props — just ensure the node exists
+    const cypher = `MERGE (n:${nodeType} {id: $id})`;
+    const ps = await conn.prepare(cypher);
+    await conn.execute(ps, { id: nodeId });
+  }
 }
 
 /**

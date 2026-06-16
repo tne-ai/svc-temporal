@@ -50,10 +50,13 @@ export async function graphTraverse(
 
   // getAll() returns an array of objects keyed by RETURN alias.
   // e.g. RETURN t, u, p → [{t: {...node...}, u: {...}, p: {...}}, ...]
-  const rawRows = await result.getAll();
+  // result may be a single QueryResult or an array — normalize to single
+  const qr = Array.isArray(result) ? result[0] : result;
+  if (!qr) return [];
+  const rawRows = await qr.getAll() as Record<string, unknown>[];
   if (!rawRows || rawRows.length === 0) return [];
 
-  // Serialize each row — strips Kuzu/Ladybug internal fields (_label, _id).
+  // Serialize each row — strips LadybugDB internal fields (_label, _id).
   return rawRows.map((row) =>
     Object.fromEntries(
       Object.entries(row).map(([k, v]) => [k, serializeValue(v)])
