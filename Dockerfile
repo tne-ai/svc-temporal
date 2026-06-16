@@ -53,6 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     less \
     tree \
+    chromium \
     && rm -rf /var/lib/apt/lists/*
 
 ARG GITHUB_TOKEN=""
@@ -106,7 +107,9 @@ RUN printf '%s\n' \
  && chmod +x /usr/local/bin/svc-temporal-entrypoint.sh
 
 COPY package.json package-lock.json* ./
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN npm ci --omit=dev && \
+    npx playwright install chromium && \
     git config --global --unset-all url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf 2>/dev/null || true
 
 COPY --from=builder /app/dist ./dist
@@ -129,7 +132,7 @@ COPY tne-plugins/plugins ./tne-plugins/plugins
 #   "--dangerously-skip-permissions cannot be used with root/sudo privileges
 #    for security reasons"
 # Ensure /app and the node user's HOME are writable for runtime state.
-RUN chown -R node:node /app && mkdir -p /home/node/.claude && chown -R node:node /home/node
+RUN chown -R node:node /app /ms-playwright && mkdir -p /home/node/.claude && chown -R node:node /home/node
 USER node
 
 ENV NODE_ENV=production
