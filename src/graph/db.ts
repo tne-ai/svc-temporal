@@ -17,7 +17,10 @@
  * Connections are not shared across concurrent calls.
  */
 
-import kuzu from 'kuzu';
+// LadybugDB is the community successor to KùzuDB (archived Oct 2025 after
+// Kùzu Inc was acquired by Apple). LadybugDB is API-compatible and MIT-licensed.
+// npm: @ladybugdb/core  — https://github.com/LadybugDB/ladybug-nodejs
+import kuzu from '@ladybugdb/core';
 import path from 'path';
 import fs from 'fs';
 import { ensureSchema } from './bootstrap.js';
@@ -50,9 +53,12 @@ export async function getConnection(fleet: string, orgId: string): Promise<typeo
   if (!_databases.has(key)) {
     const p = dbPath(fleet, orgId);
     const db = new kuzu.Database(p);
+    // ensureSchema is sync DDL — await to catch bootstrap errors before first query
     await ensureSchema(fleet, db);
     _databases.set(key, db);
   }
 
+  // LadybugDB (like Kuzu) allows multiple Connections per Database.
+  // Create a fresh one per call — connections are lightweight.
   return new kuzu.Connection(_databases.get(key)!);
 }

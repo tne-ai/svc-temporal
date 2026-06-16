@@ -16,6 +16,7 @@
     "@anthropic-ai/claude-agent-sdk": "^0.2.108",
     "@anthropic-ai/sdk": "^0.39.0",
     "@aws-sdk/client-s3": "^3.500.0",
+    "@ladybugdb/core": "^0.17.1",
     "@mariozechner/pi-agent-core": "^0.73.0",
     "@mariozechner/pi-ai": "^0.73.0",
     "@temporalio/activity": "^1.16.0",
@@ -24,7 +25,6 @@
     "@temporalio/workflow": "^1.16.0",
     "dotenv": "^17.4.2",
     "glob": "^10.5.0",
-    "kuzu": "^0.11.3",
     "typebox": "^1.1.38",
     "yaml": "^2.8.3"
   },

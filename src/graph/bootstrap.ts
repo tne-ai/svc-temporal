@@ -11,7 +11,7 @@
  * function is safe to call on an already-bootstrapped database.
  */
 
-import kuzu from 'kuzu';
+import kuzu from '@ladybugdb/core';
 import { loadGraphYaml } from './loader.js';
 
 /**

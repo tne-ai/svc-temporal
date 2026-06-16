@@ -9,7 +9,7 @@
  * and safe to call on retry.
  */
 
-import { getConnection } from './db.js';
+import { getConnection } from './db.js'; // uses @ladybugdb/core under the hood
 import { loadGraphYaml } from './loader.js';
 
 /**
@@ -43,8 +43,10 @@ export async function graphUpsertNode(
     .map((k) => `n.${k} = $${k}`)
     .join(', ');
 
+  // LadybugDB: use prepare() + execute() for parameterized writes
   const cypher = `MERGE (n:${nodeType} {id: $id}) ON MATCH SET ${setClauses} ON CREATE SET ${setClauses}`;
-  await conn.query(cypher, allProps);
+  const ps = await conn.prepare(cypher);
+  await conn.execute(ps, allProps);
 }
 
 /**
@@ -81,5 +83,6 @@ export async function graphWriteEdge(
     `MATCH (a:${fromType} {id: $fromId}), (b:${toType} {id: $toId}) ` +
     `MERGE (a)-[r:${edgeLabel}]->(b)${setClause}`;
 
-  await conn.query(cypher, { fromId, toId, ...props });
+  const ps = await conn.prepare(cypher);
+  await conn.execute(ps, { fromId, toId, ...props });
 }

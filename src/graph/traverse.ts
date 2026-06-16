@@ -12,7 +12,7 @@
  * list, so callers get consistent key names regardless of the underlying query.
  */
 
-import { getConnection } from './db.js';
+import { getConnection } from './db.js'; // uses @ladybugdb/core under the hood
 import { loadGraphYaml } from './loader.js';
 
 /**
@@ -37,23 +37,28 @@ export async function graphTraverse(
   }
 
   const conn = await getConnection(fleet, orgId);
-  const result = await conn.query(traversal.pattern, params);
 
-  if (!result || result.length === 0) return [];
-
-  const returnNames = traversal.returns.map((r) => r.name);
-  const rows: Record<string, unknown>[] = [];
-
-  // Kuzu returns results as an array of arrays; map each row to named keys.
-  for (const row of result) {
-    const obj: Record<string, unknown> = {};
-    returnNames.forEach((name, i) => {
-      obj[name] = serializeValue(row[i]);
-    });
-    rows.push(obj);
+  // LadybugDB uses prepare() + execute() for parameterized queries.
+  // conn.query(stmt) is unparameterized only; passing params there throws.
+  let result;
+  if (Object.keys(params).length > 0) {
+    const ps = await conn.prepare(traversal.pattern);
+    result = await conn.execute(ps, params);
+  } else {
+    result = await conn.query(traversal.pattern);
   }
 
-  return rows;
+  // getAll() returns an array of objects keyed by RETURN alias.
+  // e.g. RETURN t, u, p → [{t: {...node...}, u: {...}, p: {...}}, ...]
+  const rawRows = await result.getAll();
+  if (!rawRows || rawRows.length === 0) return [];
+
+  // Serialize each row — strips Kuzu/Ladybug internal fields (_label, _id).
+  return rawRows.map((row) =>
+    Object.fromEntries(
+      Object.entries(row).map(([k, v]) => [k, serializeValue(v)])
+    )
+  );
 }
 
 /**
