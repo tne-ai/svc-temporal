@@ -22,7 +22,6 @@ import { Worker, NativeConnection } from '@temporalio/worker';
 import { TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE, FSM_TASK_QUEUE, JOBS_TASK_QUEUE } from './shared/constants.js';
 
 import * as activities from './activities/index.js';
-import { startGraphServer } from './graph/server.js';
 
 async function run() {
   console.log(`Connecting to Temporal at ${TEMPORAL_ADDRESS} (namespace: ${TEMPORAL_NAMESPACE})`);
@@ -54,17 +53,6 @@ async function run() {
   });
 
   console.log(`Workers started on queues: ${FSM_TASK_QUEUE}, ${JOBS_TASK_QUEUE}`);
-
-  // Start the graph HTTP server alongside the Temporal workers.
-  // Orion's fsmInvoke registers graph_traverse as an LLM tool that calls
-  // this server at GRAPH_SERVER_PORT (default 8001). Kuzu runs in-process
-  // here because svc-temporal uses node:20-slim (Debian/glibc) — unlike
-  // Orion's Alpine image where Kuzu's glibc wheel cannot be installed.
-  // If GRAPH_SERVER_PORT is set to 0 or DISABLE_GRAPH_SERVER=1, skip startup
-  // (allows disabling in non-ERP deployments without code changes).
-  if (process.env.DISABLE_GRAPH_SERVER !== '1') {
-    startGraphServer();
-  }
 
   // Graceful shutdown on K8s SIGTERM. Without this the process dies
   // abruptly when the pod is rolled and any in-flight activities are

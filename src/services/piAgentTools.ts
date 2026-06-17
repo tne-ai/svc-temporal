@@ -516,10 +516,10 @@ export function buildPiTools(workspaceRoot: string, opts: BuildPiToolsOptions = 
     },
   };
 
-  // graph_traverse — available to ERP fleet skills (afl-*, rga-*, etc.)
-  // Calls the in-process Kuzu graph server. Returns [] gracefully when the
-  // graph server is not running (DISABLE_GRAPH_SERVER=1) or has no data yet.
-  // Non-ERP skills can call this tool safely — it just returns an empty result.
+  // graph_traverse — calls graph-svc at GRAPH_SERVICE_URL.
+  // Resolves the named traversal slug to Cypher from config/{fleet}/graph.yaml,
+  // then sends it to graph-svc POST /graph/{fleet}/{org_id}/query.
+  // Returns [] gracefully if graph-svc is unreachable or the slug is unknown.
   const GraphTraverseParams = Type.Object({
     fleet:           Type.String({ description: 'Fleet slug, e.g. "appfolio" or "regen-ag"' }),
     org_id:          Type.String({ description: 'Organisation ID' }),
@@ -536,19 +536,32 @@ export function buildPiTools(workspaceRoot: string, opts: BuildPiToolsOptions = 
       'without writing SQL joins. Use before validating or reasoning about compliance state.',
     parameters: GraphTraverseParams,
     execute: async (_toolCallId, p: Static<typeof GraphTraverseParams>) => {
-      const port = parseInt(process.env.GRAPH_SERVER_PORT ?? '8001', 10);
-      const secret = process.env.GRAPH_SERVER_SECRET ?? '';
+      const graphUrl = process.env.GRAPH_SERVICE_URL ?? 'http://graph-svc:8002';
+      const secret = process.env.GRAPH_SECRET ?? '';
       try {
-        const body = JSON.stringify({
-          fleet: p.fleet, org_id: p.org_id,
-          traversal_slug: p.traversal_slug, params: p.params,
-        });
-        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-        if (secret) {
-          const { createHmac } = await import('crypto');
-          headers['x-graph-signature'] = createHmac('sha256', secret).update(body).digest('hex');
+        // Resolve traversal slug → Cypher from config/{fleet}/graph.yaml
+        const configDir = process.env.CONFIG_DIR ?? path.join(process.cwd(), 'config');
+        const yamlPath = path.join(configDir, p.fleet, 'graph.yaml');
+        const { readFileSync } = await import('fs');
+        const { load } = await import('js-yaml');
+        let cypher: string;
+        try {
+          const raw = readFileSync(yamlPath, 'utf8');
+          const parsed = load(raw) as { graph: { traversals: Record<string, { pattern: string }> } };
+          const traversal = parsed?.graph?.traversals?.[p.traversal_slug];
+          if (!traversal) {
+            return { content: [{ type: 'text', text: `graph_traverse: unknown traversal '${p.traversal_slug}' for fleet '${p.fleet}'` }], details: { count: 0 } };
+          }
+          cypher = traversal.pattern;
+        } catch {
+          return { content: [{ type: 'text', text: `graph_traverse: no graph.yaml for fleet '${p.fleet}'` }], details: { count: 0 } };
         }
-        const res = await fetch(`http://127.0.0.1:${port}/graph/traverse`, {
+
+        const body = JSON.stringify({ cypher, params: p.params });
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (secret) headers['x-graph-secret'] = secret;
+
+        const res = await fetch(`${graphUrl}/graph/${p.fleet}/${p.org_id}/query`, {
           method: 'POST', headers, body,
         });
         if (!res.ok) {
