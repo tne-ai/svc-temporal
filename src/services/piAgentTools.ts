@@ -516,5 +516,67 @@ export function buildPiTools(workspaceRoot: string, opts: BuildPiToolsOptions = 
     },
   };
 
-  return [Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch, TodoWrite];
+  // graph_traverse — calls graph-svc at GRAPH_SERVICE_URL.
+  // Resolves the named traversal slug to Cypher from config/{fleet}/graph.yaml,
+  // then sends it to graph-svc POST /graph/{fleet}/{org_id}/query.
+  // Returns [] gracefully if graph-svc is unreachable or the slug is unknown.
+  const GraphTraverseParams = Type.Object({
+    fleet:           Type.String({ description: 'Fleet slug, e.g. "appfolio" or "regen-ag"' }),
+    org_id:          Type.String({ description: 'Organisation ID' }),
+    traversal_slug:  Type.String({ description: 'Named traversal from graph.yaml, e.g. "tenant_compliance_context"' }),
+    params:          Type.Record(Type.String(), Type.String(), { description: 'Parameter bindings for the Cypher query' }),
+  });
+
+  const GraphTraverse: AgentTool<typeof GraphTraverseParams> = {
+    name: 'graph_traverse',
+    label: 'Graph traversal',
+    description:
+      'Run a named knowledge graph traversal for an ERP fleet entity. ' +
+      'Returns cross-entity context (e.g. tenant → unit → property → certs → subsidy) ' +
+      'without writing SQL joins. Use before validating or reasoning about compliance state.',
+    parameters: GraphTraverseParams,
+    execute: async (_toolCallId, p: Static<typeof GraphTraverseParams>) => {
+      const graphUrl = process.env.GRAPH_SERVICE_URL ?? 'http://graph-svc:8002';
+      const secret = process.env.GRAPH_SECRET ?? '';
+      try {
+        // Resolve traversal slug → Cypher from config/{fleet}/graph.yaml
+        const configDir = process.env.CONFIG_DIR ?? path.join(process.cwd(), 'config');
+        const yamlPath = path.join(configDir, p.fleet, 'graph.yaml');
+        const { readFileSync } = await import('fs');
+        const { load } = await import('js-yaml');
+        let cypher: string;
+        try {
+          const raw = readFileSync(yamlPath, 'utf8');
+          const parsed = load(raw) as { graph: { traversals: Record<string, { pattern: string }> } };
+          const traversal = parsed?.graph?.traversals?.[p.traversal_slug];
+          if (!traversal) {
+            return { content: [{ type: 'text', text: `graph_traverse: unknown traversal '${p.traversal_slug}' for fleet '${p.fleet}'` }], details: { count: 0 } };
+          }
+          cypher = traversal.pattern;
+        } catch {
+          return { content: [{ type: 'text', text: `graph_traverse: no graph.yaml for fleet '${p.fleet}'` }], details: { count: 0 } };
+        }
+
+        const body = JSON.stringify({ cypher, params: p.params });
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (secret) headers['x-graph-secret'] = secret;
+
+        const res = await fetch(`${graphUrl}/graph/${p.fleet}/${p.org_id}/query`, {
+          method: 'POST', headers, body,
+        });
+        if (!res.ok) {
+          const err = await res.text();
+          return { content: [{ type: 'text', text: `graph_traverse error: ${err}` }], details: { count: 0 } };
+        }
+        const data = await res.json() as { rows: unknown[] };
+        const text = JSON.stringify(data.rows, null, 2);
+        return { content: [{ type: 'text', text }], details: { count: data.rows.length } };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: 'text', text: `graph_traverse unavailable: ${msg}` }], details: { count: 0 } };
+      }
+    },
+  };
+
+  return [Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch, TodoWrite, GraphTraverse];
 }
