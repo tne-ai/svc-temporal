@@ -109,11 +109,19 @@ export function ensureCommandWorkingDir(workspacePath: string, workingDir: strin
 
   const requiredRelativePath = commandRequiresPath(command);
   const hasRequiredPath = () => !requiredRelativePath || existsSync(join(cwdRoot, requiredRelativePath));
-  if (existsSync(join(cwdRoot, 'plugins', 'tne', 'skills')) && hasRequiredPath()) return;
 
+  // Always overlay the deployed (bundled) tne-plugins *code* over whatever is in the
+  // workspace, instead of trusting an existing checkout as-is. A stale workspace
+  // checkout can have the command's script present but ship outdated sibling files —
+  // e.g. p-cpo11-compose-app/contracts holding only crm.yaml. Using it without
+  // refreshing is the app-foundry fragility bug: a NEW app domain dies on a missing
+  // contract pack even though the deployed image already has it (and default.yaml).
+  // We force-copy only the `plugins/` subtree (skills/contracts/engine); generated
+  // outputs + TNE-CONTEXT state elsewhere under cwdRoot are preserved because
+  // copyTnePluginsTree overlays (force) and never deletes.
   const bundled = findBundledTnePluginsRoot(requiredRelativePath) || findBundledTnePluginsRoot();
-  if (bundled) copyTnePluginsTree(bundled, cwdRoot);
-  if (hasRequiredPath()) return;
+  if (bundled) copyTnePluginsTree(join(bundled, 'plugins'), join(cwdRoot, 'plugins'));
+  if (existsSync(join(cwdRoot, 'plugins', 'tne', 'skills')) && hasRequiredPath()) return;
 
   // Last-resort self-healing path for exactly the failure mode that caused the
   // CRM loop: svc-temporal was rolled out with fresh worker code but stale
