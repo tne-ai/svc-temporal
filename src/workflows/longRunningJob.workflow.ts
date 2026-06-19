@@ -13,6 +13,7 @@ import {
   defineSignal,
   defineQuery,
   setHandler,
+  workflowInfo,
 } from '@temporalio/workflow';
 
 import type {
@@ -98,11 +99,22 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
       toolHarness: input.toolHarness,
       githubToken: input.githubToken,
     };
+    // Keep the FSM child on the SAME worker family as this job, so an edge job
+    // (edge-<user>-jobs) runs its FSM on the edge sidecar (edge-<user>-fsm) — where
+    // the user's workspace + coder-pod dev-server preview live — instead of escaping
+    // to central tne-fsm-queue. Workflows can't read process.env / FSM_TASK_QUEUE, so
+    // we derive it deterministically from this workflow's own task queue.
+    const ownQueue = workflowInfo().taskQueue;
+    const fsmTaskQueue = ownQueue.endsWith('-jobs')
+      ? ownQueue.slice(0, -'-jobs'.length) + '-fsm' // edge-<user>-jobs → edge-<user>-fsm
+      : ownQueue.endsWith('jobs-queue')
+        ? ownQueue.slice(0, -'jobs-queue'.length) + 'fsm-queue' // tne-jobs-queue → tne-fsm-queue
+        : 'tne-fsm-queue';
     try {
       const fsmResult = await executeChild<(i: FsmProcessInput) => Promise<FsmProcessResult>>(
         'FsmProcessWorkflow',
         {
-          taskQueue: 'tne-fsm-queue',
+          taskQueue: fsmTaskQueue,
           workflowId: `fsm-${input.processRunId}`,
           args: [fsmInput],
         },
