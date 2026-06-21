@@ -31,7 +31,10 @@ function commandFromStep(step: StepExecutionParams['step']): string {
 }
 
 function commandRequiresPath(command: string): string | null {
-  const match = command.match(/(?:^|\s)(?:python3?|node|bash|sh)\s+([^\s;&|]+plugins\/tne\/skills\/[^\s;&|]+)/);
+  // NOTE: `*` (not `+`) before `plugins` — the foundry command runs a path that
+  // STARTS with `plugins/tne/skills/...` (no leading component), so a `+` here
+  // matched nothing and the whole tne-plugins preparation silently no-op'd.
+  const match = command.match(/(?:^|\s)(?:python3?|node|bash|sh)\s+([^\s;&|]*plugins\/tne\/skills\/[^\s;&|]+)/);
   return match?.[1]?.replace(/^['"]|['"]$/g, '') || null;
 }
 
@@ -98,17 +101,23 @@ function cloneTnePlugins(destination: string): { ok: boolean; error?: string } {
 
 export function ensureCommandWorkingDir(workspacePath: string, workingDir: string | undefined, cwdRoot: string, command = ''): void {
   mkdirSync(cwdRoot, { recursive: true });
-  if (!workingDir) return;
-  // Command-mode deterministic skills often execute repository-relative scripts
-  // such as `python3 plugins/tne/skills/...`. Central Temporal workers receive
-  // an S3 workspace that may contain only the scoped working directory outputs,
-  // not a full tne-plugins checkout. Seed the requested workingDir from a known
-  // good source, and if the image bundled stale plugins, fetch current plugins
-  // directly instead of burning another rollout cycle.
-  if (basename(workingDir) !== 'tne-plugins') return;
 
+  // Command-mode deterministic skills execute repository-relative scripts such as
+  // `python3 plugins/tne/skills/.../build_compass_application.py`, which need a
+  // tne-plugins checkout at cwdRoot. Decide whether to prepare one based on what
+  // the COMMAND requires — NOT on `workingDir`.
+  //
+  // The old gate (`basename(workingDir) === 'tne-plugins'`) was the root cause of
+  // the app-foundry fail loop: the foundry is launched from chat with the chat's
+  // workingDir (e.g. "Compass"), so this returned early, the bundled plugins were
+  // never overlaid, cwd=<workspace>/Compass had no plugins/ dir, and the script
+  // was never found → instant "FSM failed. Final phase: generator". The command's
+  // own `plugins/tne/...` script path is the reliable signal regardless of how the
+  // run was launched.
   const requiredRelativePath = commandRequiresPath(command);
-  const hasRequiredPath = () => !requiredRelativePath || existsSync(join(cwdRoot, requiredRelativePath));
+  if (!requiredRelativePath || !requiredRelativePath.startsWith('plugins/tne/')) return;
+
+  const hasRequiredPath = () => existsSync(join(cwdRoot, requiredRelativePath));
 
   // Always overlay the deployed (bundled) tne-plugins *code* over whatever is in the
   // workspace, instead of trusting an existing checkout as-is. A stale workspace
