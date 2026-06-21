@@ -67,6 +67,10 @@ export interface Step {
   passCondition: string;
   stageType: StageType;
   dependsOn: string[];
+  /** PHASE values for which this step runs. Empty/absent = always runs. When the
+   *  workflow's PHASE template var is set and not in this list, the step is
+   *  skipped without dispatching an agent. Parity with engine.schema.Step.phase_gate. */
+  phaseGate?: string[];
   backpropSkill: string;
   failFast: FailFastConfig;
   permissionMode: string;
