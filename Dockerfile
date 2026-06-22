@@ -43,6 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-yaml \
     python3-pip \
     python3-venv \
+    python3-psycopg2 \
     make \
     g++ \
     postgresql-client \
