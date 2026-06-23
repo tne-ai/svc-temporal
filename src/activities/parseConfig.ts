@@ -143,9 +143,20 @@ export async function parseConfig(params: ParseConfigParams): Promise<ParseConfi
 
   // Prefer Horizon DB — the canonical SOP lives there and can't drift with a
   // stale S3 cache on the user's workspace.
-  let skillPath = await fetchSkillFromHorizon(skillName);
+  //
+  // Local-dev escape hatch: SKILL_SOURCE_LOCAL_FIRST=1 reads skills straight from
+  // the local tne-plugins checkout (TNE_PLUGINS_PATH) BEFORE the DB. Essential
+  // when testing unmerged skill changes — otherwise the worker keeps reading the
+  // shared/prod DB copy and local edits never take effect. Default off, so prod
+  // behavior is unchanged.
+  const localFirst = process.env.SKILL_SOURCE_LOCAL_FIRST === '1';
+  let skillPath = localFirst
+    ? resolveSkillPathLocal(skillName, workspacePath)
+    : await fetchSkillFromHorizon(skillName);
   if (!skillPath) {
-    skillPath = resolveSkillPathLocal(skillName, workspacePath);
+    skillPath = localFirst
+      ? await fetchSkillFromHorizon(skillName)
+      : resolveSkillPathLocal(skillName, workspacePath);
   }
   if (!skillPath) {
     throw new Error(
