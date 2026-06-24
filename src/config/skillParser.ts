@@ -402,7 +402,10 @@ function parseFrontmatterDictSop(
     parentScope: '',
     approvalGate: Boolean(preambleDict?.human_gate),
     userCheckpoint: false,
-    stageReview: true,
+    // Honor STAGE_REVIEW from sop.vars (default on) — a skill can opt out of
+    // per-stage gates (e.g. the app foundry, which is preview-first). Previously
+    // hardcoded true, so sop.vars STAGE_REVIEW=false had no effect.
+    stageReview: (vars['STAGE_REVIEW'] || 'true').toLowerCase() !== 'false',
     perStepReview: true,
     preFlightInputs: [],
     inputsFile: '',
