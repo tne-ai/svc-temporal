@@ -311,6 +311,23 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   //   - otherwise
   //       → call the workflow-level executeStep proxy.
   async function dispatchStep(step: Step, stepParams: StepExecutionParams): Promise<StepResult> {
+    // phase_gate enforcement: skip steps whose phaseGate excludes the current PHASE
+    // without dispatching an agent (deterministic; no skip-stub artifact). Parity with
+    // engine.temporal_workflow's phase-gate skip. The synthesized success marks the step
+    // completed so dependency barriers still resolve.
+    const phaseGatePhase = mergedTemplateVars['PHASE'] ?? '';
+    if (
+      step.phaseGate &&
+      step.phaseGate.length > 0 &&
+      phaseGatePhase &&
+      !step.phaseGate.includes(phaseGatePhase)
+    ) {
+      console.log(
+        `[FsmProcessWorkflow] phase-gate skip step ${step.number} (skill=${step.skill}) — PHASE=${phaseGatePhase} not in [${step.phaseGate.join(', ')}]`,
+      );
+      return { success: true, gateResults: {} };
+    }
+
     // tne-engine leaf opt-in: declared by the leaf SKILL.md's top-level
     // `tne-engine: true` frontmatter, surfaced as Step.tneEngine by the
     // parser. Skip when this is itself a subagent step — those are
