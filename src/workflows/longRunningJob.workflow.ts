@@ -86,7 +86,12 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
     const fsmInput: FsmProcessInput = {
       runId: input.processRunId,
       skillName: input.skillName,
-      templateVars: {},
+      // Forward the job's skill variables (PROMPT + any APP_*/DOMAIN/etc.) so
+      // command-mode steps see them in env and parseConfig can apply overrides.
+      // Hardcoding {} here made every skill-run ignore its variables and fall
+      // back to SKILL.md sop.var defaults (the app foundry built the example app
+      // regardless of APP_SLUG).
+      templateVars: input.templateVars ?? {},
       workspacePath: fsmWorkspacePath,
       workingDir: input.workingDir,
       userId: input.userId,

@@ -403,8 +403,16 @@ function parseFrontmatterDictSop(
     parentScope: '',
     approvalGate: Boolean(preambleDict?.human_gate),
     userCheckpoint: false,
-    stageReview: true,
-    perStepReview: true,
+    // Honor STAGE_REVIEW from sop.vars (default on) — a skill can opt out of
+    // per-stage gates (e.g. the app foundry, which is preview-first). Previously
+    // hardcoded true, so sop.vars STAGE_REVIEW=false had no effect.
+    stageReview: (vars['STAGE_REVIEW'] || 'true').toLowerCase() !== 'false',
+    // Per-step review follows STAGE_REVIEW too. A preview-first skill (the app
+    // foundry) sets STAGE_REVIEW=false to run gateless, but perStepReview was
+    // hardcoded true — so maybePerStepReviewPause still paused after generator.1.
+    // Tie it to STAGE_REVIEW so opting out of stage gates also opts out of the
+    // per-step gate. Skills that don't set STAGE_REVIEW keep the default (on).
+    perStepReview: (vars['STAGE_REVIEW'] || 'true').toLowerCase() !== 'false',
     preFlightInputs: [],
     inputsFile: '',
     inputsBackprop: true,
@@ -785,7 +793,7 @@ function parseBlockText(block: string): ProcessConfig {
     approvalGate,
     userCheckpoint,
     stageReview,
-    perStepReview: true, // engine default; not declared by body-block SOPs
+    perStepReview: stageReview, // follow STAGE_REVIEW (preview-first → no per-step gate)
     preFlightInputs,
     inputsFile,
     inputsBackprop,

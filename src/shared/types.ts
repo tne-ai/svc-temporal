@@ -453,6 +453,13 @@ export interface JobInput {
    *  GitHub connection and passed to the worker for this job only. svc-temporal
    *  maps it to GH_TOKEN/GITHUB_TOKEN for gh CLI + HTTPS git operations. */
   githubToken?: string;
+  /** Skill variables (e.g. `{ PROMPT, APP_SLUG, DOMAIN, ... }`) that orion
+   *  builds for a skill-run job. Forwarded to FsmProcessWorkflow as its
+   *  templateVars so command-mode steps see them in the environment (and the
+   *  foundry's backfill_env_from_prompt can read PROMPT). Without this the FSM
+   *  child got `{}` and every skill-run fell back to SKILL.md sop.var defaults
+   *  (e.g. the app foundry built o-app1-example-app regardless of APP_SLUG). */
+  templateVars?: Record<string, string>;
 }
 
 export interface JobResult {
