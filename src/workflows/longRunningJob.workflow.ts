@@ -103,6 +103,12 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
       // Claude SDK for each step. LiteLLM is always-on as transport.
       toolHarness: input.toolHarness,
       githubToken: input.githubToken,
+      // Forward the resolved delegate (jobs) model so the child FSM's
+      // effectiveStep overrides each step.model. Without this, skill-run jobs
+      // ignore the user's resolved model (e.g. claude-sonnet-4-6) and the
+      // worker falls back to its Pi/LiteLLM default (kimi-k2.6) — observed: the
+      // foundry implementation shards ran on kimi instead of Sonnet.
+      ...(input.model ? { delegateModel: input.model } : {}),
     };
     // Keep the FSM child on the SAME worker family as this job, so an edge job
     // (edge-<user>-jobs) runs its FSM on the edge sidecar (edge-<user>-fsm) — where
