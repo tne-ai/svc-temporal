@@ -47,7 +47,7 @@ function commandRequiresPath(command: string): string | null {
  * files. Returns the command unchanged if no shared checkout is available
  * (legacy overlay/clone path handles that).
  */
-function resolveSharedCommand(command: string): string {
+export function resolveSharedCommand(command: string): string {
   const required = commandRequiresPath(command);
   if (!required) return command;
   const shared = findBundledTnePluginsRoot(required);
