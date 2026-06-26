@@ -86,7 +86,12 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
     const fsmInput: FsmProcessInput = {
       runId: input.processRunId,
       skillName: input.skillName,
-      templateVars: {},
+      // Forward the job's skill variables (PROMPT + any APP_*/DOMAIN/etc.) so
+      // command-mode steps see them in env and parseConfig can apply overrides.
+      // Hardcoding {} here made every skill-run ignore its variables and fall
+      // back to SKILL.md sop.var defaults (the app foundry built the example app
+      // regardless of APP_SLUG).
+      templateVars: input.templateVars ?? {},
       workspacePath: fsmWorkspacePath,
       workingDir: input.workingDir,
       userId: input.userId,
@@ -98,6 +103,12 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
       // Claude SDK for each step. LiteLLM is always-on as transport.
       toolHarness: input.toolHarness,
       githubToken: input.githubToken,
+      // Forward the resolved delegate (jobs) model so the child FSM's
+      // effectiveStep overrides each step.model. Without this, skill-run jobs
+      // ignore the user's resolved model (e.g. claude-sonnet-4-6) and the
+      // worker falls back to its Pi/LiteLLM default (kimi-k2.6) — observed: the
+      // foundry implementation shards ran on kimi instead of Sonnet.
+      ...(input.model ? { delegateModel: input.model } : {}),
     };
     // Keep the FSM child on the SAME worker family as this job, so an edge job
     // (edge-<user>-jobs) runs its FSM on the edge sidecar (edge-<user>-fsm) — where

@@ -231,4 +231,14 @@ export const SYNC_EXCLUDE_PATTERNS = [
   '.claude.json', '.claude.json.backup',
   '.local/bin',
   '*.lock', '*.tmp',
+  // App-foundry / command-mode overlay. ensureCommandWorkingDir copies a full
+  // tne-plugins checkout (plugins/ ≈ 11k files) into the workspace under the
+  // working dir on EVERY run, and the chat may `git clone` tne-plugins too.
+  // These are engine SOURCE, not user work — regenerated each run and resolved
+  // from TNE_PLUGINS_PATH, never from S3. Syncing them bloated the workspace to
+  // hundreds of MB / ~12k manifest entries and left dangling _archived keys that
+  // 404'd on every pull. Exclude the overlay + clone so only real outputs
+  // (TNE-CONTEXT, apps, ktap) sync. (The generated app SKILL.md under plugins/
+  // is regenerable + committed via the implementation PRs, so it's safe to drop.)
+  'plugins', 'tne-plugins', '_archived',
 ];

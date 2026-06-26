@@ -501,16 +501,29 @@ export async function pullWorkspaceFromS3(
       await writeFile(localFile, body);
 
       return { downloaded: true, bytes: body.length };
-    } catch (err) {
+    } catch (err: any) {
+      // NoSuchKey/404: the object was in the ListObjectsV2 page but deleted
+      // before we fetched it — a concurrent push/cleanup or an S3 wipe mid-sync
+      // (notably the overlaid tne-plugins clone churning under the workingDir).
+      // Benign: the file is simply gone. Skip quietly and summarize once below
+      // instead of emitting a stack trace per missing key.
+      if (err?.name === 'NoSuchKey' || err?.Code === 'NoSuchKey' || err?.$metadata?.httpStatusCode === 404) {
+        return { downloaded: false, bytes: 0, missing: true };
+      }
       console.error(`[pullWorkspaceFromS3] Failed to download ${obj.key}:`, err);
       return { downloaded: false, bytes: 0 };
     }
   });
 
+  let missingCount = 0;
   for (const r of results) {
     if (r.downloaded) fileCount++;
+    if ((r as any).missing) missingCount++;
     bytes += r.bytes;
     heartbeat({ op: 'pull', fileCount, bytes });
+  }
+  if (missingCount > 0) {
+    console.warn(`[pullWorkspaceFromS3] skipped ${missingCount} key(s) listed but missing on fetch (deleted mid-sync)`);
   }
 
   return { fileCount, conflicts, bytes };

@@ -38,6 +38,26 @@ function commandRequiresPath(command: string): string | null {
   return match?.[1]?.replace(/^['"]|['"]$/g, '') || null;
 }
 
+/**
+ * Single-source model: rewrite a command's repo-relative `plugins/tne/…` script
+ * path to an ABSOLUTE path inside the per-container tne-plugins checkout
+ * (TNE_PLUGINS_PATH). The command then runs the shared script while cwd stays the
+ * project workspace — so tne-plugins lives once per container (central or edge
+ * pod) and is never copied into each project, which only holds generated/edited
+ * files. Returns the command unchanged if no shared checkout is available
+ * (legacy overlay/clone path handles that).
+ */
+export function resolveSharedCommand(command: string): string {
+  const required = commandRequiresPath(command);
+  if (!required) return command;
+  const shared = findBundledTnePluginsRoot(required);
+  if (!shared) return command;
+  return command.replace(
+    /((?:^|\s)(?:python3?|node|bash|sh)\s+['"]?)(plugins\/tne\/[^\s;&|'"]+)/g,
+    (_m, pre: string, rel: string) => `${pre}${join(shared, rel)}`,
+  );
+}
+
 function findBundledTnePluginsRoot(requiredRelativePath?: string | null): string | null {
   const candidates = [
     process.env.TNE_PLUGINS_PATH,
@@ -116,6 +136,13 @@ export function ensureCommandWorkingDir(workspacePath: string, workingDir: strin
   // run was launched.
   const requiredRelativePath = commandRequiresPath(command);
   if (!requiredRelativePath || !requiredRelativePath.startsWith('plugins/tne/')) return;
+
+  // Single-source model: if this container has a tne-plugins checkout
+  // (TNE_PLUGINS_PATH), the command is rewritten to run the script straight from
+  // it (resolveSharedCommand), so we do NOT copy plugins/ into the project
+  // workspace — cwdRoot just needs to exist for generated outputs. Only when no
+  // shared checkout is present do we fall back to overlaying/cloning (below).
+  if (findBundledTnePluginsRoot(requiredRelativePath)) return;
 
   const hasRequiredPath = () => existsSync(join(cwdRoot, requiredRelativePath));
 
@@ -234,7 +261,7 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
   // those as manual inline steps made the workflow complete without ever running
   // the command or writing the declared output artifact.
   if (isCommandStep(step)) {
-    const command = commandFromStep(step).trim();
+    const command = resolveSharedCommand(commandFromStep(step).trim());
     const outputPath = step.output
       ? resolveTemplateVars(step.output, templateVars).replace('{{ITER}}', String(iteration || 1))
       : '';

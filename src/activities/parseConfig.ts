@@ -54,22 +54,30 @@ function getTnePluginsRoot(): string | null {
  * (workspace, then tne-plugins submodule). Used as a fallback when the
  * Horizon DB fetch is unavailable or returns 404.
  */
-function resolveSkillPathLocal(skillName: string, workspacePath: string): string | null {
-  // 1. User's workspace — check workspacePath and up to 2 parent dirs
-  let check = workspacePath;
-  for (let i = 0; i < 3; i++) {
-    const wsSkill = join(check, '.claude', 'skills', skillName, 'SKILL.md');
-    if (existsSync(wsSkill)) return wsSkill;
-    const parent = resolve(check, '..');
-    if (parent === check) break;
-    check = parent;
-  }
+function resolveSkillPathLocal(
+  skillName: string,
+  workspacePath: string,
+  preferRoot = false,
+): string | null {
+  // User's workspace — check workspacePath and up to 2 parent dirs.
+  const fromWorkspace = (): string | null => {
+    let check = workspacePath;
+    for (let i = 0; i < 3; i++) {
+      const wsSkill = join(check, '.claude', 'skills', skillName, 'SKILL.md');
+      if (existsSync(wsSkill)) return wsSkill;
+      const parent = resolve(check, '..');
+      if (parent === check) break;
+      check = parent;
+    }
+    return null;
+  };
 
-  // 2. tne-plugins repository — search across all plugin namespaces.
-  //    Originally hardcoded to plugins/tne/skills/; broken for plugins like
-  //    jpm/ that live in their own namespace. Now iterates over all plugins.
-  const root = getTnePluginsRoot();
-  if (root) {
+  // tne-plugins repository (TNE_PLUGINS_PATH) — search across all plugin
+  // namespaces. Originally hardcoded to plugins/tne/skills/; broken for plugins
+  // like jpm/ that live in their own namespace. Now iterates over all plugins.
+  const fromRoot = (): string | null => {
+    const root = getTnePluginsRoot();
+    if (!root) return null;
     const pluginsDir = join(root, 'plugins');
     try {
       const plugins = readdirSync(pluginsDir, { withFileTypes: true })
@@ -82,9 +90,16 @@ function resolveSkillPathLocal(skillName: string, workspacePath: string): string
     } catch {
       // pluginsDir unreadable — fall through to null
     }
-  }
+    return null;
+  };
 
-  return null;
+  // preferRoot (SKILL_SOURCE_LOCAL_FIRST dev mode): trust the explicit
+  // TNE_PLUGINS_PATH checkout AHEAD of the workspace's .claude/skills, which the
+  // workspace may have pulled stale from S3 and which would otherwise shadow the
+  // dev's edits. Default order (workspace first) is unchanged for prod.
+  return preferRoot
+    ? (fromRoot() ?? fromWorkspace())
+    : (fromWorkspace() ?? fromRoot());
 }
 
 /**
@@ -141,11 +156,24 @@ export interface ParseConfigResult {
 export async function parseConfig(params: ParseConfigParams): Promise<ParseConfigResult> {
   const { skillName, workspacePath, variables } = params;
 
-  // Prefer Horizon DB — the canonical SOP lives there and can't drift with a
-  // stale S3 cache on the user's workspace.
-  let skillPath = await fetchSkillFromHorizon(skillName);
+  // Skill source. DB-first by default — the canonical SOP lives in Horizon and
+  // can't drift with a stale S3 cache on the user's workspace.
+  //
+  // Local-dev escape hatch: SKILL_SOURCE_LOCAL_FIRST=1 reads straight from the
+  // local tne-plugins checkout (TNE_PLUGINS_PATH) BEFORE the DB. Essential when
+  // testing unmerged skill changes — otherwise the worker keeps reading the
+  // shared/prod DB copy and local edits never take effect (the app-foundry
+  // failure: the DB still had p-cpo12's hardcoded output path, so the FSM checked
+  // the wrong path and failed even though the local {{APP_SLUG}} fix was present).
+  // Default off, so prod behavior is unchanged.
+  const localFirst = process.env.SKILL_SOURCE_LOCAL_FIRST === '1';
+  let skillPath = localFirst
+    ? resolveSkillPathLocal(skillName, workspacePath, true) // TNE_PLUGINS_PATH ahead of stale workspace .claude/skills
+    : await fetchSkillFromHorizon(skillName);
   if (!skillPath) {
-    skillPath = resolveSkillPathLocal(skillName, workspacePath);
+    skillPath = localFirst
+      ? await fetchSkillFromHorizon(skillName)
+      : resolveSkillPathLocal(skillName, workspacePath);
   }
   if (!skillPath) {
     throw new Error(
