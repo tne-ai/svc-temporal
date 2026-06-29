@@ -85,6 +85,24 @@ yarn test --run
 
 47 vitest unit tests. CI (`.github/workflows/ci.yml`) runs typecheck + tests on push and PRs.
 
+## FSM dependency resolution
+
+`FsmProcessWorkflow` executes each phase's steps in parallel, gating each step behind its `dependsOn` list. The resolution logic lives in [`src/workflows/depResolution.ts`](src/workflows/depResolution.ts) and is exported for unit testing.
+
+### Dep reference forms
+
+| Form | Example | Resolves against |
+|---|---|---|
+| Bare number | `"1"` | Current-phase step with that number (intra-phase first); falls back to any other phase if no same-phase step has that number |
+| Phase-qualified | `"generator.4"` | Exactly `state.steps["generator.4"]` |
+| Wildcard | `"all"` | Every other step in the current phase |
+
+### Intra-phase isolation guarantee
+
+Step numbers reset per phase (`preamble.1`, `generator.1`, `postamble.1` are distinct steps). Without an explicit guard, a bare-number dep like `dependsOn: ["1"]` in the postamble could be spuriously satisfied by `preamble.1` or `generator.1` completing, allowing downstream steps to race the local step.
+
+`isDepSatisfied` / `isDepBlockedByFailure` enforce: **if the bare number names a step in the current phase, only that phase's completed/failed set is consulted — no cross-phase fallback.** Cross-phase fallback applies only when the number does not match any step in the current phase.
+
 ## Image build
 
 Production image is built by troopship's `.github/workflows/build_svc_temporal.yaml` on every merge to `main` (pushes to ECR). The Dockerfile here is the source of truth; troopship's checkout vendors `tne-plugins/` as a submodule so the image bundles the skill catalog.
