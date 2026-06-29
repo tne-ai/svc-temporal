@@ -48,6 +48,13 @@ import {
   EvaluatorMode,
 } from '../shared/types.js';
 import {
+  type ParsedDep,
+  parseDep,
+  formatDep,
+  isDepSatisfied,
+  isDepBlockedByFailure,
+} from './depResolution.js';
+import {
   STEP_ACTIVITY_TIMEOUT,
   STEP_HEARTBEAT_TIMEOUT,
   STEP_RETRY_POLICY,
@@ -897,35 +904,6 @@ function collectFeedback(state: FsmWorkflowState): string {
 }
 
 /**
- * Dependency reference from a step's `dependsOn` list.
- *   • `num`  — bare number (e.g. `"4"`). Resolves against this phase first,
- *              then any other phase with a matching step number in state.
- *   • `qual` — phase-qualified (e.g. `"generator.4"`). Resolves directly
- *              against `state.steps["generator.4"]`.
- *   • `all`  — wildcard meaning "every other step in this phase".
- */
-type ParsedDep =
-  | { kind: 'num'; number: string }
-  | { kind: 'qual'; phase: string; number: string }
-  | { kind: 'all' };
-
-function parseDep(raw: string): ParsedDep | null {
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  if (trimmed.toLowerCase() === 'all') return { kind: 'all' };
-  const parts = trimmed.split('.').map(p => p.trim()).filter(Boolean);
-  if (parts.length === 0) return null;
-  if (parts.length >= 2) return { kind: 'qual', phase: parts[0], number: parts.slice(1).join('.') };
-  return { kind: 'num', number: parts[0] };
-}
-
-function formatDep(dep: ParsedDep): string {
-  if (dep.kind === 'all') return 'all';
-  if (dep.kind === 'qual') return `${dep.phase}.${dep.number}`;
-  return dep.number;
-}
-
-/**
  * Run a phase's steps in parallel with DAG-ordered waves and cancel-siblings
  * semantics on failure.
  *
@@ -1000,36 +978,11 @@ async function runPhaseParallel(
   // Dep resolution — unified over local (this-phase) and global (state.steps).
   // `selfNumber` is excluded from `all` so a step can depend on "all" without
   // waiting on itself.
-  const isSatisfied = (dep: ParsedDep, selfNumber: string): boolean => {
-    if (dep.kind === 'all') {
-      return steps.every(s => s.number === selfNumber || completed.has(s.number));
-    }
-    if (dep.kind === 'qual') {
-      return state.steps[`${dep.phase}.${dep.number}`]?.status === StepStatus.COMPLETE;
-    }
-    if (completed.has(dep.number)) return true;
-    // Cross-phase fallback: any other phase with this step number COMPLETE.
-    for (const [key, st] of Object.entries(state.steps)) {
-      if (st?.status === StepStatus.COMPLETE && key.endsWith(`.${dep.number}`)) return true;
-    }
-    return false;
-  };
+  const isSatisfied = (dep: ParsedDep, selfNumber: string): boolean =>
+    isDepSatisfied(dep, selfNumber, steps, completed, state.steps);
 
-  const isBlockedByFailure = (dep: ParsedDep, selfNumber: string): boolean => {
-    if (dep.kind === 'all') {
-      return steps.some(s =>
-        s.number !== selfNumber && (failed.has(s.number) || cancelledSteps.has(s.number)),
-      );
-    }
-    if (dep.kind === 'qual') {
-      return state.steps[`${dep.phase}.${dep.number}`]?.status === StepStatus.FAILED;
-    }
-    if (failed.has(dep.number) || cancelledSteps.has(dep.number)) return true;
-    for (const [key, st] of Object.entries(state.steps)) {
-      if (st?.status === StepStatus.FAILED && key.endsWith(`.${dep.number}`)) return true;
-    }
-    return false;
-  };
+  const isBlockedByFailure = (dep: ParsedDep, selfNumber: string): boolean =>
+    isDepBlockedByFailure(dep, selfNumber, steps, failed, cancelledSteps, state.steps);
 
   while (completed.size + failed.size + cancelledSteps.size < steps.length) {
     if (isCancelled()) return { failed: failed.size > 0 };
