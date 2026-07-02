@@ -338,7 +338,7 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
     emitEvent(parentRunId, 'heartbeat', { stepNumber: step.number, skill: step.skill, status: 'invoking', retry: retries });
 
     // Invoke the skill
-    const invResult = await invokeSkill(step, prompt + (currentFeedback ? `\n\n## Revision Feedback\n\n${currentFeedback}` : ''), workspacePath, agentBackend, { parentRunId, userId, s3Bucket, s3Prefix, workingDir, toolHarness, githubToken });
+    const invResult = await invokeSkill(step, prompt + (currentFeedback ? `\n\n## Revision Feedback\n\n${currentFeedback}` : ''), workspacePath, agentBackend, { parentRunId, userId, s3Bucket, s3Prefix, workingDir, toolHarness, githubToken, phase });
 
     if (!invResult.success) {
       // Check for stage review pause (nested orchestrator)

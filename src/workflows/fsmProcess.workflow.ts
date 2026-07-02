@@ -179,7 +179,24 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
   const mergedTemplateVars: Record<string, string> = {
     ...(config.vars || {}),
     ...(input.templateVars || {}),
+    // Builtin: the run's id, exposed to every step (incl. command-mode env) so
+    // a step can address its own run — e.g. push output to the chat thread via
+    // orion's render-to-chat, or (0b) build a unique OUTPUT_BASENAME.
+    RUN_ID: input.runId,
   };
+
+  // Fold the runtime-only RUN_ID into OUTPUT_BASENAME so the basename is
+  // concrete for verbatim-copy consumers (per-step "Run Variables" list +
+  // command-step env), not just lazy output-path resolution. RUN_ID is injected
+  // here at runtime, AFTER the parser bakes sop.vars, so a sop.var referencing
+  // {{RUN_ID}} otherwise reaches command steps literal (observed crashing
+  // lifecycle.py: runs_dir ".../yes-p-cvc-council-{{RUN_ID}}"). Scoped to the
+  // {{RUN_ID}} token: a no-op for every SOP whose OUTPUT_BASENAME lacks it
+  // (every fleet except p-cvc-council today). Pure string op -> deterministic.
+  const _obn = mergedTemplateVars['OUTPUT_BASENAME'];
+  if (_obn && _obn.includes('{{RUN_ID}}')) {
+    mergedTemplateVars['OUTPUT_BASENAME'] = _obn.replaceAll('{{RUN_ID}}', input.runId);
+  }
 
   // Initialize or resume state
   const state: FsmWorkflowState = input.resumeState || initializeState(config);

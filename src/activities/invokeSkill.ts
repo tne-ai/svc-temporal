@@ -76,6 +76,7 @@ import { ensureSkillsInWorkspace } from './setupSkills.js';
 import { PiAgentSession, isPiAgentEnabled, isLiteLLMProxyEnabled, getLiteLLMBaseURL, normalizeModelForLitellm } from '../services/piAgentAdapter.js';
 import { buildPiTools } from '../services/piAgentTools.js';
 import { loadLeafSkillSchema } from '../config/leafSkillSchema.js';
+import { teeRecord } from './transcript.js';
 
 /** Extract a short text preview for message events (strip surrounding whitespace). */
 function previewText(text: string, max = 600): string {
@@ -554,7 +555,7 @@ async function invokeViaHarness(
     let harnessSawAnyTokens = false;
     let harnessSawAnyToolUse = false;
 
-    for await (const event of agent.query(prompt)) {
+    for await (const event of teeRecord(agent.query(prompt), { runId: context?.parentRunId, phase: (context as any)?.phase, stepNumber: context?.stepNumber, skill: context?.skill, workspaceRoot, model: resolvedModel })) {
       // Agent harness emits various event types — capture text content from assistant messages
       const ev = event as any;
       if (ev.type === 'assistant' && ev.message?.content) {
@@ -1051,7 +1052,7 @@ async function invokeViaClaudeAgentSDK(
     const runId = context?.parentRunId;
     const jobId = context?.jobId;
 
-    for await (const event of agent.query(prompt)) {
+    for await (const event of teeRecord(agent.query(prompt), { runId: context?.parentRunId, phase: (context as any)?.phase, stepNumber: context?.stepNumber, skill: context?.skill, workspaceRoot, model: resolvedModel })) {
       // Capture text from assistant messages + emit message/tool_use/file_change events
       if (event.type === 'assistant' && event.message?.content) {
         for (const block of event.message.content) {
@@ -1219,7 +1220,7 @@ export async function invokeSkill(
   prompt: string,
   workspacePath?: string,
   agentBackend?: AgentBackend,
-  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; workingDir?: string; toolHarness?: 'pi' | 'claude_sdk'; completion?: boolean; githubToken?: string },
+  context?: { parentRunId?: string; jobId?: string; userId?: string; s3Bucket?: string; s3Prefix?: string; workingDir?: string; toolHarness?: 'pi' | 'claude_sdk'; completion?: boolean; githubToken?: string ; phase?: string },
 ): Promise<InvocationResult> {
   // toolHarness overrides the legacy `agentBackend` param when set.
   // Orion resolves the user's `User.toolHarness` (auto/pi/claude_sdk) +
