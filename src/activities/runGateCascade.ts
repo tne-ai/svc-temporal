@@ -107,6 +107,20 @@ async function runGateCascadeInner(
     };
   }
 
+  // No gates configured (deterministic `run: command` steps): the output exists
+  // and the command's own exit code already gated it in executeStep (which fails
+  // the step on a non-zero exit before we get here), so there is nothing to
+  // LLM-judge. An empty gate set = pass. This also avoids false-failing on an
+  // edge pod where the gate evaluator's Claude auth isn't reachable — the very
+  // `gate_infrastructure_unavailable` that kept marking successful deploys failed.
+  if (enabledGates.length === 0) {
+    return {
+      passed: true,
+      gateResults: [{ gateNumber: 0, passed: true, feedback: 'No gates configured — auto-pass' }],
+      finalFeedback: '',
+    };
+  }
+
   const results: GateResult[] = [];
 
   for (const gateNum of [...enabledGates].sort()) {

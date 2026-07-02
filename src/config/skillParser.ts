@@ -362,7 +362,14 @@ function parseFrontmatterDictSop(
         dependsOn,
         phaseGate: Array.isArray(s?.phase_gate) ? s.phase_gate.map(String) : [],
         backpropSkill: '',
-        failFast: { maxRetries: 3, gates: [1, 2, 3, 4] },
+        // A `run: command` step is deterministic: its gate is the command's
+        // exit code (executeStep fails the step on a non-zero exit, before the
+        // gate cascade). The LLM content judges (gates 2-4) can't meaningfully
+        // evaluate a command's output — often a dir/artifact, e.g. p-cpo19's
+        // `apps` — and on an edge pod, where the gate evaluator's Claude auth
+        // isn't wired, they throw `infrastructure` and false-fail a step whose
+        // work actually succeeded. So command steps carry no content gates.
+        failFast: { maxRetries: 3, gates: run === 'command' ? [] : [1, 2, 3, 4] },
         permissionMode: 'acceptEdits',
         model: '',
         timeout: stepTimeout,
