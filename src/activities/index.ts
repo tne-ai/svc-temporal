@@ -13,3 +13,5 @@ export { emitFsmEventActivity } from './emitEvent.js';
 export { scanOutputForFindings, applyFindingsToInputs } from './backpropInputs.js';
 export { recordProvenance, lookupProvenance } from './provenanceStore.js';
 export { judgeSimilarity, llmInvert, runBijectionInverse } from './backwardDispatch.js';
+export { graphQuery } from './graphQuery.js';
+export { graphWriteNode, graphWriteEdge } from './graphWrite.js';

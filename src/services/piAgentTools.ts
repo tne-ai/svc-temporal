@@ -23,6 +23,7 @@ import path from 'path';
 import { glob } from 'glob';
 import { Type, type Static } from 'typebox';
 import type { AgentTool } from '@mariozechner/pi-agent-core';
+import { GRAPH_SERVICE_URL, GRAPH_SECRET } from '../shared/constants.js';
 
 /**
  * Minimal Tavily search — orion has a richer wrapper inside its
@@ -536,8 +537,8 @@ export function buildPiTools(workspaceRoot: string, opts: BuildPiToolsOptions = 
       'without writing SQL joins. Use before validating or reasoning about compliance state.',
     parameters: GraphTraverseParams,
     execute: async (_toolCallId, p: Static<typeof GraphTraverseParams>) => {
-      const graphUrl = process.env.GRAPH_SERVICE_URL ?? 'http://graph-svc:8002';
-      const secret = process.env.GRAPH_SECRET ?? '';
+      const graphUrl = GRAPH_SERVICE_URL;
+      const secret = GRAPH_SECRET;
       try {
         // Resolve traversal slug → Cypher from config/{fleet}/graph.yaml
         const configDir = process.env.CONFIG_DIR ?? path.join(process.cwd(), 'config');
