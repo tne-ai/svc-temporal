@@ -164,6 +164,22 @@ describe('Gate 1 — type-specific dispatch', () => {
     expect(res.gateResults).toHaveLength(1);
     expect(res.gateResults[0].error).toBe('infrastructure');
   });
+
+  it('empty gate set (run: command steps) → auto-pass, no evaluator invoked', async () => {
+    mockGateResponse = () => { throw new Error('gate model must not be called'); };
+    const p = writeOutput('generated artifact');
+    const res = await runGateCascade(makeStep({ failFast: { maxRetries: 3, gates: [] } }), p);
+    expect(res.passed).toBe(true);
+    expect(res.infrastructureError).toBeFalsy();
+  });
+
+  it('empty gate set still requires the output to exist', async () => {
+    const res = await runGateCascade(
+      makeStep({ failFast: { maxRetries: 3, gates: [] } }),
+      join(tmpdir(), 'does-not-exist-xyz'),
+    );
+    expect(res.passed).toBe(false);
+  });
 });
 
 // ─── Cascade-level behavior (gate 1 as first gate) ─────────────────────────────
