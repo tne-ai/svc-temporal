@@ -181,6 +181,14 @@ export const HORIZON_JOB_EVENTS_URL = (() => {
   return HORIZON_FSM_BASE ? `${HORIZON_FSM_BASE}/job-events` : '';
 })();
 
+// ─── Graph service (svc-graph) ─────────────────────────────────────────────
+
+/** svc-graph base URL — org goal/project graph + KTAP fleet, both served from here. */
+export const GRAPH_SERVICE_URL = typeof process !== 'undefined' ? (process.env.GRAPH_SERVICE_URL || 'http://graph-svc:8002') : 'http://graph-svc:8002';
+
+/** Shared secret for svc-graph's X-Graph-Secret auth header. */
+export const GRAPH_SECRET = typeof process !== 'undefined' ? (process.env.GRAPH_SECRET || '') : '';
+
 // ─── Agent Backend ─────────────────────────────────────────────────────────
 
 /** Which agent backend to use for skill invocation */
