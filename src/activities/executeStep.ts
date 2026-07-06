@@ -277,7 +277,16 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
       return { success: false, outputPath: stateOutputPath || outputPath || undefined, error };
     }
     emitEvent(parentRunId, 'heartbeat', { stepNumber: step.number, skill: step.skill, status: 'command_running', iteration, command: command.slice(0, 300), outputPath: stateOutputPath || outputPath || undefined });
-    const env: NodeJS.ProcessEnv = { ...process.env };
+    // Give deterministic `run: command` steps the caller's GitHub token too
+    // (LLM steps already receive it via invokeSkill), so command-mode plumbing
+    // like p-cpo19's plumb_deploy.py can use `gh`/git without the worker pod
+    // being gh-authenticated.
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...(githubToken
+        ? { GH_TOKEN: githubToken, GITHUB_TOKEN: githubToken, GITHUB_PERSONAL_ACCESS_TOKEN: githubToken }
+        : {}),
+    };
     for (const [key, value] of Object.entries(templateVars || {})) {
       if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) env[key] = String(value);
     }
