@@ -343,11 +343,18 @@ function parseFrontmatterDictSop(
       const tneEngineMaxIterations = readLeafMaxIterations(skillName, skillsRoot, 3);
 
       const run = typeof s?.run === 'string' ? s.run : '';
+      const output = typeof s?.output === 'string' ? s.output : '';
+      // A step whose declared output is a machine-readable data file
+      // (blueprint.json, *.yaml, …) produces data, not prose — it's validated
+      // structurally downstream (e.g. the app-foundry blueprint is strictly
+      // validated by p-cpo11), never as a document. Treated like a command
+      // step below: no content gates.
+      const machineDataOutput = /\.(json|ya?ml|ndjson|jsonl|csv|tsv)$/i.test(output);
       return {
         number: String(i + 1),
         skill: skillName,
         inputs,
-        output: typeof s?.output === 'string' ? s.output : '',
+        output,
         verify: '',
         run,
         notes:
@@ -362,14 +369,23 @@ function parseFrontmatterDictSop(
         dependsOn,
         phaseGate: Array.isArray(s?.phase_gate) ? s.phase_gate.map(String) : [],
         backpropSkill: '',
-        // A `run: command` step is deterministic: its gate is the command's
-        // exit code (executeStep fails the step on a non-zero exit, before the
-        // gate cascade). The LLM content judges (gates 2-4) can't meaningfully
-        // evaluate a command's output — often a dir/artifact, e.g. p-cpo19's
-        // `apps` — and on an edge pod, where the gate evaluator's Claude auth
-        // isn't wired, they throw `infrastructure` and false-fail a step whose
-        // work actually succeeded. So command steps carry no content gates.
-        failFast: { maxRetries: 3, gates: run === 'command' ? [] : [1, 2, 3, 4] },
+        // The LLM content judges (gates 2-4) evaluate *prose* deliverables.
+        // Two kinds of step produce output they can't meaningfully judge — and
+        // will false-fail:
+        //   1. `run: command` — deterministic; its real gate is the exit code
+        //      (executeStep fails the step on a non-zero exit before the
+        //      cascade). Its output is often a dir/artifact (e.g. p-cpo19's
+        //      `apps`), and on an edge pod, where the gate evaluator's Claude
+        //      auth isn't wired, the judges throw `infrastructure` and false-
+        //      fail a step whose work actually succeeded.
+        //   2. a machine-data output (blueprint.json, *.yaml, …) — data, not a
+        //      document; validated structurally downstream. The app-foundry
+        //      blueprint subagent (p-cpo16 → blueprint.json) looped forever
+        //      because gates 2-4 read its JSON as an "incomplete document",
+        //      failed it, and the executeStep retry loop re-invoked p-cpo16
+        //      with the judge's complaint as revision feedback.
+        // Both carry no content gates; downstream validators own correctness.
+        failFast: { maxRetries: 3, gates: run === 'command' || machineDataOutput ? [] : [1, 2, 3, 4] },
         permissionMode: 'acceptEdits',
         model: '',
         timeout: stepTimeout,

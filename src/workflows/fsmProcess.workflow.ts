@@ -356,7 +356,12 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
     // `tne-engine: true` frontmatter, surfaced as Step.tneEngine by the
     // parser. Skip when this is itself a subagent step — those are
     // already nested orchestrators and python treats them separately.
-    if (step.tneEngine && step.skill && step.skill !== 'inline') {
+    // (The `step.run !== 'subagent'` guard was documented above but missing
+    // from the condition: the app-foundry blueprint step is `run: subagent`
+    // AND its leaf p-cpo16 declares `tne-engine: true`, so it was wrongly
+    // dispatched as a nested child FsmProcessWorkflow — compounding the
+    // blueprint re-evaluation loop — instead of a scoped subagent turn.)
+    if (step.tneEngine && step.skill && step.skill !== 'inline' && step.run !== 'subagent') {
       const wfRun = workflowInfo().runId;
       const childWorkflowId = `${wfRun.slice(0, 8)}-${step.skill}`;
       const childInput: FsmProcessInput = {

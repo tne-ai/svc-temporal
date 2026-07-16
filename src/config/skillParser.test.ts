@@ -349,6 +349,51 @@ sop_migration: auto
     expect(cfg.generator[2].dependsOn).toEqual(['1', '2']);
   });
 
+  it('dict sop: exempts command + machine-data-output steps from content gates', () => {
+    // Regression for the app-foundry blueprint loop: a `run: subagent` step
+    // whose output is blueprint.json is data, not prose. The LLM content
+    // judges (gates 2-4) read it as an "incomplete document", failed it, and
+    // the executeStep retry loop re-invoked p-cpo16 forever. Machine-data
+    // outputs (and command steps) must carry NO content gates; a subagent step
+    // producing a prose deliverable (.md) keeps the full cascade.
+    const p = writeSkill('p-cpo12-shape', `---
+name: p-cpo12-shape
+process_type: r-coo-sop91-process
+sop:
+  scope: p-cpo12-shape
+  max_iterations: 1
+  phases:
+    generator:
+      steps:
+      - id: blueprint-data-model
+        skill: p-cpo16-blueprint-data-model
+        run: subagent
+        output: TNE-CONTEXT/cpo/app-builds/x/blueprint.json
+      - id: build
+        skill: inline
+        run: command
+        output: TNE-CONTEXT/cpo/app-builds/x/app-build.json
+      - id: write-summary
+        skill: some-writer
+        run: subagent
+        output: TNE-CONTEXT/cpo/app-builds/x/summary.md
+sop_migration: auto
+---
+
+## SOP
+
+<!-- config in sop: frontmatter -->
+`);
+    const cfg = parseSkillFile(p);
+    expect(cfg.generator).toHaveLength(3);
+    // subagent → blueprint.json : machine data, no content gates
+    expect(cfg.generator[0].failFast.gates).toEqual([]);
+    // command : deterministic, no content gates
+    expect(cfg.generator[1].failFast.gates).toEqual([]);
+    // subagent → .md prose deliverable : full content cascade
+    expect(cfg.generator[2].failFast.gates).toEqual([1, 2, 3, 4]);
+  });
+
   it('dict sop: respects `human_gate: true` on preamble', () => {
     // p-debug1-three-words style — single preamble step with a human gate.
     const p = writeSkill('p-debug1-three-words', `---
