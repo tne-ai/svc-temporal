@@ -413,7 +413,15 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
       const perStepProxy = proxyActivities<typeof activities>({
         startToCloseTimeout: `${step.timeout}s`,
         heartbeatTimeout: STEP_HEARTBEAT_TIMEOUT,
-        retry: STEP_RETRY_POLICY,
+        // BOUNDED retry (not the default unbounded STEP_RETRY_POLICY): a step
+        // author sets an explicit `timeout` to bound the step, so a startToClose
+        // timeout should fail-fast, not retry forever. The unbounded policy here
+        // turned a too-short `timeout` (e.g. the app-foundry blueprint's old
+        // 120s) into an infinite ~every-timeout re-invocation loop — the
+        // activity timed out just after writing its output and got re-run
+        // endlessly. Cap at 3 attempts: still absorbs a one-off slow turn, but
+        // a persistently-over-budget step surfaces as a failure instead of a loop.
+        retry: { ...STEP_RETRY_POLICY, maximumAttempts: 3 },
       });
       return perStepProxy.executeStep(stepParams);
     }
