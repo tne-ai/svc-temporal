@@ -845,13 +845,50 @@ function buildStepParams(
   templateVarsOverride?: Record<string, string>,
 ): StepExecutionParams {
   const phase = overridePhase || (stepPhase(step, config) as 'preamble' | 'generator' | 'evaluator' | 'postamble');
-  // Per-user delegate (worker) model override: when the user has configured
-  // a delegate model in Horizon's Settings → Delegate Model, that overrides
-  // the SKILL.md per-step model. Falls back to step.model when the user
-  // hasn't opted in. This is the entire point of delegation — "all my
-  // workers run on X" without editing each skill.
-  const effectiveStep: Step = input.delegateModel
-    ? { ...step, model: input.delegateModel }
+  const effectiveTemplateVars = templateVarsOverride ?? input.templateVars;
+  // Per-step model routing.
+  //
+  // A SKILL.md step may declare its own `model:` — a concrete id, an alias, a
+  // tier key ('opus'/'glm-5.2'/'kimi-k2.6'), or a template var ({{HIGH_MODEL}})
+  // that resolves against the run's templateVars. We resolve+substitute it here
+  // and give it PRECEDENCE over the job-wide delegate/tier model. That is what
+  // makes a genuine per-step A/B possible: e.g. the decompose skill's reference
+  // step runs on {{HIGH_MODEL}} (opus) while its low-tier chain step runs on
+  // {{LOW_MODEL}} (glm-5.2), even though the job's single tier model is sonnet.
+  //
+  // Precedence (highest first):
+  //   1. declared per-step model (SKILL.md `model:` / Model column), resolved
+  //   2. input.delegateModel — per-user "all my workers run on X" override
+  //   3. step.model as-authored (legacy: usually empty → default agent model)
+  //
+  // Backward compatible: a step with no `model:` and no delegateModel is
+  // untouched; a plain delegateModel run still applies to every step that
+  // doesn't declare its own model.
+  //
+  // Substitution is done inline here (a tiny replaceAll loop, matching the
+  // OUTPUT_BASENAME handling above) rather than via the config `templateResolver`
+  // — that module imports `fs` and must not be pulled into the workflow sandbox.
+  // The tier-key ('opus'/'glm-5.2'/'kimi-k2.6') → concrete-model-id mapping is
+  // applied later, on the activity side (invokeSkill → resolveTierModel), where
+  // env lookups are allowed; the workflow only decides WHICH string wins.
+  let perStepModel = '';
+  if (step.model) {
+    let substituted = step.model;
+    for (const [k, v] of Object.entries(effectiveTemplateVars || {})) {
+      if (k === 'ITER') continue;
+      substituted = substituted.replaceAll(`{{${k}}}`, v).replaceAll(`{${k}}`, v);
+    }
+    substituted = substituted.trim();
+    // Only treat as concrete when every template var resolved (no leftover
+    // {{…}} / {…}). An unresolved var means the run didn't supply it — fall
+    // through to the delegate/default rather than sending a literal placeholder.
+    if (substituted && !/\{\{?[A-Za-z0-9_-]+\}?\}/.test(substituted)) {
+      perStepModel = substituted;
+    }
+  }
+  const effectiveModel = perStepModel || input.delegateModel || step.model;
+  const effectiveStep: Step = effectiveModel !== step.model
+    ? { ...step, model: effectiveModel }
     : step;
   return {
     step: effectiveStep,

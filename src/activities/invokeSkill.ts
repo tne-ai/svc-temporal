@@ -68,6 +68,7 @@ import {
 } from '../shared/constants.js';
 import type { AgentBackend, InvocationResult, Step } from '../shared/types.js';
 import { resolveTemplateVars } from '../config/templateResolver.js';
+import { resolveTierModel } from '../config/tierModel.js';
 import { emitEvent, emitJobEvent } from './emitEvent.js';
 import { pushWorkspaceToS3 } from './workspaceSync.js';
 import { fetchUserProviderKey } from '../lib/fetchUserProviderKey.js';
@@ -1226,6 +1227,17 @@ export async function invokeSkill(
   // Orion resolves the user's `User.toolHarness` (auto/pi/claude_sdk) +
   // reasoning provider into a concrete 'pi' | 'claude_sdk' before calling
   // svc-temporal, so by the time we land here it's a hard choice.
+  // Per-step model routing (activity half): the workflow may have set
+  // step.model to a coarse tier key ('opus'/'glm-5.2'/'kimi-k2.6') — map it to
+  // the concrete model id the invocation backends + LiteLLM expect. A no-op for
+  // already-concrete ids / aliases / OpenRouter slugs, so backend selection and
+  // every downstream call see the resolved id.
+  const routedModel = resolveTierModel(step.model) || step.model;
+  if (routedModel && routedModel !== step.model) {
+    step = { ...step, model: routedModel };
+    console.log(`[invokeSkill] per-step model routing: '${step.skill}' tier '${routedModel}'`);
+  }
+
   const harness = context?.toolHarness;
   let backend: AgentBackend;
   if (harness === 'pi') {

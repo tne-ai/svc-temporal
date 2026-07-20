@@ -316,6 +316,44 @@ sop_migration: auto
     expect(cfg.postamble.every(s => s.dependsOn.length === 0)).toBe(true);
   });
 
+  it('dict sop: parses per-step `model:` (tier A/B) into step.model', () => {
+    // A step may declare its own model — a tier key or a template var — so the
+    // engine can run that one step on a different tier than the rest of the
+    // chain (e.g. an opus reference vs a glm low-tier chain). The parser must
+    // surface it on step.model; empty/omitted → '' (inherit the job model).
+    const p = writeSkill('p-tier-ab', `---
+name: p-tier-ab
+process_type: r-coo-sop91-process
+sop:
+  phases:
+    evaluator:
+      steps:
+      - id: reference-output
+        skill: inline
+        description: HIGH-tier reference.
+        model: "{{HIGH_MODEL}}"
+      - id: run-low-tier-chain
+        skill: inline
+        description: LOW-tier chain.
+        model: glm-5.2
+      - id: parity-check
+        skill: e-cko32-persona-evaluator
+        description: Score parity.
+---
+
+# P-TIER-AB
+
+## SOP
+
+<!-- config in sop: frontmatter -->
+`);
+    const cfg = parseSkillFile(p);
+    expect(cfg.evaluator).toHaveLength(3);
+    expect(cfg.evaluator[0].model).toBe('{{HIGH_MODEL}}');
+    expect(cfg.evaluator[1].model).toBe('glm-5.2');
+    expect(cfg.evaluator[2].model).toBe(''); // no model declared → inherit
+  });
+
   it('dict sop: maps `depends_on: [step-id]` to sequential dependsOn numbers', () => {
     const p = writeSkill('p-dict-deps', `---
 name: p-dict-deps
