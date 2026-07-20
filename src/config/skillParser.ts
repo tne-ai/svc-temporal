@@ -344,6 +344,16 @@ function parseFrontmatterDictSop(
 
       const run = typeof s?.run === 'string' ? s.run : '';
       const output = typeof s?.output === 'string' ? s.output : '';
+      // Per-step model override (parity with the markdown-table `Model` column).
+      // A dict-form step may declare `model:` — a concrete model id, an alias, a
+      // tier key ('opus'/'glm-5.2'/'kimi-k2.6'), or a template var
+      // ({{HIGH_MODEL}}) resolved at runtime. Empty → inherit the job model. The
+      // engine gives a declared per-step model precedence over the job-wide
+      // delegate/tier model in buildStepParams — that's how one step (e.g. an
+      // opus reference) runs on a different model than the rest of the chain.
+      const stepModel = typeof s?.model === 'string' && !NO_DEFAULT.has(s.model.trim())
+        ? s.model.trim()
+        : '';
       // A step whose declared output is a machine-readable data file
       // (blueprint.json, *.yaml, …) produces data, not prose — it's validated
       // structurally downstream (e.g. the app-foundry blueprint is strictly
@@ -387,7 +397,7 @@ function parseFrontmatterDictSop(
         // Both carry no content gates; downstream validators own correctness.
         failFast: { maxRetries: 3, gates: run === 'command' || machineDataOutput ? [] : [1, 2, 3, 4] },
         permissionMode: 'acceptEdits',
-        model: '',
+        model: stepModel,
         timeout: stepTimeout,
         tneEngine,
         tneEngineMaxIterations,
