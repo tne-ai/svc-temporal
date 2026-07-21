@@ -403,6 +403,47 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
       }
     }
 
+    // Fallback persistence: the step declared an output file but the agent
+    // returned its result as TEXT instead of calling Write. This is the norm
+    // on the Pi / LiteLLM harness and the subprocess backend — neither has a
+    // Write tool — so any per-step `model:` override that routes to a
+    // non-Anthropic model (e.g. a low-tier `model: glm-5.2` leaf) produces its
+    // answer in `invResult.stdout` and never touches the filesystem. It also
+    // happens on the SDK path when a prompt asks the model to "produce" an
+    // answer rather than to write a file (e.g. an opus reference-output step).
+    // Without this, the captured text is discarded, the declared file is
+    // missing, and the step either fails `output_file_missing` or — on older
+    // engines — was masked as success with no artifact. Downstream read-models
+    // (e.g. the Decompose lifecycle modal, which polls these files by name)
+    // then wait forever. Persist the captured text to the declared path so the
+    // artifact materializes for every backend. Guarded so it only fires when
+    // there is genuinely no file yet and no structured payload already handled
+    // it — steps whose agent DID Write, or that returned structuredOutput, are
+    // untouched.
+    if (
+      outputPathAbs &&
+      invResult.structuredOutput === undefined &&
+      !existsSync(outputPathAbs) &&
+      typeof invResult.stdout === 'string' &&
+      invResult.stdout.trim().length > 0
+    ) {
+      try {
+        mkdirSync(dirname(outputPathAbs), { recursive: true });
+        writeFileSync(outputPathAbs, invResult.stdout.trim() + '\n', 'utf-8');
+        emitEvent(parentRunId, 'heartbeat', {
+          stepNumber: step.number, skill: step.skill,
+          status: 'output_persisted_from_text', iteration,
+          outputPath: outputPath || undefined,
+        });
+      } catch (err: any) {
+        emitEvent(parentRunId, 'step_failed', {
+          stepNumber: step.number, skill: step.skill, iteration,
+          reason: 'output_text_write_failed', error: err?.message,
+        });
+        return { success: false, outputPath: outputPath || undefined, error: `Failed to persist step output text: ${err?.message}` };
+      }
+    }
+
     // Run gate cascade if output file exists
     if (outputPathAbs && existsSync(outputPathAbs)) {
       heartbeat({ step: step.number, skill: step.skill, status: 'gate_check', retry: retries });
