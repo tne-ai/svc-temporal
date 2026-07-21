@@ -20,11 +20,11 @@
  * their LiteLLM model_list without a code change (same env var names orion uses).
  */
 
-export type TierKey = 'opus' | 'glm-5.2' | 'kimi-k2.6';
+export type TierKey = 'opus' | 'glm-5.2' | 'kimi-k2.6' | 'kimi-k3';
 
-/** True when `key` is one of the three routing-table tier keys. */
+/** True when `key` is one of the routing-table tier keys. */
 export function isTierKey(key: string): key is TierKey {
-  return key === 'opus' || key === 'glm-5.2' || key === 'kimi-k2.6';
+  return key === 'opus' || key === 'glm-5.2' || key === 'kimi-k2.6' || key === 'kimi-k3';
 }
 
 /**
@@ -42,6 +42,9 @@ export function resolveTierModel(key: string | undefined): string {
       return process.env.SKILL_MODEL_GLM_MODEL || 'glm-5.2';
     case 'kimi-k2.6':
       return process.env.SKILL_MODEL_KIMI_MODEL || 'kimi-k2.6';
+    case 'kimi-k3':
+      // Newer Kimi flagship; bare model name resolves at the LiteLLM proxy.
+      return process.env.SKILL_MODEL_KIMI3_MODEL || 'kimi-k3';
     default:
       return k;
   }
