@@ -25,7 +25,8 @@
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
-import { parseSkillFile } from '../config/skillParser.js';
+import { ApplicationFailure } from '@temporalio/common';
+import { parseSkillFile, SkillConfigError } from '../config/skillParser.js';
 import type { ProcessConfig } from '../shared/types.js';
 import { FSM_INVOKE_SECRET, HORIZON_FSM_BASE } from '../shared/constants.js';
 
@@ -176,15 +177,30 @@ export async function parseConfig(params: ParseConfigParams): Promise<ParseConfi
       : resolveSkillPathLocal(skillName, workspacePath);
   }
   if (!skillPath) {
-    throw new Error(
+    // Missing skill file is deterministic — non-retryable (see the parse catch
+    // below for the rationale).
+    throw ApplicationFailure.nonRetryable(
       `SKILL.md not found for "${skillName}". ` +
       `Checked Horizon DB, workspace at ${workspacePath}, and tne-plugins. ` +
-      `Set TNE_PLUGINS_PATH env var if the repo is in a non-standard location.`
+      `Set TNE_PLUGINS_PATH env var if the repo is in a non-standard location.`,
+      'SkillConfigError'
     );
   }
 
   console.log(`[parseConfig] Resolved ${skillName} → ${skillPath}`);
-  const config = parseSkillFile(skillPath, variables);
+  let config: ProcessConfig;
+  try {
+    config = parseSkillFile(skillPath, variables);
+  } catch (err) {
+    // A malformed/missing skill definition is deterministic — retrying can't
+    // fix it. Surface it as a NON-RETRYABLE failure so the workflow fails fast
+    // with a clear message instead of the unbounded config retry policy looping
+    // forever (rich's p-cmo-bio1-write-bio spun ~780 attempts over 31h).
+    if (err instanceof SkillConfigError) {
+      throw ApplicationFailure.nonRetryable(err.message, 'SkillConfigError');
+    }
+    throw err;
+  }
   console.log(`[parseConfig] Parsed: scope=${config.scope}, phases: ` +
     `preamble=${config.preamble.length}, generator=${config.generator.length}, ` +
     `evaluator=${config.evaluator.length}, postamble=${config.postamble.length}`);

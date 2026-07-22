@@ -9,7 +9,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { parseSkillFile } from './skillParser.js';
+import { parseSkillFile, SkillConfigError } from './skillParser.js';
 
 let tmpRoot: string;
 
@@ -559,5 +559,20 @@ After.
     const cfg = parseSkillFile(p);
     expect(cfg.scope).toBe('p-ceo2-like');
     expect(cfg.preamble).toHaveLength(1);
+  });
+
+  it('throws a typed SkillConfigError when no usable SOP is present', () => {
+    // A malformed skill (no SOP block, no sop: frontmatter) must throw the
+    // typed error so the parseConfig activity can classify it NON-RETRYABLE.
+    // Regression guard for the infinite-retry loop (rich's p-cmo-bio1-write-bio
+    // spun parseConfig ~780 attempts / 31h on this exact failure).
+    const p = writeSkill('p-no-sop', `---
+name: p-no-sop
+---
+
+# Just prose, no SOP block anywhere.
+`);
+    expect(() => parseSkillFile(p)).toThrow(SkillConfigError);
+    expect(() => parseSkillFile(p)).toThrow(/No usable SOP/);
   });
 });

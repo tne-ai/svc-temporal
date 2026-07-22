@@ -21,6 +21,21 @@ import {
   Step,
 } from '../shared/types.js';
 
+/**
+ * A skill definition is malformed or missing (no parseable SOP, file not found,
+ * etc.). This is a DETERMINISTIC failure — it will never succeed on retry — so
+ * the parseConfig activity rethrows it as a non-retryable `ApplicationFailure`
+ * (type `SkillConfigError`) to fail the workflow fast instead of the unbounded
+ * TRANSIENT_RETRY_POLICY looping forever on a permanently broken skill.
+ * (Observed: a "no usable SOP" SKILL.md spun parseConfig ~780 attempts / 31h.)
+ */
+export class SkillConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SkillConfigError';
+  }
+}
+
 // Built-in variable resolutions (lowest priority)
 const BUILTIN_VARS: Record<string, string> = {
   'TNE-CONTEXT': 'TNE-CONTEXT',
@@ -964,7 +979,7 @@ export function parseSkillFile(
   // because the parser actually accepts ## SOP body blocks, frontmatter
   // sop: strings, dict-form sop: phases, AND inline /r-coo-sop*-process
   // fences. The actual signal is "no SOP candidate had any phases."
-  throw new Error(
+  throw new SkillConfigError(
     `No usable SOP found in ${path}. Expected one of: ` +
     "`## SOP` body block, frontmatter `sop:` string, dict-form " +
     "`sop: { phases: { ... } }`, or a fenced /r-coo-sop*-process block.",
