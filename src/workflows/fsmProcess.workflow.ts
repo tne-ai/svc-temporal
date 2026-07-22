@@ -127,10 +127,13 @@ export async function FsmProcessWorkflow(input: FsmProcessInput): Promise<FsmPro
 
   // Config activity proxy (short timeout — just file reads). Unbounded
   // retry so a transient FS hiccup during plugin sync doesn't kill the
-  // run before it even starts.
+  // run before it even starts — EXCEPT for `SkillConfigError` (a malformed /
+  // missing skill definition), which is deterministic and would otherwise loop
+  // forever. parseConfig throws those as non-retryable ApplicationFailures;
+  // this type list is defense-in-depth so a bad skill fails fast either way.
   const configActivities = proxyActivities<typeof activities>({
     startToCloseTimeout: '30s',
-    retry: TRANSIENT_RETRY_POLICY,
+    retry: { ...TRANSIENT_RETRY_POLICY, nonRetryableErrorTypes: ['SkillConfigError'] },
   });
 
   // Freshness-check proxy — checkFreshness only stats a few files but it
