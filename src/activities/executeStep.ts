@@ -10,6 +10,7 @@ import { heartbeat } from '@temporalio/activity';
 import { execFileSync, spawn } from 'child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'fs';
 import { basename, dirname, isAbsolute, join } from 'path';
+import { resolveRealPath, isCrossProjectAccess, otherProjectDirsAbs } from '../shared/projectContainment.js';
 import { tmpdir } from 'os';
 import type { StepExecutionParams, StepResult } from '../shared/types.js';
 import { invokeSkill, buildPrompt } from './invokeSkill.js';
@@ -247,6 +248,25 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
 
   const cwdRoot = workingDir ? join(workspacePath, workingDir) : workspacePath;
 
+  // Project containment: confine this step's OUTPUT to its own project so a job
+  // for project A cannot write its artifact into a sibling project B — whether
+  // via an absolute `output:` path or a `..` escape. Deps/repos/workspace-root
+  // files stay writable (only OTHER project dirs are off-limits). Fail-open on a
+  // guard error — never break a step; the normal in-project output is unchanged.
+  const { currentProjectDir: _curProj, otherProjectDirs: _otherProj } =
+    otherProjectDirsAbs(workspacePath, workingDir || '', params.projectWorkingDirs || []);
+  const confineOutput = (p: string): string => {
+    if (!p || !_otherProj.length) return p;
+    try {
+      if (isCrossProjectAccess(resolveRealPath(cwdRoot, p), _curProj, _otherProj)) {
+        const clamped = join(cwdRoot, basename(resolveRealPath(cwdRoot, p)));
+        console.warn(`[executeStep] 🚫 cross-project output confined into own project: ${p} -> ${clamped}`);
+        return clamped;
+      }
+    } catch { /* never break a step on a containment-guard error */ }
+    return p;
+  };
+
   if (isCommandStep(step)) {
     try { ensureCommandWorkingDir(workspacePath, workingDir, cwdRoot, commandFromStep(step)); } catch (err: any) {
       const error = `Failed to prepare command working directory '${cwdRoot}': ${err?.message || String(err)}`;
@@ -266,7 +286,7 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
       ? resolveTemplateVars(step.output, templateVars).replace('{{ITER}}', String(iteration || 1))
       : '';
     const outputPathAbs = outputPath
-      ? (isAbsolute(outputPath) ? outputPath : join(cwdRoot, outputPath))
+      ? confineOutput(isAbsolute(outputPath) ? outputPath : join(cwdRoot, outputPath))
       : '';
     const stateOutputPath = outputPath && !isAbsolute(outputPath) && workingDir
       ? join(workingDir, outputPath)
@@ -381,7 +401,7 @@ async function executeStepInner(params: StepExecutionParams): Promise<StepResult
       ? resolveTemplateVars(step.output, templateVars).replace('{{ITER}}', String(iteration || 1))
       : '';
     const outputPathAbs = outputPath
-      ? (isAbsolute(outputPath) ? outputPath : join(cwdRoot, outputPath))
+      ? confineOutput(isAbsolute(outputPath) ? outputPath : join(cwdRoot, outputPath))
       : '';
 
     // Structured Outputs: when the leaf skill declared output_schema_path,

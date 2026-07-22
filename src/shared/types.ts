@@ -177,6 +177,10 @@ export interface FsmProcessInput {
    *  in. S3 pull/push are scoped to this subtree so sibling subdirs stay
    *  untouched. Empty/undefined → cwd is the workspace root. */
   workingDir?: string;
+  /** The user's project working-dirs (from orion). Used to confine this run's
+   *  outputs/tools to its OWN project — a job for project A must not write into
+   *  a sibling project B. See shared/projectContainment. */
+  projectWorkingDirs?: string[];
   /** User ID for audit tracking */
   userId: string;
   /** Whether to auto-approve all review gates */
@@ -281,6 +285,9 @@ export interface StepExecutionParams {
   workspacePath: string;
   /** Relative subdir under `workspacePath` — scopes S3 sync and the agent's cwd. */
   workingDir?: string;
+  /** The user's project working-dirs — confines this step's output/tools to its
+   *  own project (see shared/projectContainment). */
+  projectWorkingDirs?: string[];
   manifestPath?: string;
   /** Pre-computed manifest body (markdown) listing prior completed step
    *  outputs. Embedded inline in the agent prompt as "## Available Inputs"
@@ -430,6 +437,9 @@ export interface JobInput {
   skillName?: string;
   /** Relative subdirectory inside the user workspace; forwarded to FSM. */
   workingDir?: string;
+  /** The user's project working-dirs (from orion dispatch) — forwarded to the
+   *  FSM/step so the worker can confine writes/tools to this job's own project. */
+  projectWorkingDirs?: string[];
   /** Pre-created ProcessRun.id in Horizon — reused as the FSM child runId. */
   processRunId?: string;
   /** Absolute workspace path on the worker — overrides the default
