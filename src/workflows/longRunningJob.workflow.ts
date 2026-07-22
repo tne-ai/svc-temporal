@@ -94,6 +94,7 @@ export async function LongRunningJobWorkflow(input: JobInput): Promise<JobResult
       templateVars: input.templateVars ?? {},
       workspacePath: fsmWorkspacePath,
       workingDir: input.workingDir,
+      projectWorkingDirs: input.projectWorkingDirs,
       userId: input.userId,
       autoApprove: input.autoApprove ?? false,
       s3Bucket: input.s3Bucket,

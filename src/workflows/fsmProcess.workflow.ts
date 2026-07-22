@@ -901,6 +901,7 @@ function buildStepParams(
     humanNotes: state.steps[`${phase}.${step.number}`]?.humanNotes,
     workspacePath: input.workspacePath,
     workingDir: input.workingDir,
+    projectWorkingDirs: input.projectWorkingDirs,
     agentBackend: input.agentBackend,
     toolHarness: input.toolHarness,
     githubToken: input.githubToken,
