@@ -76,6 +76,7 @@ import { fetchUserGitHubToken } from '../lib/fetchUserGitHubToken.js';
 import { ensureSkillsInWorkspace } from './setupSkills.js';
 import { PiAgentSession, isPiAgentEnabled, isLiteLLMProxyEnabled, getLiteLLMBaseURL, normalizeModelForLitellm } from '../services/piAgentAdapter.js';
 import { buildPiTools } from '../services/piAgentTools.js';
+import { emitVelaToolSignal, emitVelaPrompt } from '../services/velaMonitor.js';
 import { loadLeafSkillSchema } from '../config/leafSkillSchema.js';
 import { teeRecord } from './transcript.js';
 
@@ -556,6 +557,10 @@ async function invokeViaHarness(
     let harnessSawAnyTokens = false;
     let harnessSawAnyToolUse = false;
 
+    // VELA: emit the prompt signal for this step so the SOC scores the
+    // instruction layer before any tool fires (parity with orion's chat monitor).
+    emitVelaPrompt(prompt, { sessionId: runId || jobId, agentId: context?.userId });
+
     for await (const event of teeRecord(agent.query(prompt), { runId: context?.parentRunId, phase: (context as any)?.phase, stepNumber: context?.stepNumber, skill: context?.skill, workspaceRoot, model: resolvedModel })) {
       // Agent harness emits various event types — capture text content from assistant messages
       const ev = event as any;
@@ -578,6 +583,10 @@ async function invokeViaHarness(
           } else if (block.type === 'tool_use') {
             emitEvent(runId, 'tool_use', { backend: 'harness', tool: block.name, input: block.input, stepNumber: context?.stepNumber, skill: context?.skill });
             emitJobEvent(jobId, 'tool_use', { backend: 'harness', tool: block.name, input: block.input, toolUseId: block.id });
+            // VELA: emit a security signal for every tool call the job/FSM agent
+            // makes, so central job activity is watched by the SOC exactly like
+            // chat/edge (the fleet gateway re-signs + scores it). Fire-and-forget.
+            emitVelaToolSignal(block.name, block.input, { sessionId: runId || jobId, agentId: context?.userId });
             const file = fileFromToolUse(block.name, block.input);
             if (file) {
               const normalized = normalizeFilePath(file, workspaceRoot, context?.workingDir);
