@@ -189,6 +189,14 @@ export const GRAPH_SERVICE_URL = typeof process !== 'undefined' ? (process.env.G
 /** Shared secret for svc-graph's X-Graph-Secret auth header. */
 export const GRAPH_SECRET = typeof process !== 'undefined' ? (process.env.GRAPH_SECRET || '') : '';
 
+// ─── app-erp ────────────────────────────────────────────────────────────────
+
+/** app-erp base URL — in-cluster DNS once deployed alongside Orion (op-07/op-09). */
+export const ERP_BASE_URL = typeof process !== 'undefined' ? (process.env.ERP_BASE_URL || 'http://app-erp:8000') : 'http://app-erp:8000';
+
+/** Scoped app-erp API key (Authorization: Bearer), NOT the Orion service-account key. */
+export const ERP_API_KEY = typeof process !== 'undefined' ? (process.env.ERP_API_KEY || '') : '';
+
 // ─── Agent Backend ─────────────────────────────────────────────────────────
 
 /** Which agent backend to use for skill invocation */
