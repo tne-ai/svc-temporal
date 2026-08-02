@@ -7,6 +7,7 @@
 
 import { Client, Connection } from '@temporalio/client';
 import { TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE } from './shared/constants.js';
+import { compressionDataConverter } from './shared/compressionCodec.js';
 
 let cachedClient: Client | null = null;
 
@@ -26,6 +27,7 @@ export async function getTemporalClient(): Promise<Client> {
   cachedClient = new Client({
     connection,
     namespace: TEMPORAL_NAMESPACE,
+    dataConverter: compressionDataConverter,
   });
 
   return cachedClient;
