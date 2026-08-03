@@ -921,9 +921,36 @@ async function invokeViaClaudeAgentSDK(
   // `cwd` as localPath unscoped would nest already-present siblings under
   // the subdir on subsequent pulls.
   const stopSync = startPeriodicS3Sync(workspaceRoot, context?.s3Bucket, context?.s3Prefix, context?.parentRunId, context?.workingDir);
+  // Guard against a stalled SDK stream hanging the FSM step — and thus the
+  // whole run — at its phase forever with no error. The in-process query()
+  // (e.g. a direct-to-Anthropic call that stops yielding) has no ceiling on
+  // its own; createClaudeSDKAgent supports an abortController but invokeSkill
+  // never wired one, so a hung compose/generator query left the process_run
+  // stuck at INIT indefinitely (no subprocess, idle CPU, no completion). Abort
+  // if no SDK event arrives within an idle window; each event resets it.
+  // Env-tunable; 0 disables. On abort the query() throws → caught below → step
+  // fails cleanly so the FSM can retry/surface instead of hanging. Declared
+  // outside the try so the catch/finally can clear the timer + tailor the error.
+  const idleMs = Number(process.env.FSM_SDK_IDLE_TIMEOUT_MS ?? 480000); // 8 min
+  const abortController = new AbortController();
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  let abortedForIdle = false;
+  const armIdle = () => {
+    if (!idleMs) return;
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      abortedForIdle = true;
+      console.error(
+        `[invokeViaClaudeAgentSDK] no SDK event for ${idleMs}ms — aborting stalled query (model=${resolvedModel}, run=${context?.parentRunId})`,
+      );
+      try { abortController.abort(); } catch { /* already settled */ }
+    }, idleMs);
+  };
+
   try {
     const agent = createClaudeSDKAgent({
       model: resolvedModel,
+      abortController,
       cwd,
       permissionMode: 'bypassPermissions',
       persistSession: false,
@@ -1062,7 +1089,9 @@ async function invokeViaClaudeAgentSDK(
     const runId = context?.parentRunId;
     const jobId = context?.jobId;
 
+    armIdle(); // start the stall guard before the first (potentially slow) event
     for await (const event of teeRecord(agent.query(prompt), { runId: context?.parentRunId, phase: (context as any)?.phase, stepNumber: context?.stepNumber, skill: context?.skill, workspaceRoot, model: resolvedModel })) {
+      armIdle(); // an event arrived — reset the stall guard
       // Capture text from assistant messages + emit message/tool_use/file_change events
       if (event.type === 'assistant' && event.message?.content) {
         for (const block of event.message.content) {
@@ -1157,16 +1186,22 @@ async function invokeViaClaudeAgentSDK(
       }
     }
 
+    if (idleTimer) clearTimeout(idleTimer);
     return { success: true, stdout, stderr: '', exitCode: 0, structuredOutput };
   } catch (err) {
-    console.error('[invokeViaClaudeAgentSDK] Error:', err);
+    if (idleTimer) clearTimeout(idleTimer);
+    const stderr = abortedForIdle
+      ? `SDK query stalled: no event for ${idleMs}ms (model=${resolvedModel}) — aborted to avoid hanging the run`
+      : String(err);
+    console.error('[invokeViaClaudeAgentSDK] Error:', abortedForIdle ? stderr : err);
     return {
       success: false,
       stdout: '',
-      stderr: String(err),
+      stderr,
       exitCode: 1,
     };
   } finally {
+    if (idleTimer) clearTimeout(idleTimer);
     await stopSync().catch(() => {});
   }
 }
