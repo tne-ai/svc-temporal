@@ -781,8 +781,30 @@ export function buildPiTools(workspaceRoot: string, opts: BuildPiToolsOptions = 
     },
   };
 
+  const ErpCallConnectorParams = Type.Object({
+    slug:      Type.String({ description: 'Connector slug (e.g. "square-payments", or a generic agent-registered connector) — check GET /api/connectors for what exists' }),
+    operation: Type.String({ description: 'One of the connector\'s declared read operations, e.g. "list_customers" — check the connector\'s spec if unsure' }),
+    params:    Type.Optional(Type.Record(Type.String(), Type.String(), { description: 'Path/query params the operation needs, e.g. {"username": "octocat"} for a path template like /users/{username}/repos' })),
+    limit:     Type.Optional(Type.Number({ description: 'Cap on records returned (default 25) — keep this small; you decide what to do with each record, so pulling hundreds at once just floods your own context' })),
+  });
+  const ErpCallConnector: AgentTool<typeof ErpCallConnectorParams> = {
+    name: 'erp_call_connector',
+    label: 'Pull raw connector data (mediated, read-only)',
+    description:
+      'Fetch RAW records from an external connector (Square, GitHub, or any agent-registered one) — no automatic mapping, no automatic write. Unlike POST /{name}/sync (which writes through a fixed field-mapping interpreter), this hands YOU the raw records so you can reason about each one and decide what to do: erp_invoke_agent to delegate to the entity agent that actually owns the target data (preferred — respects that agent\'s own business logic), erp_create_entity/erp_update_entity for a direct write you\'re confident about, or just report back what you found. Credentials are resolved entirely server-side — you never see them.',
+    parameters: ErpCallConnectorParams,
+    execute: async (_toolCallId, p: Static<typeof ErpCallConnectorParams>) => {
+      const res = await fetch(`${ERP_BASE_URL}/api/connectors/${p.slug}/call`, {
+        method: 'POST', headers: erpHeaders(),
+        body: JSON.stringify({ operation: p.operation, params: p.params ?? {}, limit: p.limit ?? 25 }),
+      });
+      return erpResult(res);
+    },
+  };
+
   return [
     Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch, TodoWrite, GraphTraverse, GraphQuery,
     ErpGetEntities, ErpGetEntity, ErpCreateEntity, ErpUpdateEntity, ErpGetSchema, ErpInvokeAgent, ErpFetchUrl,
+    ErpCallConnector,
   ];
 }
