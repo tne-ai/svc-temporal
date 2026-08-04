@@ -743,6 +743,20 @@ export function buildPiTools(workspaceRoot: string, opts: BuildPiToolsOptions = 
     },
   };
 
+  const ErpGetRulesParams = Type.Object({
+    entity: Type.String({ description: 'Which domain\'s business rules to fetch, e.g. "compliance" — matches a SKILL.md\'s own domain, not necessarily a table name' }),
+  });
+  const ErpGetRules: AgentTool<typeof ErpGetRulesParams> = {
+    name: 'erp_get_rules',
+    label: 'app-erp business rules',
+    description: 'Fetch this org\'s real business rules for a domain (compliance thresholds, formats, tolerances) — merges the industry baseline with any org-specific overrides. Check this instead of relying on hardcoded numbers in your own skill prompt; org overrides only take effect if you fetch fresh each time.',
+    parameters: ErpGetRulesParams,
+    execute: async (_toolCallId, p: Static<typeof ErpGetRulesParams>) => {
+      const res = await fetch(`${ERP_BASE_URL}/api/config/rules?entity=${encodeURIComponent(p.entity)}`, { headers: erpHeaders() });
+      return erpResult(res);
+    },
+  };
+
   const ErpInvokeAgentParams = Type.Object({
     skill:  Type.String({ description: 'Target entity agent\'s skill name, e.g. "rga-member"' }),
     prompt: Type.String({ description: 'Free-text instruction — the receiving agent decides which of its own intents this maps to' }),
@@ -804,7 +818,7 @@ export function buildPiTools(workspaceRoot: string, opts: BuildPiToolsOptions = 
 
   return [
     Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch, TodoWrite, GraphTraverse, GraphQuery,
-    ErpGetEntities, ErpGetEntity, ErpCreateEntity, ErpUpdateEntity, ErpGetSchema, ErpInvokeAgent, ErpFetchUrl,
+    ErpGetEntities, ErpGetEntity, ErpCreateEntity, ErpUpdateEntity, ErpGetSchema, ErpGetRules, ErpInvokeAgent, ErpFetchUrl,
     ErpCallConnector,
   ];
 }
