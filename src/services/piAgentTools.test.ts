@@ -114,7 +114,7 @@ describe('piAgentTools app-erp tools', () => {
   // ERP_BASE_URL/ERP_API_KEY (shared/constants.ts) are read once at module
   // import time, same as GRAPH_SERVICE_URL/GRAPH_SECRET — stubEnv in a
   // beforeEach here would have no effect on the already-evaluated constant,
-  // so these tests assert against the real default ('http://app-erp:8000',
+  // so these tests assert against the real default ('http://app-erp:80',
   // no key) rather than pretending to override it.
   const tools = buildPiTools('/tmp/workspace');
   const byName = (name: string) => tools.find((t) => t.name === name)!;
@@ -132,7 +132,7 @@ describe('piAgentTools app-erp tools', () => {
     } as any, new AbortController().signal);
 
     const [url, opts] = fetchMock.mock.calls[0];
-    expect(String(url)).toContain('http://app-erp:8000/api/entities/member?');
+    expect(String(url)).toContain('http://app-erp:80/api/entities/member?');
     expect(String(url)).toContain('limit=10');
     expect(String(url)).toContain(encodeURIComponent(JSON.stringify({ current_status: 'active' })));
     expect((opts.headers as Record<string, string>)['Authorization']).toBeUndefined(); // no ERP_API_KEY in test env
@@ -149,7 +149,7 @@ describe('piAgentTools app-erp tools', () => {
     } as any, new AbortController().signal);
 
     const [url, opts] = fetchMock.mock.calls[0];
-    expect(String(url)).toBe('http://app-erp:8000/api/entities/member');
+    expect(String(url)).toBe('http://app-erp:80/api/entities/member');
     expect(opts.method).toBe('POST');
     expect(JSON.parse(opts.body as string)).toEqual({ source: 'rga-member', source_ref: undefined, fields: { full_name: 'Test' } });
     expect(result.details).toEqual({ ok: false, status: 400 });
@@ -161,9 +161,9 @@ describe('piAgentTools app-erp tools', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     await byName('erp_get_schema').execute('call-3', { table: 'rga_members' } as any, new AbortController().signal);
-    expect(String(fetchMock.mock.calls[0][0])).toBe('http://app-erp:8000/api/db/schema/rga_members');
+    expect(String(fetchMock.mock.calls[0][0])).toBe('http://app-erp:80/api/db/schema/rga_members');
 
     await byName('erp_get_schema').execute('call-4', {} as any, new AbortController().signal);
-    expect(String(fetchMock.mock.calls[1][0])).toBe('http://app-erp:8000/api/db/schema');
+    expect(String(fetchMock.mock.calls[1][0])).toBe('http://app-erp:80/api/db/schema');
   });
 });
