@@ -34,3 +34,29 @@ describe('answerFromEvents', () => {
     expect(answerFromEvents(accumulated, 'ignored')).toBe('one\n\ntwo');
   });
 });
+
+describe('applied more than once, as the event loop does', () => {
+  it('is idempotent: a second result event cannot displace the first', () => {
+    // The Claude SDK path calls this inside the loop, so it can run again if a
+    // second `result` arrives. The old code assigned unconditionally, so the
+    // LAST summary won; now the first non-empty answer stands.
+    let answer = '';
+    answer = answerFromEvents(answer, 'first summary');
+    answer = answerFromEvents(answer, 'second summary');
+    expect(answer).toBe('first summary');
+  });
+
+  it('never lets a summary displace accumulated blocks, however many arrive', () => {
+    let answer = 'accumulated blocks';
+    answer = answerFromEvents(answer, 'summary A');
+    answer = answerFromEvents(answer, 'summary B');
+    expect(answer).toBe('accumulated blocks');
+  });
+
+  it('still takes a summary if the first result carried nothing', () => {
+    let answer = '';
+    answer = answerFromEvents(answer, undefined);
+    answer = answerFromEvents(answer, 'the real summary');
+    expect(answer).toBe('the real summary');
+  });
+});
