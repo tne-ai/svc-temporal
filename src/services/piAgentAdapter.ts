@@ -94,7 +94,50 @@ export type HarnessEvent =
   | { type: 'assistant'; message: { content: Array<{ type: 'text'; text: string } | { type: 'tool_use'; id: string; name: string; input: any }> } }
   | { type: 'tool_result'; result: { tool_use_id: string; tool_name: string; output: string; is_error?: boolean } }
   | { type: 'partial_message'; delta: { text: string } }
-  | { type: 'result'; subtype?: string; is_error?: boolean; num_turns?: number };
+  | { type: 'result'; subtype?: string; is_error?: boolean; num_turns?: number; usage?: PiUsageTotals };
+
+/**
+ * Pi's token counts (`@mariozechner/pi-ai` `Usage`) — a third spelling next to
+ * Anthropic's `input_tokens` and OpenAI's `prompt_tokens`. `normalizeUsage` in
+ * invokeSkill.ts is what turns it into orion's canonical payload.
+ */
+export interface PiUsageTotals {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null;
+
+const tokenCount = (usage: Record<string, unknown>, key: string): number => {
+  const value = usage[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+};
+
+/**
+ * Total the usage Pi reports per API call across a finished run.
+ *
+ * Returns null when no message carried a usage object at all, which is not the
+ * same as a run that used zero tokens: the first must leave orion's cost unset
+ * so it can be seen as unmeasured, the second is a real measurement of zero.
+ */
+export function sumAssistantUsage(messages: unknown): PiUsageTotals | null {
+  const usages = Array.isArray(messages)
+    ? messages.filter(isRecord).filter((m) => m.role === 'assistant').map((m) => m.usage).filter(isRecord)
+    : [];
+  if (usages.length === 0) return null;
+  return usages.reduce<PiUsageTotals>(
+    (total, usage) => ({
+      input: total.input + tokenCount(usage, 'input'),
+      output: total.output + tokenCount(usage, 'output'),
+      cacheRead: total.cacheRead + tokenCount(usage, 'cacheRead'),
+      cacheWrite: total.cacheWrite + tokenCount(usage, 'cacheWrite'),
+    }),
+    { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  );
+}
 
 /**
  * Build a Pi Model object from our flat options. Pi expects a fully-formed
@@ -232,6 +275,9 @@ function translatePiEvent(event: AgentEvent): HarnessEvent[] {
       // assistant content so the consumer's stdout / SSE stream gets
       // the actual reason instead of zero tokens + "silent failure".
       const messages: any[] = Array.isArray((event as any).messages) ? (event as any).messages : [];
+      // A run that failed still burned tokens, so usage rides on both results.
+      const usage = sumAssistantUsage(messages);
+      const withUsage = usage ? { usage } : {};
       const failureMsg = messages.find((m) => typeof m?.errorMessage === 'string' && m.errorMessage.length > 0);
       if (failureMsg) {
         const detail = String(failureMsg.errorMessage);
@@ -245,10 +291,10 @@ function translatePiEvent(event: AgentEvent): HarnessEvent[] {
           // `(ev as any).error || .message || .subtype` extraction
           // surfaces the real cause in `harnessError` instead of just
           // the literal string "error".
-          { type: 'result', subtype: 'error', is_error: true, error: detail } as any,
+          { type: 'result', subtype: 'error', is_error: true, error: detail, ...withUsage } as any,
         ];
       }
-      return [{ type: 'result' }];
+      return [{ type: 'result', ...withUsage }];
     }
     default:
       return [];

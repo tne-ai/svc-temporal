@@ -13,43 +13,6 @@
  * instead — same external surface, no harness dependency.
  */
 
-/**
- * Pull token counts out of a usage object regardless of shape. Anthropic
- * emits `input_tokens` / `output_tokens` + cache-aware fields; OpenAI-
- * compatible providers (OpenRouter, DeepSeek, Kimi, etc.) emit
- * `prompt_tokens` / `completion_tokens` with no cache breakdown.
- *
- * Returns the same shape orion's jobService.applyTokenUpdate /
- * fsmService.applyTokenUpdate expect (camelCase). When the input usage
- * has neither key, returns null — the caller skips the emit.
- */
-function normalizeUsage(usage: any): {
-  inputTokens: number;
-  outputTokens: number;
-  cacheCreationInputTokens?: number;
-  cacheReadInputTokens?: number;
-} | null {
-  if (!usage || typeof usage !== 'object') return null;
-  // Anthropic shape first — when both shapes are present (some routers
-  // pass through both) we prefer Anthropic because it carries cache info.
-  if (typeof usage.input_tokens === 'number' || typeof usage.output_tokens === 'number') {
-    return {
-      inputTokens: usage.input_tokens ?? 0,
-      outputTokens: usage.output_tokens ?? 0,
-      cacheCreationInputTokens: usage.cache_creation_input_tokens,
-      cacheReadInputTokens: usage.cache_read_input_tokens,
-    };
-  }
-  // OpenAI / OpenRouter shape.
-  if (typeof usage.prompt_tokens === 'number' || typeof usage.completion_tokens === 'number') {
-    return {
-      inputTokens: usage.prompt_tokens ?? 0,
-      outputTokens: usage.completion_tokens ?? 0,
-    };
-  }
-  return null;
-}
-
 import { spawn } from 'child_process';
 import { existsSync, mkdirSync } from 'fs';
 import { isAbsolute, join, relative } from 'path';
@@ -70,6 +33,7 @@ import type { AgentBackend, InvocationResult, Step } from '../shared/types.js';
 import { resolveTemplateVars } from '../config/templateResolver.js';
 import { resolveTierModel } from '../config/tierModel.js';
 import { emitEvent, emitJobEvent } from './emitEvent.js';
+import { normalizeUsage } from './normalizeUsage.js';
 import { pushWorkspaceToS3 } from './workspaceSync.js';
 import { fetchUserProviderKey } from '../lib/fetchUserProviderKey.js';
 import { fetchUserGitHubToken } from '../lib/fetchUserGitHubToken.js';
