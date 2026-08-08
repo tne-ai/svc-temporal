@@ -773,7 +773,7 @@ function buildNestedFsmHooks(
               const headers: Record<string, string> = {
                 'Content-Type': 'application/json',
               };
-              if (FSM_INVOKE_SECRET) headers['x-fsm-secret'] = FSM_INVOKE_SECRET;
+              headers['x-fsm-secret'] = FSM_INVOKE_SECRET;
 
               const response = await fetch(HORIZON_FSM_START_URL, {
                 method: 'POST',

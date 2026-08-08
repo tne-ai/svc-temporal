@@ -128,8 +128,26 @@ export const DEFAULT_SUPPORT_MODEL = 'claude-haiku-4-5-20251001';
 /** Horizon API URL for skill invocation (if set, use HTTP POST instead of claude -p) */
 export const FSM_INVOKE_URL = typeof process !== 'undefined' ? (process.env.FSM_INVOKE_URL || '') : '';
 
-/** Secret for Horizon API authentication */
-export const FSM_INVOKE_SECRET = typeof process !== 'undefined' ? (process.env.FSM_INVOKE_SECRET || '') : '';
+/**
+ * The shared secret Horizon checks on every event we post.
+ *
+ * The default is not a nicety, it is the other half of a contract: orion's
+ * fsmInvoke route falls back to this exact string, so a default of `''` here
+ * meant the client sent nothing to a server that expected something. Horizon
+ * answered 401 and `emitJobEvent` posted fire-and-forget without looking, so
+ * every job event — token_update included — was thrown away in silence, and a
+ * benchmark run recorded a working model as zero tokens and zero cost.
+ *
+ * Both sides must name the same string or neither should have a default. They
+ * name the same one. Production sets FSM_INVOKE_SECRET on both and this is
+ * never used; if only one side is configured, #228's warning now says so.
+ */
+export const HORIZON_DEV_SHARED_SECRET = 'fsm-internal-horizon-dev';
+
+export const FSM_INVOKE_SECRET =
+  typeof process !== 'undefined'
+    ? (process.env.FSM_INVOKE_SECRET || HORIZON_DEV_SHARED_SECRET)
+    : HORIZON_DEV_SHARED_SECRET;
 
 /**
  * Base URL for Horizon's /api/fsm-invoke endpoints. Set this once and
