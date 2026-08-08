@@ -33,8 +33,23 @@ describe('appendTextBlock', () => {
     expect(appendTextBlock('one\n\n', 'two')).toBe('one\n\ntwo');
   });
 
-  it('does not add one when the next block starts with whitespace', () => {
+  it('does not add one when the next block starts with a newline', () => {
     expect(appendTextBlock('one', '\ntwo')).toBe('one\ntwo');
+  });
+
+  it('still separates when the boundary is only a space', () => {
+    // A space does not end a line, and the line is what the scorer reads. The
+    // first version of this treated a trailing space as already separated, and
+    // the next run produced "…the home of Banking & litigation".
+    expect(appendTextBlock('the home of Banking & ', 'litigation')).toBe('the home of Banking & \n\nlitigation');
+  });
+
+  it('puts the answer on its own line even after a trailing space', () => {
+    expect(appendTextBlock('…Banking & ', 'litigation').split('\n').pop()).toBe('litigation');
+  });
+
+  it('still separates after a tab, for the same reason', () => {
+    expect(appendTextBlock('x\t', 'y')).toBe('x\t\n\ny');
   });
 
   it('keeps the blocks in the order they arrived', () => {

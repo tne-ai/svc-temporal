@@ -17,13 +17,22 @@ const BLOCK_SEPARATOR = '\n\n';
 /**
  * Append a text block to what has been collected so far.
  *
- * Adds a separator only when there is something to separate and the boundary is
- * not already whitespace — so a model that ends its own block with a newline is
- * not given a third one, and the first block is not preceded by blank lines.
+ * The boundary has to be a NEWLINE, not merely whitespace. A first attempt at
+ * this treated any trailing space as "already separated", and the next run
+ * produced
+ *
+ *   "New York City is indisputably the home of Banking & " + "litigation"
+ *   → "…the home of Banking & litigation"
+ *
+ * — one line again, scored again against the wrong text. A space does not end a
+ * line, and the line is what every scorer reads.
+ *
+ * A block that already ends with a newline is not given a second one, so a model
+ * that formats its own paragraphs keeps its formatting.
  */
 export function appendTextBlock(collected: string, block: string): string {
   if (!block) return collected;
   if (!collected) return block;
-  const boundaryIsBlank = /\s$/.test(collected) || /^\s/.test(block);
-  return boundaryIsBlank ? collected + block : collected + BLOCK_SEPARATOR + block;
+  const alreadyOnItsOwnLine = collected.endsWith('\n') || block.startsWith('\n');
+  return alreadyOnItsOwnLine ? collected + block : collected + BLOCK_SEPARATOR + block;
 }
