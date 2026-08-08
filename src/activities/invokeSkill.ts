@@ -32,6 +32,8 @@ import {
 import type { AgentBackend, InvocationResult, Step } from '../shared/types.js';
 import { resolveTemplateVars } from '../config/templateResolver.js';
 import { resolveTierModel } from '../config/tierModel.js';
+import { answerFromEvents } from './answerFromEvents.js';
+import { appendTextBlock } from './appendTextBlock.js';
 import { emitEvent, emitJobEvent } from './emitEvent.js';
 import { normalizeUsage } from './normalizeUsage.js';
 import { pushWorkspaceToS3 } from './workspaceSync.js';
@@ -540,7 +542,7 @@ async function invokeViaHarness(
             if (t.trim().length > 40 && prompt.includes(t.trim())) {
               continue;
             }
-            stdout += block.text;
+            stdout = appendTextBlock(stdout, block.text);
             const text = previewText(block.text);
             emitEvent(runId, 'message', { backend: 'harness', text, stepNumber: context?.stepNumber, skill: context?.skill });
             emitJobEvent(jobId, 'message', { backend: 'harness', text });
@@ -696,7 +698,7 @@ async function invokeViaHarness(
     // Prefer the streamed assistant text; fall back to the result event's text
     // only when nothing streamed. Strip an echoed prompt prefix so the job
     // output is just the model's answer (some adapters return prompt+answer).
-    let finalOut = stdout.trim() ? stdout : resultText;
+    let finalOut = answerFromEvents(stdout, resultText);
     if (prompt && finalOut.startsWith(prompt)) {
       finalOut = finalOut.slice(prompt.length).replace(/^\s+/, '');
     }
@@ -1060,7 +1062,7 @@ async function invokeViaClaudeAgentSDK(
       if (event.type === 'assistant' && event.message?.content) {
         for (const block of event.message.content) {
           if (block.type === 'text') {
-            stdout += block.text;
+            stdout = appendTextBlock(stdout, block.text);
             const text = previewText(block.text);
             emitEvent(runId, 'message', { backend: 'claude-agent-sdk', text, stepNumber: context?.stepNumber, skill: context?.skill });
             emitJobEvent(jobId, 'message', { backend: 'claude-agent-sdk', text });
@@ -1094,7 +1096,10 @@ async function invokeViaClaudeAgentSDK(
 
       // Capture final result
       if (event.type === 'result') {
-        if (event.result) stdout = event.result;
+        // Accumulated blocks win; the SDK's own `result` is the fallback. It
+        // used to overwrite, which replaced text separated so two blocks cannot
+        // weld into one line with the SDK's unseparated concatenation.
+        stdout = answerFromEvents(stdout, event.result);
         if (event.subtype === 'success' && (event as any).structured_output !== undefined) {
           structuredOutput = (event as any).structured_output;
         }
