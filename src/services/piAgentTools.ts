@@ -23,7 +23,7 @@ import path from 'path';
 import { glob } from 'glob';
 import { Type, type Static } from 'typebox';
 import type { AgentTool } from '@mariozechner/pi-agent-core';
-import { GRAPH_SERVICE_URL, GRAPH_SECRET } from '../shared/constants.js';
+import { GRAPH_SERVICE_URL, GRAPH_SECRET, ERP_BASE_URL, ERP_API_KEY } from '../shared/constants.js';
 
 /**
  * Minimal Tavily search — orion has a richer wrapper inside its
@@ -579,5 +579,246 @@ export function buildPiTools(workspaceRoot: string, opts: BuildPiToolsOptions = 
     },
   };
 
-  return [Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch, TodoWrite, GraphTraverse];
+  // graph_query — raw Cypher, no config anywhere. The agent supplies the
+  // query directly (same as app-erp's own POST /api/graph/query, which
+  // agent-manual.md already documents as the primary way LOCAL skills read
+  // the graph today — graph_traverse's named-slug indirection is the
+  // exception, not the norm). Mirrors activities/graphQuery.ts's shape
+  // (fleet/orgId/cypher/params) but exposed as an LLM-callable tool rather
+  // than workflow-only. Calls graph-svc directly — same GRAPH_SERVICE_URL/
+  // GRAPH_SECRET trust boundary graph_traverse and graphQuery.ts already
+  // have in this deployed environment.
+  const GraphQueryParams = Type.Object({
+    fleet:   Type.String({ description: 'Fleet slug, e.g. "appfolio" or "regen-ag"' }),
+    org_id:  Type.String({ description: 'Organisation ID' }),
+    cypher:  Type.String({ description: 'Cypher query to run against the graph' }),
+    params:  Type.Record(Type.String(), Type.String(), { description: 'Parameter bindings for the Cypher query' }),
+  });
+
+  const GraphQuery: AgentTool<typeof GraphQueryParams> = {
+    name: 'graph_query',
+    label: 'Graph query',
+    description:
+      'Run a raw Cypher query against the knowledge graph for an ERP fleet/org. ' +
+      'Use this for anything graph_traverse\'s small set of pre-named traversals ' +
+      'doesn\'t cover — write the Cypher yourself against the fleet\'s node/edge types.',
+    parameters: GraphQueryParams,
+    execute: async (_toolCallId, p: Static<typeof GraphQueryParams>) => {
+      try {
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (GRAPH_SECRET) headers['x-graph-secret'] = GRAPH_SECRET;
+
+        const res = await fetch(`${GRAPH_SERVICE_URL}/graph/${p.fleet}/${p.org_id}/query`, {
+          method: 'POST', headers,
+          body: JSON.stringify({ cypher: p.cypher, params: p.params }),
+        });
+        if (!res.ok) {
+          const err = await res.text();
+          return { content: [{ type: 'text', text: `graph_query error: ${err}` }], details: { count: 0 } };
+        }
+        const data = await res.json() as { rows: unknown[] };
+        const text = JSON.stringify(data.rows, null, 2);
+        return { content: [{ type: 'text', text }], details: { count: data.rows.length } };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: 'text', text: `graph_query unavailable: ${msg}` }], details: { count: 0 } };
+      }
+    },
+  };
+
+  // ── app-erp tools ──────────────────────────────────────────────────────
+  // Mirror app-erp's own already-documented HTTP contract (docs/agent-manual.md
+  // in the app-erp repo) instead of inventing bespoke per-action names —
+  // one generic entity CRUD pattern covers nearly every SKILL.md today.
+  // Every write requires `source` (app-erp rejects writes without it — no
+  // way to bypass provenance tracking through this route either).
+
+  const erpHeaders = (): Record<string, string> => {
+    const h: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (ERP_API_KEY) h['Authorization'] = `Bearer ${ERP_API_KEY}`;
+    return h;
+  };
+
+  const erpResult = async (res: Response) => {
+    const text = await res.text();
+    if (!res.ok) {
+      return { content: [{ type: 'text' as const, text: `app-erp error (${res.status}): ${text}` }], details: { ok: false, status: res.status } };
+    }
+    return { content: [{ type: 'text' as const, text }], details: { ok: true, status: res.status } };
+  };
+
+  const ErpGetEntitiesParams = Type.Object({
+    entity:    Type.String({ description: 'Singular entity name matching the schema exactly, e.g. "member" not "members" — check erp_get_schema if unsure' }),
+    filters:   Type.Optional(Type.Record(Type.String(), Type.String(), { description: 'Equality filters, e.g. {"current_status": "active"}' })),
+    limit:     Type.Optional(Type.Number()),
+    offset:    Type.Optional(Type.Number()),
+    order_by:  Type.Optional(Type.String()),
+    order_dir: Type.Optional(Type.String()),
+  });
+  const ErpGetEntities: AgentTool<typeof ErpGetEntitiesParams> = {
+    name: 'erp_get_entities',
+    label: 'List app-erp entities',
+    description: 'List/filter rows of an app-erp entity (member, product, field, harvest_batch, etc.). Read-only.',
+    parameters: ErpGetEntitiesParams,
+    execute: async (_toolCallId, p: Static<typeof ErpGetEntitiesParams>) => {
+      const params = new URLSearchParams();
+      if (p.limit != null) params.set('limit', String(p.limit));
+      if (p.offset != null) params.set('offset', String(p.offset));
+      if (p.order_by) params.set('order_by', p.order_by);
+      if (p.order_dir) params.set('order_dir', p.order_dir);
+      if (p.filters) params.set('filters', JSON.stringify(p.filters));
+      const res = await fetch(`${ERP_BASE_URL}/api/entities/${p.entity}?${params}`, { headers: erpHeaders() });
+      return erpResult(res);
+    },
+  };
+
+  const ErpGetEntityParams = Type.Object({
+    entity: Type.String({ description: 'Singular entity name, e.g. "member"' }),
+    id:     Type.String({ description: 'Primary key value' }),
+  });
+  const ErpGetEntity: AgentTool<typeof ErpGetEntityParams> = {
+    name: 'erp_get_entity',
+    label: 'Get app-erp entity',
+    description: 'Fetch a single app-erp entity row by id. Read-only.',
+    parameters: ErpGetEntityParams,
+    execute: async (_toolCallId, p: Static<typeof ErpGetEntityParams>) => {
+      const res = await fetch(`${ERP_BASE_URL}/api/entities/${p.entity}/${p.id}`, { headers: erpHeaders() });
+      return erpResult(res);
+    },
+  };
+
+  const ErpCreateEntityParams = Type.Object({
+    entity:     Type.String({ description: 'Singular entity name, e.g. "member"' }),
+    fields:     Type.Record(Type.String(), Type.Unknown(), { description: 'Column values — only columns declared in the entity schema; PK and source_* are server-set' }),
+    source:     Type.String({ description: 'Required — free-text identifier of who/what made this write (your own skill name, or "user")' }),
+    source_ref: Type.Optional(Type.String({ description: 'Optional pointer back to the specific origin (external id, source slug)' })),
+  });
+  const ErpCreateEntity: AgentTool<typeof ErpCreateEntityParams> = {
+    name: 'erp_create_entity',
+    label: 'Create app-erp entity',
+    description: 'Create a new app-erp entity row. WRITE — has a real side effect.',
+    parameters: ErpCreateEntityParams,
+    execute: async (_toolCallId, p: Static<typeof ErpCreateEntityParams>) => {
+      const res = await fetch(`${ERP_BASE_URL}/api/entities/${p.entity}`, {
+        method: 'POST', headers: erpHeaders(),
+        body: JSON.stringify({ source: p.source, source_ref: p.source_ref, fields: p.fields }),
+      });
+      return erpResult(res);
+    },
+  };
+
+  const ErpUpdateEntityParams = Type.Object({
+    entity:     Type.String({ description: 'Singular entity name, e.g. "member"' }),
+    id:         Type.String({ description: 'Primary key value of the row to update' }),
+    fields:     Type.Record(Type.String(), Type.Unknown(), { description: 'Column values to change — only columns declared in the entity schema' }),
+    source:     Type.String({ description: 'Required — free-text identifier of who/what made this write' }),
+    source_ref: Type.Optional(Type.String()),
+  });
+  const ErpUpdateEntity: AgentTool<typeof ErpUpdateEntityParams> = {
+    name: 'erp_update_entity',
+    label: 'Update app-erp entity',
+    description: 'Update an existing app-erp entity row. WRITE — has a real side effect.',
+    parameters: ErpUpdateEntityParams,
+    execute: async (_toolCallId, p: Static<typeof ErpUpdateEntityParams>) => {
+      const res = await fetch(`${ERP_BASE_URL}/api/entities/${p.entity}/${p.id}`, {
+        method: 'PUT', headers: erpHeaders(),
+        body: JSON.stringify({ source: p.source, source_ref: p.source_ref, fields: p.fields }),
+      });
+      return erpResult(res);
+    },
+  };
+
+  const ErpGetSchemaParams = Type.Object({
+    table: Type.Optional(Type.String({ description: 'Specific table name, or omit for the full schema' })),
+  });
+  const ErpGetSchema: AgentTool<typeof ErpGetSchemaParams> = {
+    name: 'erp_get_schema',
+    label: 'app-erp schema',
+    description: 'Discover the live app-erp database schema — every table/column/type, or one table\'s detail. Check before assuming a column does or doesn\'t exist; this is always current, unlike prose docs.',
+    parameters: ErpGetSchemaParams,
+    execute: async (_toolCallId, p: Static<typeof ErpGetSchemaParams>) => {
+      const path = p.table ? `/api/db/schema/${p.table}` : '/api/db/schema';
+      const res = await fetch(`${ERP_BASE_URL}${path}`, { headers: erpHeaders() });
+      return erpResult(res);
+    },
+  };
+
+  const ErpGetRulesParams = Type.Object({
+    entity: Type.String({ description: 'Which domain\'s business rules to fetch, e.g. "compliance" — matches a SKILL.md\'s own domain, not necessarily a table name' }),
+  });
+  const ErpGetRules: AgentTool<typeof ErpGetRulesParams> = {
+    name: 'erp_get_rules',
+    label: 'app-erp business rules',
+    description: 'Fetch this org\'s real business rules for a domain (compliance thresholds, formats, tolerances) — merges the industry baseline with any org-specific overrides. Check this instead of relying on hardcoded numbers in your own skill prompt; org overrides only take effect if you fetch fresh each time.',
+    parameters: ErpGetRulesParams,
+    execute: async (_toolCallId, p: Static<typeof ErpGetRulesParams>) => {
+      const res = await fetch(`${ERP_BASE_URL}/api/config/rules?entity=${encodeURIComponent(p.entity)}`, { headers: erpHeaders() });
+      return erpResult(res);
+    },
+  };
+
+  const ErpInvokeAgentParams = Type.Object({
+    skill:  Type.String({ description: 'Target entity agent\'s skill name, e.g. "rga-member"' }),
+    prompt: Type.String({ description: 'Free-text instruction — the receiving agent decides which of its own intents this maps to' }),
+  });
+  const ErpInvokeAgent: AgentTool<typeof ErpInvokeAgentParams> = {
+    name: 'erp_invoke_agent',
+    label: 'Delegate to app-erp entity agent',
+    description: 'Delegate a request to another app-erp entity agent (cross-domain work) instead of writing to its tables directly — each entity type is owned by one agent.',
+    parameters: ErpInvokeAgentParams,
+    execute: async (_toolCallId, p: Static<typeof ErpInvokeAgentParams>) => {
+      // POST /api/agent returns an SSE stream — collect it into one result
+      // rather than exposing streaming semantics through this tool.
+      const res = await fetch(`${ERP_BASE_URL}/api/agent`, {
+        method: 'POST', headers: erpHeaders(),
+        body: JSON.stringify({ skill: p.skill, prompt: p.prompt }),
+      });
+      return erpResult(res);
+    },
+  };
+
+  const ErpFetchUrlParams = Type.Object({
+    url:         Type.String({ description: 'The external URL to fetch' }),
+    source_slug: Type.String({ description: 'A name for this source, for the pull-log/sources registry' }),
+  });
+  const ErpFetchUrl: AgentTool<typeof ErpFetchUrlParams> = {
+    name: 'erp_fetch_url',
+    label: 'Fetch external URL (mediated)',
+    description: 'Fetch a URL outside app-erp\'s known hosts (a link a user gave you, found in an email/document) through app-erp\'s mediated fetch — blocks internal/private/link-local addresses, enforces a size cap, logs the pull. Use this instead of fetching external URLs directly.',
+    parameters: ErpFetchUrlParams,
+    execute: async (_toolCallId, p: Static<typeof ErpFetchUrlParams>) => {
+      const res = await fetch(`${ERP_BASE_URL}/api/intake/fetch-url`, {
+        method: 'POST', headers: erpHeaders(),
+        body: JSON.stringify({ url: p.url, source_slug: p.source_slug, auth_header: null }),
+      });
+      return erpResult(res);
+    },
+  };
+
+  const ErpCallConnectorParams = Type.Object({
+    slug:      Type.String({ description: 'Connector slug (e.g. "square-payments", or a generic agent-registered connector) — check GET /api/connectors for what exists' }),
+    operation: Type.String({ description: 'One of the connector\'s declared read operations, e.g. "list_customers" — check the connector\'s spec if unsure' }),
+    params:    Type.Optional(Type.Record(Type.String(), Type.String(), { description: 'Path/query params the operation needs, e.g. {"username": "octocat"} for a path template like /users/{username}/repos' })),
+    limit:     Type.Optional(Type.Number({ description: 'Cap on records returned (default 25) — keep this small; you decide what to do with each record, so pulling hundreds at once just floods your own context' })),
+  });
+  const ErpCallConnector: AgentTool<typeof ErpCallConnectorParams> = {
+    name: 'erp_call_connector',
+    label: 'Pull raw connector data (mediated, read-only)',
+    description:
+      'Fetch RAW records from an external connector (Square, GitHub, or any agent-registered one) — no automatic mapping, no automatic write. Unlike POST /{name}/sync (which writes through a fixed field-mapping interpreter), this hands YOU the raw records so you can reason about each one and decide what to do: erp_invoke_agent to delegate to the entity agent that actually owns the target data (preferred — respects that agent\'s own business logic), erp_create_entity/erp_update_entity for a direct write you\'re confident about, or just report back what you found. Credentials are resolved entirely server-side — you never see them.',
+    parameters: ErpCallConnectorParams,
+    execute: async (_toolCallId, p: Static<typeof ErpCallConnectorParams>) => {
+      const res = await fetch(`${ERP_BASE_URL}/api/connectors/${p.slug}/call`, {
+        method: 'POST', headers: erpHeaders(),
+        body: JSON.stringify({ operation: p.operation, params: p.params ?? {}, limit: p.limit ?? 25 }),
+      });
+      return erpResult(res);
+    },
+  };
+
+  return [
+    Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch, TodoWrite, GraphTraverse, GraphQuery,
+    ErpGetEntities, ErpGetEntity, ErpCreateEntity, ErpUpdateEntity, ErpGetSchema, ErpGetRules, ErpInvokeAgent, ErpFetchUrl,
+    ErpCallConnector,
+  ];
 }

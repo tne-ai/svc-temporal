@@ -20,6 +20,7 @@ if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && proces
 
 import { Worker, NativeConnection } from '@temporalio/worker';
 import { TEMPORAL_ADDRESS, TEMPORAL_NAMESPACE, FSM_TASK_QUEUE, JOBS_TASK_QUEUE } from './shared/constants.js';
+import { compressionDataConverter } from './shared/compressionCodec.js';
 
 import * as activities from './activities/index.js';
 
@@ -37,6 +38,7 @@ async function run() {
     taskQueue: FSM_TASK_QUEUE,
     workflowsPath: new URL('./workflows/index.js', import.meta.url).pathname,
     activities,
+    dataConverter: compressionDataConverter,
     maxConcurrentActivityTaskExecutions: 25,
     maxConcurrentWorkflowTaskExecutions: 10,
   });
@@ -48,6 +50,7 @@ async function run() {
     taskQueue: JOBS_TASK_QUEUE,
     workflowsPath: new URL('./workflows/index.js', import.meta.url).pathname,
     activities,
+    dataConverter: compressionDataConverter,
     maxConcurrentActivityTaskExecutions: 2,
     maxConcurrentWorkflowTaskExecutions: 5,
   });
