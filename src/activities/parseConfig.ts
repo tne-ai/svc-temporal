@@ -114,7 +114,7 @@ function resolveSkillPathLocal(
  * though orion knows about the skill.
  */
 async function fetchSkillFromHorizon(skillName: string): Promise<string | null> {
-  if (!HORIZON_FSM_BASE || !FSM_INVOKE_SECRET) return null;
+  if (!HORIZON_FSM_BASE) return null;
   const url = `${HORIZON_FSM_BASE}/skill/${encodeURIComponent(skillName)}`;
   try {
     const response = await fetch(url, {

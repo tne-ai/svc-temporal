@@ -33,7 +33,7 @@ export async function fetchUserProviderKey(
   userId: string,
   provider: 'anthropic' | 'anthropic_oauth' | 'openai' | 'gemini' | 'openrouter',
 ): Promise<string | null> {
-  if (!HORIZON_FSM_BASE || !FSM_INVOKE_SECRET) {
+  if (!HORIZON_FSM_BASE) {
     // No backend wiring — workers running standalone (test envs etc.).
     return null;
   }

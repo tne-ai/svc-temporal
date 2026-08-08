@@ -11,7 +11,7 @@
 import { HORIZON_FSM_BASE, FSM_INVOKE_SECRET } from '../shared/constants.js';
 
 export async function fetchUserGitHubToken(userId: string): Promise<string | null> {
-  if (!HORIZON_FSM_BASE || !FSM_INVOKE_SECRET) return null;
+  if (!HORIZON_FSM_BASE) return null;
 
   const url = `${HORIZON_FSM_BASE}/github-token/${encodeURIComponent(userId)}`;
   try {
