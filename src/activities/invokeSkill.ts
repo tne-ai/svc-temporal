@@ -32,6 +32,7 @@ import {
 import type { AgentBackend, InvocationResult, Step } from '../shared/types.js';
 import { resolveTemplateVars } from '../config/templateResolver.js';
 import { resolveTierModel } from '../config/tierModel.js';
+import { appendTextBlock } from './appendTextBlock.js';
 import { emitEvent, emitJobEvent } from './emitEvent.js';
 import { normalizeUsage } from './normalizeUsage.js';
 import { pushWorkspaceToS3 } from './workspaceSync.js';
@@ -540,7 +541,7 @@ async function invokeViaHarness(
             if (t.trim().length > 40 && prompt.includes(t.trim())) {
               continue;
             }
-            stdout += block.text;
+            stdout = appendTextBlock(stdout, block.text);
             const text = previewText(block.text);
             emitEvent(runId, 'message', { backend: 'harness', text, stepNumber: context?.stepNumber, skill: context?.skill });
             emitJobEvent(jobId, 'message', { backend: 'harness', text });
@@ -1060,7 +1061,7 @@ async function invokeViaClaudeAgentSDK(
       if (event.type === 'assistant' && event.message?.content) {
         for (const block of event.message.content) {
           if (block.type === 'text') {
-            stdout += block.text;
+            stdout = appendTextBlock(stdout, block.text);
             const text = previewText(block.text);
             emitEvent(runId, 'message', { backend: 'claude-agent-sdk', text, stepNumber: context?.stepNumber, skill: context?.skill });
             emitJobEvent(jobId, 'message', { backend: 'claude-agent-sdk', text });
