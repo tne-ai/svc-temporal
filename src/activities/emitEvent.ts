@@ -4,8 +4,9 @@
  * (step transitions, claude messages, tool uses, file changes, gates).
  *
  * URL resolution lives in constants.ts (HORIZON_FSM_EVENTS_URL, derived from
- * HORIZON_API_BASE_URL). If no URL is configured, silently drops events (dev
- * ergonomics — don't crash).
+ * HORIZON_API_BASE_URL). An unconfigured URL still drops events rather than
+ * crashing — dev ergonomics — but says so once, which is the whole subject of
+ * the comment on warnOnce below.
  */
 
 import { HORIZON_FSM_EVENTS_URL, HORIZON_JOB_EVENTS_URL, FSM_INVOKE_SECRET } from '../shared/constants.js';
@@ -35,10 +36,55 @@ export type JobEventType =
  * lines, and the fact worth knowing is "these are not arriving", not how many.
  */
 const warnedOnce = new Set<string>();
-function warnOnce(key: string, message: string, detail?: unknown): void {
+
+/**
+ * Exported for its own test; the dedupe is the behaviour worth pinning.
+ *
+ * Swallows its own failure because two of the callers are outside the outer
+ * try — a `console.warn` that throws on a closed stderr would otherwise make
+ * emission reject, and the contract is that it never fails an activity. A
+ * logger that cannot log is not worth losing a job over.
+ */
+export function warnOnce(key: string, message: string, detail?: unknown): void {
   if (warnedOnce.has(key)) return;
   warnedOnce.add(key);
-  console.warn(`[emitEvent] ${message}`, detail ?? '');
+  try {
+    console.warn(`[emitEvent] ${message}`, detail ?? '');
+  } catch {
+    // Nothing to report it to.
+  }
+}
+
+/** Test seam. Nothing in production resets this — once per process is the point. */
+export function resetWarnedOnce(): void {
+  warnedOnce.clear();
+}
+
+/**
+ * The key a rejected POST warns under.
+ *
+ * The status is part of it: a run of 500s followed by a 401 is a different
+ * problem with a different fix, and a key of just "status" would report the
+ * first and swallow the second.
+ */
+export function postStatusKey(scope: 'fsm' | 'job', status: number): string {
+  return `${scope}-status-${status}`;
+}
+
+/**
+ * The key a failed POST warns under — keyed by the error's `code` for the same
+ * reason: a worker that spent an hour on ECONNREFUSED and then starts timing
+ * out has a different problem, and one key for both hides the change.
+ *
+ * `code` and not the message, because a message can carry a host, a port or a
+ * request id, and a key that varies per event is a memory leak wearing a
+ * diagnostic's clothes.
+ */
+export function postFailureKey(scope: 'fsm' | 'job', err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  const name = (err as { name?: unknown } | null)?.name;
+  const tag = typeof code === 'string' ? code : typeof name === 'string' ? name : 'unknown';
+  return `${scope}-post-${tag}`;
 }
 
 export async function emitEvent(
@@ -70,12 +116,12 @@ export async function emitEvent(
       body: JSON.stringify({ runId, type, data }),
       signal: controller.signal,
     }).catch((err) => {
-      warnOnce('fsm-post', `POST ${HORIZON_FSM_EVENTS_URL} failed`, err?.message || err);
+      warnOnce(postFailureKey('fsm', err), `POST ${HORIZON_FSM_EVENTS_URL} failed`, err?.message || err);
       return null;
     });
     clearTimeout(timer);
     if (res && !res.ok) {
-      warnOnce('fsm-status', `POST ${HORIZON_FSM_EVENTS_URL} returned ${res.status}`);
+      warnOnce(postStatusKey('fsm', res.status), `POST ${HORIZON_FSM_EVENTS_URL} returned ${res.status}`);
     }
   } catch (err) {
     // Fire-and-forget — never block the activity on event emission, but say so.
@@ -96,8 +142,8 @@ export async function emitFsmEventActivity(params: {
 
 /**
  * Per-job parallel of `emitEvent`. Posts to Horizon's job-events endpoint,
- * keyed by jobId. Same shared-secret auth, same fire-and-forget shape — drops
- * silently when no jobId or no URL is configured.
+ * keyed by jobId. Same shared-secret auth, same fire-and-forget shape — still
+ * drops the event when no jobId or no URL is configured, but says so once.
  *
  * Why a separate function: jobs and FSM runs have different identifiers and
  * different ring buffers on the orion side. Conflating them would force orion
@@ -139,12 +185,12 @@ export async function emitJobEvent(
       body: JSON.stringify({ jobId, type, data }),
       signal: controller.signal,
     }).catch((err) => {
-      warnOnce('job-post', `POST ${HORIZON_JOB_EVENTS_URL} failed`, err?.message || err);
+      warnOnce(postFailureKey('job', err), `POST ${HORIZON_JOB_EVENTS_URL} failed`, err?.message || err);
       return null;
     });
     clearTimeout(timer);
     if (res && !res.ok) {
-      warnOnce('job-status', `POST ${HORIZON_JOB_EVENTS_URL} returned ${res.status}`);
+      warnOnce(postStatusKey('job', res.status), `POST ${HORIZON_JOB_EVENTS_URL} returned ${res.status}`);
     }
   } catch (err) {
     // Fire-and-forget — never block the activity on event emission, but say so.
